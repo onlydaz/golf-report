@@ -48,6 +48,16 @@ impl Default for DatabaseState {
 }
 
 impl DatabaseState {
+    #[cfg(test)]
+    pub(crate) async fn with_test_pool(pool: PgPool) -> Self {
+        let state = Self::default();
+        {
+            let mut inner = state.inner.lock().await;
+            inner.pool = Some(pool);
+            inner.status.state = DatabaseConnectionState::Connected;
+        }
+        state
+    }
     pub async fn status(&self) -> DatabaseStatus {
         self.inner.lock().await.status.clone()
     }

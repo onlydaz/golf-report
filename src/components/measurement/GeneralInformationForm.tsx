@@ -67,7 +67,7 @@ function GeneralInformationForm() {
       <Col span={8}>
         <Form.Item
           name="weight"
-          label="Weight"
+          label="Khối lượng đè gậy (Weight)"
           rules={[
             {
               required: true,

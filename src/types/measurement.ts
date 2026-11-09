@@ -7,6 +7,8 @@ export interface TipPositionMeasurement {
   finalDistance: number | null;
   retryCount: number | null;
   result: TipPositionResult;
+  // Frontend-only attempt awaiting a result; excluded from the save payload.
+  pendingRetryCount?: number;
 }
 
 export interface ButtMeasurement {

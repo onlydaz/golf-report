@@ -36,10 +36,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
   Legend,
-  Pie,
-  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -66,12 +63,6 @@ const createDefaultRange = (): [Dayjs, Dayjs] => [
   dayjs().subtract(29, "day").startOf("day"),
   dayjs().endOf("day"),
 ];
-
-const resultColors = {
-  OK: "#1d9b6c",
-  NG: "#d95757",
-  INCOMPLETE: "#829ab1",
-};
 
 // Thứ tự và tên các cột khi xuất báo cáo
 const exportHeaders = [

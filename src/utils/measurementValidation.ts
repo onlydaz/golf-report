@@ -4,7 +4,7 @@ export const TIP_POSITION_COUNT = 4;
 export const MAX_RETRY_COUNT = 4;
 
 export function calculateTipResult(tips: TipPositionMeasurement[]): MeasurementResult {
-  if (tips.length !== TIP_POSITION_COUNT || tips.some((tip) => tip.result === "INCOMPLETE")) return "INCOMPLETE";
+  if (tips.length !== TIP_POSITION_COUNT || tips.some((tip) => tip.result === "INCOMPLETE" || (tip.result === "NG" && tip.retryCount !== MAX_RETRY_COUNT))) return "INCOMPLETE";
   if (tips.some((tip) => tip.result === "NG")) return "NG";
   if (tips.every((tip) => tip.result === "OK")) return "OK";
   return "INCOMPLETE";
@@ -21,9 +21,12 @@ export function validateTipPosition(tip: TipPositionMeasurement, index: number, 
   const previousNgIndex = tips.findIndex((item) => item.result === "NG");
   if (previousNgIndex >= 0 && index > previousNgIndex && tip.result !== "SKIPPED") errors.push(`Vị trí Tip ${index + 1} phải là SKIPPED sau vị trí NG.`);
   if (tip.result === "SKIPPED") {
+    if (previousNgIndex < 0 || index <= previousNgIndex) errors.push(`Tip ${index + 1} chỉ được SKIPPED sau vị trí NG.`);
     if (tip.finalDistance !== null || tip.retryCount !== null) errors.push(`Vị trí Tip ${index + 1} bị bỏ qua không được có dữ liệu.`);
     return errors;
   }
+  if (tip.result === "INCOMPLETE") errors.push(`Tip ${index + 1} chưa hoàn tất kiểm tra.`);
+  if (tip.positionNumber !== index + 1) errors.push("Các vị trí Tip phải liên tiếp từ 1 đến 4.");
   if (tip.finalDistance === null || !Number.isFinite(tip.finalDistance) || tip.finalDistance < 0) errors.push(`Khoảng cách cuối của Tip ${index + 1} phải là số không âm.`);
   if (tip.retryCount === null || !Number.isInteger(tip.retryCount) || tip.retryCount < 0 || tip.retryCount > MAX_RETRY_COUNT) errors.push(`Số lần kiểm tra lại của Tip ${index + 1} phải từ 0 đến 4.`);
   if (tip.result === "NG" && tip.retryCount !== MAX_RETRY_COUNT) errors.push(`Tip ${index + 1} có kết quả NG phải kiểm tra lại đủ 4 lần.`);

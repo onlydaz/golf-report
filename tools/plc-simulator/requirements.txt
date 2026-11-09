@@ -1,0 +1,2 @@
+# Đã kiểm tra với Python 3.12.1; cố định phiên bản để giữ đúng API.
+pymodbus==3.11.4

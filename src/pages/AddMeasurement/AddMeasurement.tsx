@@ -1,277 +1,104 @@
-
-import { ReloadOutlined, SaveOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, Form, Space, message } from "antd";
-import dayjs, { type Dayjs } from "dayjs";
-import { useEffect, useMemo, useState } from "react";
-
+﻿import { Alert, Button, Card, Descriptions, Input, Space, Tag, message } from "antd";
+import { useEffect, useState } from "react";
 import PageHeader from "../../components/PageHeader";
-import ButtStationForm from "../../components/measurement/ButtStationForm";
-import GeneralInformationForm from "../../components/measurement/GeneralInformationForm";
-import OverallResult from "../../components/measurement/OverallResult";
-import TipStationForm from "../../components/measurement/TipStationForm";
+import { getPlcStatus, startPlcCapture, type PlcStatus } from "../../services/plcService";
 
-import type {
-  ButtMeasurement,
-  MeasurementInput,
-  TipPositionMeasurement,
-} from "../../types/measurement";
-
-import {
-  calculateOverallResult,
-  calculateTipResult,
-  validateMeasurementInput,
-} from "../../utils/measurementValidation";
-
-import {
-  createMeasurement,
-  getDatabaseStatus,
-} from "../../services/measurementService";
-
-const createInitialTips = (): TipPositionMeasurement[] =>
-  [1, 2, 3, 4].map((positionNumber) => ({
-    positionNumber,
-    finalDistance: null,
-    retryCount: null,
-    result: "INCOMPLETE",
-  }));
-
-const createInitialButt = (): ButtMeasurement => ({
-  finalDistance: null,
-  result: null,
-});
+const formatNumber = (value: string | null | undefined) => value == null ? "—" : Number(value).toLocaleString("vi-VN", { maximumFractionDigits: 2 });
+const resultTag = (result?: string) => <Tag color={result === "OK" ? "green" : result === "NG" ? "red" : "default"}>{result === "SKIPPED" ? "BỎ QUA" : result ?? "Chờ kết quả"}</Tag>;
 
 function AddMeasurement() {
-  const [form] = Form.useForm();
+  const [status, setStatus] = useState<PlcStatus | null>(null);
+  const [product, setProduct] = useState("");
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [messageApi, contextHolder] = message.useMessage();
-
-  const [tips, setTips] = useState<TipPositionMeasurement[]>(createInitialTips);
-  const [butt, setButt] = useState<ButtMeasurement>(createInitialButt);
-  const [saving, setSaving] = useState(false);
-  const [databaseReady, setDatabaseReady] = useState(false);
-  const [databaseMessage, setDatabaseMessage] = useState(
-    "Đang kết nối cơ sở dữ liệu..."
-  );
-
-  const tipResult = useMemo(
-    () => calculateTipResult(tips),
-    [tips]
-  );
-
-  const overallResult = useMemo(
-    () => calculateOverallResult(tipResult, butt.result),
-    [tipResult, butt.result]
-  );
-
   useEffect(() => {
     let active = true;
-
-    const refreshStatus = async () => {
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
       try {
-        const status = await getDatabaseStatus();
-
-        if (active) {
-          setDatabaseReady(status.state === "CONNECTED");
-          setDatabaseMessage(status.message);
-        }
-      } catch {
-        if (active) {
-          setDatabaseReady(false);
-          setDatabaseMessage("Không thể đọc trạng thái cơ sở dữ liệu.");
-        }
+        const next = await getPlcStatus();
+        if (active) { setStatus(next); setError(null); }
+      } catch (err) {
+        if (active) setError(typeof err === "string" ? err : "Không đọc được trạng thái PLC.");
+      } finally {
+        if (active) timer = setTimeout(() => void refresh(), 500);
       }
     };
-
-    void refreshStatus();
-
-    const timer = window.setInterval(
-      () => void refreshStatus(),
-      2000
-    );
-
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
+    void refresh();
+    return () => { active = false; clearTimeout(timer); };
   }, []);
-
-  const reset = () => {
-    form.resetFields();
-    form.setFieldValue("measurementTime", dayjs());
-    setTips(createInitialTips());
-    setButt(createInitialButt());
-  };
-
-  const save = async () => {
-    let values: {
-      productCode: string;
-      measurementTime: Dayjs;
-      clubNumber: string;
-      weight: number;
-    };
-
+  const start = async () => {
+    setStarting(true);
     try {
-      values = await form.validateFields();
-    } catch {
-      messageApi.error(
-        "Vui lòng kiểm tra các trường bắt buộc trong biểu mẫu."
-      );
-      return;
-    }
-
-    const input: MeasurementInput = {
-      productCode: values.productCode,
-      measurementTime: values.measurementTime.toISOString(),
-      clubNumber: values.clubNumber,
-      weight: values.weight,
-      tips,
-      butt,
-      tipResult,
-      overallResult,
-    };
-
-    const errors = validateMeasurementInput(input);
-
-    if (errors.length > 0) {
-      messageApi.error(errors[0]);
-      return;
-    }
-
-    if (!databaseReady) {
-      messageApi.error(
-        "Cơ sở dữ liệu chưa sẵn sàng. Vui lòng chờ hoặc thử kết nối lại."
-      );
-      return;
-    }
-
-    setSaving(true);
-
-    try {
-      const measurementId = await createMeasurement(input);
-
-      messageApi.success(
-        `Đã lưu kết quả đo. Mã bản ghi: ${measurementId}.`
-      );
-    } catch (error: unknown) {
-      const errorMessage =
-        typeof error === "string"
-          ? error
-          : "Không thể lưu kết quả đo. Vui lòng kiểm tra PostgreSQL và thử lại.";
-
-      messageApi.error(errorMessage);
-    } finally {
-      setSaving(false);
-    }
+      await startPlcCapture(product);
+      setStatus(await getPlcStatus());
+      messageApi.success("Đã xác nhận mã sản phẩm; chờ phép đo mới.");
+    } catch (err) { messageApi.error(typeof err === "string" ? err : "Không thể bắt đầu ghi nhận."); }
+    finally { setStarting(false); }
   };
+  const data = status?.data;
+  const tipResult = data ? data.tipPositions.some(tip => tip.result === "NG") ? "NG" : "OK" : undefined;
+  const overall = data ? tipResult === "NG" || data.buttResult === "NG" ? "NG" : "OK" : undefined;
+  const connection = status?.connection === "CONNECTED" ? "Đã kết nối" : status?.connection === "DISCONNECTED" ? "Mất kết nối" : "Đang kết nối";
+  return <>
+    {contextHolder}
+    <PageHeader eyebrow="PLC" title="Ghi nhận kết quả đo" description="Tự động tiếp nhận, hiển thị và lưu trữ kết quả đo từ PLC theo mã sản phẩm." />
+    {error && <Alert type="error" showIcon message={error} style={{ marginBottom: 16 }} />}
+    <Card className="section-card add-measurement-card">
+      <div className="form-section-title">A. Thông tin kết nối</div>
+      <Descriptions column={2} items={[
+        { key: "connection", label: "Trạng thái PLC", children: <Tag color={status?.connection === "CONNECTED" ? "green" : "orange"}>{connection}</Tag> },
+        { key: "address", label: "Địa chỉ PLC", children: status ? `${status.address} · Unit ID ${status.unit}` : "—" },
+        { key: "received", label: "Kết quả", children: data ? `Đã nhận · Sequence ${status?.sequenceId}` : "Đang chờ kết quả" },
+      ]} />
+    </Card>
+    <Card className="section-card add-measurement-card">
+      <div className="form-section-title">B. Thông tin sản phẩm</div>
+      <label className="measurement-field-label" htmlFor="plc-product">Mã sản phẩm</label>
+      <Space wrap>
+        <Input id="plc-product" value={product} maxLength={50} placeholder="Nhập mã sản phẩm" disabled={starting || status?.busy} onChange={event => setProduct(event.target.value)} onPressEnter={() => { if (product.trim() && !starting && !status?.busy) void start(); }} />
+        <Button type="primary" loading={starting} disabled={!product.trim() || !status || status.busy || status.connection !== "CONNECTED"} onClick={() => void start()}>Bắt đầu ghi nhận</Button>
+      </Space>
+      <p>Mã đã xác nhận: <strong>{status?.productCode ?? "Chưa xác nhận"}</strong></p>
+      <p style={{ color: "#829ab1" }}>Hệ thống sẽ tự động lưu các kết quả đo mới theo mã đã xác nhận.</p>
+    </Card>
+    <Card className="section-card add-measurement-card">
+      <div className="form-section-title">C. Dữ liệu nhận tự động</div>
+      <Descriptions column={2} items={[
+        { key: "product", label: "Mã sản phẩm phép đo", children: data?.productCode ?? "—" },
+        { key: "club", label: "Số thứ tự gậy", children: data?.clubNumber ?? "—" },
+        { key: "time", label: "Thời gian nhận", children: data ? new Date(data.measuredAt).toLocaleString("vi-VN") : "—" },
+        { key: "weight", label: "Khối lượng đè gậy (Weight)", children: formatNumber(data?.weight) },
+      ]} />
+      <div style={{ marginTop: 20, marginBottom: 16 }}>
+  <strong>Trạm Tip</strong>
+</div>
 
-  return (
-    <>
-      {contextHolder}
-
-      <PageHeader
-        eyebrow="Nhập dữ liệu"
-        title="Thêm kết quả đo"
-        description="Nhập kết quả đo cuối cùng và số lần kiểm tra lại cho gậy Golf."
-        extra={
-          <Button
-            type="default"
-            icon={<ReloadOutlined />}
-            onClick={reset}
-          >
-            Đặt lại
-          </Button>
-        }
-      />
-
-      <Form
-        form={form}
-        layout="vertical"
-        requiredMark={false}
-        initialValues={{ measurementTime: dayjs() }}
-      >
-        <Card className="section-card add-measurement-card">
-          <div className="form-section-title">
-            A. Thông tin chung
-          </div>
-
-          <GeneralInformationForm />
-        </Card>
-
-        {!databaseReady && (
-          <Alert
-            type="warning"
-            showIcon
-            message={databaseMessage}
-            style={{ marginBottom: 20 }}
-          />
-        )}
-
-        <Card className="section-card add-measurement-card">
-          <div className="form-section-title">
-            B. Trạm Tip <span className="card-caption">4 vị trí đo</span>
-          </div>
-
-          <TipStationForm
-            tips={tips}
-            onChange={setTips}
-          />
-
-          <div className="computed-result">
-            <span>Kết quả Tip</span>
-
-            <strong>
-              {tipResult === "INCOMPLETE"
-                ? "CHƯA HOÀN TẤT"
-                : tipResult}
-            </strong>
-          </div>
-        </Card>
-
-        <Card className="section-card add-measurement-card">
-          <div className="form-section-title">
-            C. Trạm Butt
-          </div>
-
-          <ButtStationForm
-            butt={butt}
-            onChange={setButt}
-          />
-        </Card>
-
-        <Card className="section-card add-measurement-card">
-          <div className="form-section-title">
-            D. Kết quả tổng thể
-          </div>
-
-          <OverallResult
-            tipResult={tipResult}
-            buttResult={butt.result}
-            overallResult={overallResult}
-          />
-        </Card>
-
-        <div className="add-measurement-actions">
-          <Space>
-            <Button
-              onClick={reset}
-              disabled={saving}
-            >
-              Đặt lại
-            </Button>
-
-            <Button
-              type="primary"
-              disabled={!databaseReady}
-              loading={saving}
-              icon={<SaveOutlined />}
-              onClick={save}
-            >
-              Lưu kết quả
-            </Button>
-          </Space>
-        </div>
-      </Form>
-    </>
-  );
+<div className="tip-grid tip-form-grid">
+        {[1, 2, 3, 4].map(position => {
+          const tip = data?.tipPositions.find(item => item.positionNumber === position);
+          return <div className={`tip-position ${tip?.result === "SKIPPED" ? "tip-position-skipped" : ""}`} key={position}>
+            <div className="tip-position-header"><div className="tip-position-title">Tip {position}</div></div>
+            <label className="measurement-field-label">Khoảng cách đo (mm)</label><div>{formatNumber(tip?.finalDistance)}</div>
+            <label className="measurement-field-label">Số lần kiểm tra lại đã ghi nhận</label><div>{tip?.retryCount ?? "—"}</div>
+            <label className="measurement-field-label">Kết quả cuối</label>{resultTag(tip?.result)}
+          </div>;
+        })}
+      </div>
+      <div className="computed-result"><span>Kết quả Tip</span>{resultTag(tipResult)}</div>
+      <div style={{ marginTop: 24 }}></div>
+      <Descriptions title="Trạm Butt" items={[
+        { key: "distance", label: "Khoảng cách (mm)", children: formatNumber(data?.buttDistance) },
+        { key: "result", label: "Kết quả", children: resultTag(data?.buttResult) },
+      ]} />
+      <div className="computed-result"><span>Kết quả tổng thể</span>{resultTag(overall)}</div>
+    </Card>
+    <Card className="section-card add-measurement-card">
+      <div className="form-section-title">D. Trạng thái lưu dữ liệu</div>
+      <Alert showIcon type={status?.phase === "ERROR" ? "error" : status?.phase === "SAVED" ? "success" : "info"} message={status?.message ?? "Đang kết nối..."} />
+      {status?.measurementId != null && <p>Mã bản ghi: <strong>{status.measurementId}</strong></p>}
+    </Card>
+  </>;
 }
-
 export default AddMeasurement;

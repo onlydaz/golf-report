@@ -30,6 +30,9 @@ impl MeasurementService {
             }
             match tip.result {
                 TipPositionResult::Skipped => {
+                    if !request.tip_positions[..index].iter().any(|previous| previous.result == TipPositionResult::Ng) {
+                        return Err(format!("Tip {} chỉ được SKIPPED sau vị trí NG.", index + 1));
+                    }
                     if tip.final_distance.is_some() || tip.retry_count.is_some() {
                         return Err(format!("Tip {} bị SKIPPED không được có dữ liệu.", index + 1));
                     }

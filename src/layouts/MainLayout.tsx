@@ -8,7 +8,7 @@ import {
   SettingOutlined,
 } from "@ant-design/icons";
 
-import { Alert, Avatar, Button, Layout, Menu, Tag } from "antd";
+import { Alert, Avatar, Button, Layout, Menu } from "antd";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, Outlet } from "react-router-dom";
 import type { MenuProps } from "antd";
@@ -23,7 +23,7 @@ const { Sider, Header, Content } = Layout;
 
 const menuItems: MenuProps["items"] = [
   { key: "/dashboard", icon: <DashboardOutlined />, label: "Tổng quan" },
-  { key: "/measurements/add", icon: <PlusCircleOutlined />, label: "Thêm phép đo" },
+  { key: "/measurements/add", icon: <PlusCircleOutlined />, label: "Ghi nhận kết quả đo" },
   { key: "/measurements", icon: <HistoryOutlined />, label: "Lịch sử đo" },
   { key: "/reports", icon: <FileTextOutlined />, label: "Báo cáo" },
 ];
@@ -140,7 +140,7 @@ function MainLayout() {
       <Layout>
         <Header className="main-header">
           <div className="header-context">
-            Kiểm soát chất lượng / Quản lý phép đo
+            Quản lý và báo cáo kết quả đo
           </div>
 
           <div className="header-user">
