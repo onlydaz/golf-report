@@ -1,0 +1,36 @@
+.reports-page { width: 100%; min-width: 0; }
+.reports-page .page-description { font-size: 15px; color: #627d98; }
+.reports-page .card-title { font-size: clamp(18px, 1.4vw, 20px); font-weight: 700; }
+.reports-page .card-caption { font-size: 15px; color: #627d98; }
+.reports-page .ant-btn,
+.reports-page .ant-input,
+.reports-page .ant-picker,
+.reports-page .ant-select-selector { min-height: 36px; font-size: 14px; }
+.reports-page .ant-select-selection-item,
+.reports-page .ant-select-selection-placeholder,
+.reports-page .ant-picker-input > input { font-size: 14px; }
+.reports-filter-row .ant-btn,
+.reports-filter-row .ant-input,
+.reports-filter-row .ant-picker { min-height: 36px; font-size: 14px; }
+.reports-filter-row { display: grid; grid-template-columns: minmax(245px, 1.6fr) minmax(145px, 1fr) minmax(145px, 1fr) repeat(2, minmax(120px, .8fr)) minmax(170px, 1.15fr); gap: 10px; max-width: 1220px; }
+.reports-filter-field { min-width: 0; }
+.reports-filter-actions { display: flex; align-items: center; justify-content: flex-start; gap: 8px; margin-top: 12px; }
+.reports-page .report-stat-grid .ant-card-body { min-height: 116px; padding: 16px 12px; }
+.reports-page .report-stat-grid .ant-statistic-title { font-size: clamp(15px, 1vw, 16px); color: #526b83; font-weight: 600; }
+.reports-page .report-stat-grid .ant-statistic-content { font-size: clamp(34px, 2.2vw, 40px); font-weight: 700; line-height: 1.15; overflow-wrap: anywhere; }
+.reports-table .ant-table-cell { padding: 10px 8px; font-size: 14px; white-space: normal; overflow-wrap: anywhere; }
+.reports-table .ant-table-thead > tr > th { font-size: 14px; color: #334e68; font-weight: 700; white-space: nowrap; }
+.reports-table .ant-tag { font-size: 14px; margin-inline-end: 0; white-space: normal; overflow-wrap: anywhere; }
+.reports-page .ant-pagination { font-size: 15px; }
+.reports-page .recharts-legend-item-text { font-size: 14px; }
+
+@media (max-width: 1500px) {
+  .reports-filter-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 800px) {
+  .reports-filter-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .reports-header-actions { width: 100%; }
+  .reports-filter-row { grid-template-columns: minmax(0, 1fr); }
+}

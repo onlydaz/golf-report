@@ -1,0 +1,163 @@
+import { ApiOutlined, CheckCircleOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, Form, Input, InputNumber, Tag } from "antd";
+import { useEffect, useRef, useState } from "react";
+import PageHeader from "../../components/PageHeader";
+import { getAs200WorkerStatus, type As200Status } from "../../services/as200Service";
+import { getPlcConnectionSettings, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
+import "./ConnectionSettings.css";
+
+export default function ConnectionSettings() {
+  const [form] = Form.useForm<PlcEndpoint>();
+  const [settings, setSettings] = useState<PlcConnectionSettings>();
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<"test" | "save" | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [error, setError] = useState("");
+  const [errorAction, setErrorAction] = useState<"test" | "save" | null>(null);
+  const [notice, setNotice] = useState("");
+  const [tested, setTested] = useState<"idle" | "ok" | "failed">("idle");
+  const [worker, setWorker] = useState<As200Status>();
+  const [resetRequired, setResetRequired] = useState(false);
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const value = await getAs200WorkerStatus();
+        if (!disposed) setWorker(value);
+      } catch {
+        if (!disposed) setWorker(undefined);
+      } finally {
+        if (!disposed) timer = setTimeout(() => void poll(), 2000);
+      }
+    };
+    void poll();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
+  useEffect(() => {
+    mounted.current = true;
+    void getPlcConnectionSettings().then((value) => {
+      if (!mounted.current) return;
+      setSettings(value); if (value.endpoint) form.setFieldsValue(value.endpoint);
+    }).catch((e: unknown) => { if (mounted.current) setError(plcConnectionError(e, "Không thể đọc thông tin kết nối. Vui lòng thử lại hoặc liên hệ kỹ thuật.")); })
+      .finally(() => { if (mounted.current) setLoading(false); });
+    return () => { mounted.current = false; };
+  }, [form]);
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ""; } };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+  const changed = () => {
+    setResetRequired(false);
+    const values = form.getFieldsValue();
+    setDirty(!!settings && (!settings.endpoint || values.ip !== settings.endpoint.ip || values.port !== settings.endpoint.port || values.unitId !== settings.endpoint.unitId));
+    setTested("idle"); setError(""); setNotice("");
+  };
+  const act = async (action: "test" | "save", confirmReset = false) => {
+    if (inFlight.current || !settings) return;
+    if (action === "save" && !canEditConnection) return;
+    if (confirmReset && !resetRequired) return;
+    inFlight.current = true;
+    try {
+      const values = await form.validateFields();
+      setBusy(action); setError(""); setNotice("");
+      if (action === "test") {
+        setTested("idle"); await testPlcConnection(values);
+        if (mounted.current) setTested("ok");
+      } else {
+        setNotice("Đang kết nối với máy đo...");
+        await connectPlcCollection(values, settings.revision, confirmReset);
+        if (mounted.current) { setResetRequired(false); }
+        const saved = await getPlcConnectionSettings();
+        const current = await getAs200WorkerStatus();
+        if (mounted.current) { setSettings(saved); if (saved.endpoint) form.setFieldsValue(saved.endpoint); setDirty(false); setWorker(current); setNotice(""); }
+      }
+    } catch (e) {
+      if (mounted.current && !(e && typeof e === "object" && "errorFields" in e)) {
+        console.error("PLC connection operation failed:", e);
+        setNotice("");
+        setErrorAction(action);
+        if (action === "test") setTested("failed");
+        const needsReset = action === "save" && e === "RESET_CONFIRMATION_REQUIRED";
+        setResetRequired(needsReset);
+        setError(needsReset ? "PLC đã khởi động lại. Vui lòng kiểm tra kết quả đo trước khi tiếp tục." : plcConnectionError(e, action === "test" ? "Không thể kết nối với PLC. Vui lòng kiểm tra địa chỉ IP và cổng kết nối." : "Không thể lưu thay đổi. Vui lòng thử lại hoặc liên hệ kỹ thuật."));
+      }
+    } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
+  };
+  const canEditConnection = !!worker && !worker.enabled
+    && (worker.state === "STOPPED" || !settings?.configured)
+    && !worker.message.includes("dữ liệu chưa lưu");
+  const receiving = !worker ? "Chưa xác định"
+    : worker.state === "STOPPING" ? "Đang dừng thu dữ liệu"
+    : worker.state === "STOPPED" ? worker.message.includes("dữ liệu chưa lưu") ? "Đã dừng; còn dữ liệu chờ phục hồi" : "Đã dừng thu dữ liệu"
+    : !worker.enabled ? "Chưa bật"
+    : worker.pauseReason ? "Tạm dừng"
+    : worker.connection === "CONNECTED" && worker.plcHealth === "RUNNING" ? "Đang thu dữ liệu"
+    : worker.connection === "DISCONNECTED" ? "Mất kết nối"
+    : "Đang chờ thiết bị";
+  const endpointText = (endpoint: PlcEndpoint) =>
+    `${endpoint.ip.includes(":") ? `[${endpoint.ip}]` : endpoint.ip}:${endpoint.port} · Unit ID ${endpoint.unitId}`;
+
+  return <div className="plc-settings-page">
+    <PageHeader eyebrow="HỆ THỐNG" title="Cài đặt kết nối" description="Thiết lập thông tin để kết nối với thiết bị đo (PLC)." />
+    <Card className="plc-settings-card" loading={loading}>
+      {!settings && !loading ? <Alert type="error" showIcon title={error || "Không thể đọc cấu hình. Vui lòng liên hệ kỹ thuật."} /> : <>
+        <div className="plc-settings-grid">
+          <section className="plc-settings-panel" aria-labelledby="plc-settings-form-title">
+            <div className="plc-settings-heading">
+              <span className="plc-settings-icon"><ApiOutlined /></span>
+              <h2 id="plc-settings-form-title">Thông tin PLC</h2>
+            </div>
+          <Form form={form} layout="vertical" disabled={!!busy || loading} onValuesChange={changed} requiredMark={false}>
+            <Form.Item name="ip" label="Địa chỉ IP" rules={[{ required: true, message: "Vui lòng nhập địa chỉ IP." }, { validator: (_, value: string) => !value || isPlcIp(value) ? Promise.resolve() : Promise.reject(new Error("Địa chỉ IP chưa hợp lệ. Vui lòng kiểm tra lại.")) }]}>
+              <Input placeholder="Ví dụ: 192.168.1.10" autoComplete="off" size="large" disabled={!canEditConnection} />
+            </Form.Item>
+            <div className="plc-settings-fields">
+              <Form.Item name="port" label="Cổng kết nối" rules={[{ required: true, message: "Vui lòng nhập cổng kết nối." }, { type: "integer", min: 1, max: 65535, message: "Cổng kết nối phải từ 1 đến 65535." }]}>
+                <InputNumber min={1} max={65535} precision={0} size="large" disabled={!canEditConnection} />
+              </Form.Item>
+              <Form.Item name="unitId" label="Unit ID" rules={[{ required: true, message: "Vui lòng nhập Unit ID." }, { type: "integer", min: 1, max: 247, message: "Unit ID phải từ 1 đến 247." }]}>
+                <InputNumber min={1} max={247} precision={0} size="large" disabled={!canEditConnection} />
+              </Form.Item>
+            </div>
+            {dirty && <p className="plc-settings-dirty" role="status">Thay đổi chưa được lưu.</p>}
+            <div className="plc-settings-actions">
+              <Button icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
+              <Button type="primary" icon={<SaveOutlined />} loading={busy === "save"} disabled={!!busy || !canEditConnection || !settings} onClick={() => void act("save")}>Lưu và kết nối</Button>
+            </div>
+          </Form>
+        <div className="plc-settings-feedback" aria-live="polite">
+          {error && errorAction !== "test" && <Alert type="error" showIcon title={error} />}
+          {resetRequired && !worker?.enabled && <div>
+            <Button disabled={!!busy || worker?.state !== "STOPPED"} loading={busy === "save"} onClick={() => void act("save", true)}>
+              Bắt đầu phiên mới
+            </Button>
+          </div>}
+          {notice && <p className="plc-settings-saved"><CheckCircleOutlined /> {notice}</p>}
+        </div>
+          </section>
+          <section className="plc-settings-panel plc-settings-status-panel" aria-labelledby="plc-settings-status-title">
+            <h2 id="plc-settings-status-title" className="plc-settings-status-title">Trạng thái kết nối</h2>
+            <dl className="plc-settings-status" aria-live="polite">
+          <div><dt>Kết quả kiểm tra</dt><dd>
+            <Tag color={busy === "test" ? "processing" : tested === "ok" ? "success" : tested === "failed" ? "error" : "default"}
+              icon={busy === "test" ? <ReloadOutlined spin /> : tested === "ok" ? <CheckCircleOutlined /> : undefined}>
+              {busy === "test" ? "Đang kiểm tra" : tested === "ok" ? "Kết nối thành công" : tested === "failed" ? "Không thể kết nối" : "Chưa kiểm tra"}
+            </Tag>
+            {error && errorAction === "test" && <small className="plc-settings-test-error" role="alert">{error}</small>}
+          </dd></div>
+          <div><dt>Cấu hình đã lưu</dt><dd>{settings?.endpoint ? endpointText(settings.endpoint) : "Chưa thiết lập"}</dd></div>
+          <div><dt>Nhận dữ liệu đo</dt><dd>{receiving}
+            {!worker && <small>Chưa lấy được trạng thái bộ thu dữ liệu.</small>}
+            {worker && !worker.enabled && <small>Liên hệ kỹ thuật để bật ghi nhận kết quả đo.</small>}
+          </dd></div>
+            </dl>
+          </section>
+        </div>
+      </>}
+    </Card>
+  </div>;
+}

@@ -1,0 +1,20 @@
+.dashboard-recent-table .ant-table-cell { white-space: normal; overflow-wrap: anywhere; }
+.dashboard-page { width: 100%; min-width: 0; }
+.dashboard-page .page-description { font-size: 15px; color: #627d98; }
+.dashboard-page .card-title { font-size: clamp(18px, 1.4vw, 20px); font-weight: 700; }
+.dashboard-page .card-caption { font-size: 15px; color: #627d98; }
+.dashboard-page .ant-btn,
+.dashboard-page .ant-picker,
+.dashboard-page .ant-table-pagination { font-size: 15px; }
+.dashboard-header-actions .ant-picker { min-width: 250px; }
+.dashboard-stat-grid .stat-label { font-size: clamp(14px, .9vw, 15px); color: #526b83; }
+.dashboard-stat-grid .stat-value { font-size: clamp(28px, 1.75vw, 32px); line-height: 1.15; overflow-wrap: anywhere; }
+.dashboard-stat-grid .stat-card { min-height: 124px; }
+.dashboard-page .ant-table-cell { font-size: clamp(15px, 1.05vw, 16px); }
+.dashboard-page .ant-table-thead > tr > th { color: #334e68; font-weight: 700; white-space: normal; }
+.dashboard-page .ant-table .ant-tag { font-size: 15px; margin-inline-end: 0; }
+.dashboard-chart-card .recharts-pie-label-text { font-size: 14px; fill: #405b72; }
+
+@media (max-width: 900px) {
+  .dashboard-header-actions .ant-picker { min-width: 0; max-width: 100%; }
+}

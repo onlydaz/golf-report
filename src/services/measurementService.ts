@@ -1,31 +1,70 @@
-import { invoke } from "@tauri-apps/api/core";
-import type { MeasurementInput, TipPositionMeasurement } from "../types/measurement";
 
-export type DatabaseConnectionState = "CONNECTING" | "CONNECTED" | "CONNECTION_FAILED" | "MIGRATION_FAILED";
+import { invoke } from "@tauri-apps/api/core";
+
+export type MeasurementResult = "UNMEASURED" | "OK" | "NG";
+
+export type DatabaseConnectionState =
+  | "CONNECTING"
+  | "CONNECTED"
+  | "CONNECTION_FAILED"
+  | "CONNECTION_LOST"
+  | "MIGRATION_FAILED";
 
 export interface DatabaseStatus {
   state: DatabaseConnectionState;
   message: string;
 }
 
-interface BackendTipPosition {
-  positionNumber: number;
-  finalDistance: string | null;
-  retryCount: number | null;
-  result: "OK" | "NG" | "SKIPPED";
-}
-
 export interface BackendMeasurement {
   id: number;
+  sourceId: number;
+  sessionId: string | null;
+  recordSeq: number;
+  totalCount: number | null;
   productCode: string;
-  clubNumber: string;
+  clubNumber: number;
   measuredAt: string;
-  weight: string;
-  tipPositions: BackendTipPosition[];
-  tipResult: "OK" | "NG" | "INCOMPLETE";
-  buttDistance: string;
-  buttResult: "OK" | "NG" | "INCOMPLETE";
-  overallResult: "OK" | "NG" | "INCOMPLETE";
+  createdAt: string;
+  tipLoad: string | null;
+  buttLoad: string | null;
+  overallResult: MeasurementResult;
+  tipResult: MeasurementResult | null;
+  buttResult: MeasurementResult | null;
+}
+
+export interface MeasurementAttempt {
+  id: number;
+  pointId: number;
+  attemptNumber: number;
+  pushDist: string | null;
+  bend: string | null;
+}
+
+export interface MeasurementPoint {
+  id: number;
+  stationId: number;
+  pointNumber: number;
+  result: MeasurementResult;
+  attemptCount: number;
+  decideAttempt: number | null;
+  position: string | null;
+  attempts: MeasurementAttempt[];
+}
+
+export interface MeasurementStation {
+  id: number;
+  measurementId: number;
+  stationType: "TIP" | "BUTT";
+  result: MeasurementResult;
+  pointCount: number;
+  ngPoint: number | null;
+  load: string;
+  createdAt: string;
+  points: MeasurementPoint[];
+}
+
+export interface MeasurementDetail extends BackendMeasurement {
+  stations: MeasurementStation[];
 }
 
 export interface MeasurementListRequest {
@@ -33,12 +72,13 @@ export interface MeasurementListRequest {
   pageSize?: number;
   search?: string;
   productCode?: string;
-  clubNumber?: string;
+  clubNumber?: number;
   measuredFrom?: string;
+  /** Exclusive upper bound (next day midnight for calendar ranges). */
   measuredTo?: string;
-  tipResult?: "OK" | "NG";
-  buttResult?: "OK" | "NG";
-  result?: "OK" | "NG";
+  tipResult?: MeasurementResult;
+  buttResult?: MeasurementResult;
+  result?: MeasurementResult;
 }
 
 export interface MeasurementListResponse {
@@ -55,71 +95,47 @@ export interface MeasurementStatistics {
   passRate: number;
   tipNg: number;
   buttNg: number;
-  daily: Array<{ date: string; total: number; ok: number; ng: number }>;
-  stationResults: Array<{ station: string; ok: number; ng: number }>;
-  overallDistribution: Array<{ result: "OK" | "NG" | "INCOMPLETE"; count: number }>;
-}
 
-interface CreateMeasurementPayload {
-  productCode: string;
-  clubNumber: string;
-  measuredAt: string;
-  weight: string;
-  tipPositions: Array<{
-    positionNumber: number;
-    finalDistance: string | null;
-    retryCount: number | null;
-    result: "OK" | "NG" | "SKIPPED";
+  daily: Array<{
+    date: string;
+    total: number;
+    ok: number;
+    ng: number;
   }>;
-  buttDistance: string;
-  buttResult: "OK" | "NG" | "INCOMPLETE";
+
+  stationResults: Array<{
+    station: string;
+    ok: number;
+    ng: number;
+  }>;
+
+  overallDistribution: Array<{
+    result: MeasurementResult;
+    count: number;
+  }>;
 }
 
-function toBackendTip(tip: TipPositionMeasurement): CreateMeasurementPayload["tipPositions"][number] {
-  return {
-    positionNumber: tip.positionNumber,
-    finalDistance: tip.finalDistance === null ? null : String(tip.finalDistance),
-    retryCount: tip.retryCount,
-    result: tip.result === "INCOMPLETE" ? "SKIPPED" : tip.result,
-  };
-}
+export const checkDatabaseConnection = () =>
+  invoke<string>("check_database_connection");
 
-function toCreatePayload(input: MeasurementInput): CreateMeasurementPayload {
-  return {
-    productCode: input.productCode,
-    clubNumber: input.clubNumber,
-    measuredAt: input.measurementTime,
-    weight: String(input.weight),
-    tipPositions: input.tips.map(toBackendTip),
-    buttDistance: String(input.butt.finalDistance),
-    buttResult: input.butt.result ?? "INCOMPLETE",
-  };
-}
+export const getDatabaseStatus = () =>
+  invoke<DatabaseStatus>("get_database_status");
 
-export function checkDatabaseConnection(): Promise<string> {
-  return invoke<string>("check_database_connection");
-}
+export const retryDatabaseConnection = () =>
+  invoke<DatabaseStatus>("retry_database_connection");
 
-export function getDatabaseStatus(): Promise<DatabaseStatus> {
-  return invoke<DatabaseStatus>("get_database_status");
-}
+export const getMeasurements = (request: MeasurementListRequest = {}) =>
+  invoke<MeasurementListResponse>("get_measurements", { request });
 
-export function retryDatabaseConnection(): Promise<DatabaseStatus> {
-  return invoke<DatabaseStatus>("retry_database_connection");
-}
+export const getMeasurementById = (id: number) =>
+  invoke<MeasurementDetail>("get_measurement_by_id", { id });
 
-export function createMeasurement(input: MeasurementInput): Promise<number> {
-  return invoke<number>("create_measurement", { request: toCreatePayload(input) });
-}
+export const getMeasurementStatistics = (
+  request: MeasurementListRequest = {}
+) =>
+  invoke<MeasurementStatistics>("get_measurement_statistics", { request });
 
-export function getMeasurements(request: MeasurementListRequest = {}): Promise<MeasurementListResponse> {
-  return invoke<MeasurementListResponse>("get_measurements", { request });
-}
-
-export function getMeasurementById(id: number): Promise<BackendMeasurement> {
-  return invoke<BackendMeasurement>("get_measurement_by_id", { id });
-}
-
-export function getMeasurementStatistics(request: MeasurementListRequest = {}): Promise<MeasurementStatistics> {
-  return invoke<MeasurementStatistics>("get_measurement_statistics", { request });
-}
+export const getMeasurementReport = (
+  request: MeasurementListRequest = {}
+) =>
+  invoke<MeasurementDetail[]>("get_measurement_report", { request });

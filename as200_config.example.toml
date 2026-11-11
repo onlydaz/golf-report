@@ -1,0 +1,30 @@
+# Technical reference only. The QC screen creates endpoint-only settings in AppData.
+# This is an example address, never an automatically selected device.
+mode = "modbus"
+enabled = false
+technical_setup_confirmed = false
+address = "192.0.2.10:502"
+unit_id = 7
+ack_enabled = false
+pc_heartbeat_enabled = false
+allow_plc_connection = false
+allow_plc_heartbeat_write = false
+
+# Before enabling collection, a technician must explicitly confirm ALL fields below.
+# Never copy identity/session values from another device or invent a new session to bypass recovery.
+# word_order = "LOW" # Verify on the actual device, do not copy blindly.
+# modbus_address_offset = 0 # Verify D-register to PDU mapping.
+# source_key = "TECHNICIAN-CONFIRMED-STABLE-SOURCE"
+# confirmed_session_id = "TECHNICIAN-CONFIRMED-SESSION"
+# plc_heartbeat_timeout_ms = 5000 # Example only; agree timing with PLC technician.
+# journal_path = "as200_capture_journal.json"
+
+# Set technical_setup_confirmed=true only after confirming identity/history/map/heartbeat.
+# Set enabled=true separately to start acquisition after restart.
+# Read-only collection does not require write capabilities.
+# ACK requires ack_protocol="as200", ack_enabled=true and allow_plc_connection=true.
+# PC heartbeat additionally requires pc_heartbeat_enabled=true and allow_plc_heartbeat_write=true.
+# Do not enable writes until commissioning. Existing ACK evidence/session guards still apply.
+
+# Legacy mode="simulator"/"plc" configurations remain readable without automatic conversion.
+# In particular, never change mode to clear an existing journal binding or ACK intent.

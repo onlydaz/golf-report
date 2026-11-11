@@ -1,6 +1,6 @@
-
+import { formatReportTime, reportDateBoundary, vietnamNow } from "../../utils/reportTime";
 import {
-  DownloadOutlined,
+  FilterOutlined,
   FileExcelOutlined,
   FileTextOutlined,
   ReloadOutlined,
@@ -25,12 +25,10 @@ import {
 } from "antd";
 
 import type { ColumnsType, TablePaginationConfig } from "antd/es/table";
-import dayjs, { type Dayjs } from "dayjs";
+import type { Dayjs } from "dayjs";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
-import ExcelJS from "exceljs";
-import * as XLSX from "xlsx";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Bar,
@@ -45,255 +43,26 @@ import {
 
 import { useNavigate } from "react-router-dom";
 import PageHeader from "../../components/PageHeader";
+import "./Reports.css";
 
 import {
   getMeasurementStatistics,
+  getMeasurementReport,
   getMeasurements,
   type BackendMeasurement,
   type MeasurementListRequest,
   type MeasurementStatistics,
 } from "../../services/measurementService";
 
-type ResultFilter = "OK" | "NG" | undefined;
+import { createCsvBytes, createExcelBytes } from "../../utils/as200Export";
+import { buildReportTables, formatDecimal } from "../../utils/as200Report";
+
+type ResultFilter = "OK" | "NG" | "UNMEASURED" | undefined;
 type ExportFormat = "csv" | "xlsx";
-type ExportValue = string | number;
-type ExportRow = Record<string, ExportValue>;
-
 const createDefaultRange = (): [Dayjs, Dayjs] => [
-  dayjs().subtract(29, "day").startOf("day"),
-  dayjs().endOf("day"),
+  vietnamNow().subtract(29, "day").startOf("day"),
+  vietnamNow().endOf("day"),
 ];
-
-// Thứ tự và tên các cột khi xuất báo cáo
-const exportHeaders = [
-  "Mã bản ghi",
-  "Thời gian đo",
-  "Mã sản phẩm",
-  "Số thứ tự gậy",
-  "Weight",
-  "Tip",
-  "Butt",
-  "Kết quả tổng",
-
-  "Tip 1 (mm)",
-  "Tip 1 - Đo lại",
-  "Tip 2 (mm)",
-  "Tip 2 - Đo lại",
-  "Tip 3 (mm)",
-  "Tip 3 - Đo lại",
-  "Tip 4 (mm)",
-  "Tip 4 - Đo lại",
-
-  "Butt (mm)",
-];
-
-// Chuyển dữ liệu PostgreSQL thành dòng báo cáo
-const buildExportRows = (
-  measurements: BackendMeasurement[]
-): ExportRow[] => {
-  return measurements.map((item) => {
-    const row: ExportRow = {
-      "Mã bản ghi": item.id,
-      "Thời gian đo": new Date(item.measuredAt).toLocaleString("vi-VN"),
-      "Mã sản phẩm": item.productCode,
-      "Số thứ tự gậy": item.clubNumber,
-      Weight: item.weight,
-      Tip: item.tipResult,
-      Butt: item.buttResult,
-      "Kết quả tổng": item.overallResult,
-    };
-
-    for (let position = 1; position <= 4; position++) {
-      const tip = item.tipPositions?.find(
-        (value) => value.positionNumber === position
-      );
-
-      row[`Tip ${position} (mm)`] = tip?.finalDistance ?? "";
-      row[`Tip ${position} - Đo lại`] = tip?.retryCount ?? "";
-    }
-
-    row["Butt (mm)"] = item.buttDistance ?? "";
-
-    return row;
-  });
-};
-
-// Tính độ rộng cột theo tiêu đề và dữ liệu
-const calculateColumnWidth = (
-  rows: ExportRow[],
-  header: string
-): number => {
-  let maxLength = header.length;
-
-  for (const row of rows) {
-    const value = String(row[header] ?? "");
-    maxLength = Math.max(maxLength, value.length);
-  }
-
-  return Math.min(Math.max(maxLength + 4, 12), 45);
-};
-
-// Xuất CSV UTF-8 BOM
-const createCsvBytes = (rows: ExportRow[]): Uint8Array => {
-  const sheet = XLSX.utils.json_to_sheet(rows, {
-    header: exportHeaders,
-  });
-
-  const csv = XLSX.utils.sheet_to_csv(sheet);
-
-  return new TextEncoder().encode(`\uFEFF${csv}`);
-};
-
-// Xuất Excel có định dạng
-const createExcelBytes = async (
-  rows: ExportRow[]
-): Promise<Uint8Array> => {
-  const workbook = new ExcelJS.Workbook();
-
-  workbook.creator = "Golf Measurement Report";
-  workbook.created = new Date();
-
-  const worksheet = workbook.addWorksheet("Báo cáo", {
-    views: [
-      {
-        state: "frozen",
-        ySplit: 1,
-        showGridLines: false,
-      },
-    ],
-  });
-
-  // Khai báo các cột
-  worksheet.columns = exportHeaders.map((header) => ({
-    header,
-    key: header,
-    width: calculateColumnWidth(rows, header),
-  }));
-
-  // Ghi dữ liệu
-  for (const row of rows) {
-    worksheet.addRow(row);
-  }
-
-  // Định dạng hàng tiêu đề
-  const headerRow = worksheet.getRow(1);
-  headerRow.height = 32;
-
-  headerRow.eachCell((cell) => {
-    cell.font = {
-      name: "Calibri",
-      size: 11,
-      bold: true,
-      color: { argb: "FFFFFFFF" },
-    };
-
-    cell.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF1769AA" },
-    };
-
-    cell.alignment = {
-      horizontal: "center",
-      vertical: "middle",
-      wrapText: true,
-    };
-
-    cell.border = {
-      top: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      bottom: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      left: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      right: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-    };
-  });
-
-  // Định dạng các dòng dữ liệu
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-
-    row.height = 26;
-
-    row.eachCell({ includeEmpty: true }, (cell) => {
-      cell.font = {
-        name: "Calibri",
-        size: 11,
-        color: { argb: "FF243B53" },
-      };
-
-      cell.alignment = {
-        horizontal: "center",
-        vertical: "middle",
-        wrapText: true,
-      };
-
-      // Màu nền xen kẽ giữa các hàng
-      cell.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: {
-          argb:
-            rowNumber % 2 === 0
-              ? "FFFFFFFF"
-              : "FFF3F7FB",
-        },
-      };
-
-      cell.border = {
-        bottom: {
-          style: "hair",
-          color: { argb: "FFE1E8EF" },
-        },
-      };
-
-      // Tô màu kết quả OK và NG
-      const value = String(cell.value ?? "");
-
-      if (value === "OK") {
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFE3F5EB" },
-        };
-
-        cell.font = {
-          name: "Calibri",
-          size: 11,
-          bold: true,
-          color: { argb: "FF167451" },
-        };
-      } else if (value === "NG") {
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFFFEBEB" },
-        };
-
-        cell.font = {
-          name: "Calibri",
-          size: 11,
-          bold: true,
-          color: { argb: "FFB43F49" },
-        };
-      }
-    });
-  });
-
-  const buffer = await workbook.xlsx.writeBuffer();
-
-  return new Uint8Array(buffer);
-};
 
 function Reports() {
   const navigate = useNavigate();
@@ -313,8 +82,8 @@ function Reports() {
     const range = createDefaultRange();
 
     return {
-      measuredFrom: range[0].toISOString(),
-      measuredTo: range[1].toISOString(),
+      measuredFrom: reportDateBoundary(range[0]),
+      measuredTo: reportDateBoundary(range[1], true),
     };
   });
 
@@ -323,6 +92,7 @@ function Reports() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
 
+  const requestVersion = useRef(0);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState("");
@@ -333,6 +103,7 @@ function Reports() {
       nextFilters: MeasurementListRequest,
       nextPage = 1
     ) => {
+      const version = ++requestVersion.current;
       setLoading(true);
       setError("");
 
@@ -348,11 +119,13 @@ function Reports() {
           getMeasurements(request),
         ]);
 
+        if(version !== requestVersion.current) return;
         setStats(summary);
         setRecords(response.items);
         setTotal(response.total);
         setPage(response.page);
       } catch (reason: unknown) {
+        if(version !== requestVersion.current) return;
         setError(
           typeof reason === "string"
             ? reason
@@ -363,7 +136,7 @@ function Reports() {
         setRecords([]);
         setTotal(0);
       } finally {
-        setLoading(false);
+        if(version === requestVersion.current) setLoading(false);
       }
     },
     []
@@ -375,11 +148,16 @@ function Reports() {
 
   // Áp dụng bộ lọc
   const applyFilters = () => {
+    const club = draftClub.trim() ? Number(draftClub) : undefined;
+    if (club !== undefined && (!Number.isInteger(club) || club < -2147483648 || club > 2147483647)) {
+      messageApi.error("Số gậy phải là số nguyên signed 32-bit theo AS200.");
+      return;
+    }
     setFilters({
-      measuredFrom: draftRange[0].toISOString(),
-      measuredTo: draftRange[1].toISOString(),
+      measuredFrom: reportDateBoundary(draftRange[0]),
+      measuredTo: reportDateBoundary(draftRange[1], true),
       productCode: draftProduct || undefined,
-      clubNumber: draftClub || undefined,
+      clubNumber: club,
       tipResult: draftTip,
       buttResult: draftButt,
       result: draftOverall,
@@ -398,33 +176,9 @@ function Reports() {
     setDraftOverall(undefined);
 
     setFilters({
-      measuredFrom: range[0].toISOString(),
-      measuredTo: range[1].toISOString(),
+      measuredFrom: reportDateBoundary(range[0]),
+      measuredTo: reportDateBoundary(range[1], true),
     });
-  };
-
-  // Lấy toàn bộ dữ liệu theo bộ lọc để xuất file
-  const exportRows = async (): Promise<BackendMeasurement[]> => {
-    const all: BackendMeasurement[] = [];
-
-    let current = 1;
-    let count = 0;
-
-    do {
-      const response = await getMeasurements({
-        ...filters,
-        page: current,
-        pageSize: 100,
-      });
-
-      all.push(...response.items);
-      count = response.total;
-      current += 1;
-
-      if (response.items.length === 0) break;
-    } while (all.length < count);
-
-    return all;
   };
 
   // Xuất Excel hoặc CSV
@@ -434,17 +188,17 @@ function Reports() {
     setExporting(true);
 
     try {
-      const all = await exportRows();
+      const all = await getMeasurementReport(filters);
 
       if (all.length === 0) {
         messageApi.info("Không có dữ liệu phù hợp để xuất.");
         return;
       }
 
-      const rows = buildExportRows(all);
+      const rows = buildReportTables(all).measurements;
 
       const suggested =
-        `bao-cao-do-gay-${dayjs().format("YYYYMMDD-HHmmss")}.${format}`;
+        `bao-cao-do-gay-${vietnamNow().format("YYYYMMDD-HHmmss")}.${format}`;
 
       const path = await save({
         defaultPath: suggested,
@@ -463,7 +217,7 @@ function Reports() {
       if (format === "csv") {
         bytes = createCsvBytes(rows);
       } else {
-        bytes = await createExcelBytes(rows);
+        bytes = await createExcelBytes(rows, all);
       }
 
       await writeFile(path, bytes);
@@ -487,31 +241,41 @@ function Reports() {
     {
       title: "Mã bản ghi",
       dataIndex: "id",
+      align: "center",
+      width: 96,
       render: (value: number) => `#${value}`,
     },
     {
-      title: "Thời gian đo",
+      title: "Thời gian nhận",
       dataIndex: "measuredAt",
+      align: "center",
+      width: 165,
       render: (value: string) =>
-        new Date(value).toLocaleString("vi-VN"),
+        formatReportTime(value),
     },
     {
       title: "Mã sản phẩm",
       dataIndex: "productCode",
+      width: 165,
     },
     {
       title: "Số gậy",
       dataIndex: "clubNumber",
+      align: "center",
+      width: 75,
     },
     {
-      title: "Weight",
-      dataIndex: "weight",
+      title: "RecordSeq", dataIndex: "recordSeq", align: "center", width: 88,
     },
+    {title:"TIP Load (g)",dataIndex:"tipLoad",render:formatDecimal,align:"right",width:110},
+    {title:"BUTT Load (g)",dataIndex:"buttLoad",render:formatDecimal,align:"right",width:110},
     {
       title: "Tip",
       dataIndex: "tipResult",
+      align: "center",
+      width: 70,
       render: (value: string) => (
-        <Tag color={value === "OK" ? "green" : "red"}>
+        <Tag color={value === "OK" ? "green" : value === "NG" ? "red" : "default"}>
           {value}
         </Tag>
       ),
@@ -519,8 +283,10 @@ function Reports() {
     {
       title: "Butt",
       dataIndex: "buttResult",
+      align: "center",
+      width: 70,
       render: (value: string) => (
-        <Tag color={value === "OK" ? "green" : "red"}>
+        <Tag color={value === "OK" ? "green" : value === "NG" ? "red" : "default"}>
           {value}
         </Tag>
       ),
@@ -528,8 +294,10 @@ function Reports() {
     {
       title: "Kết quả tổng",
       dataIndex: "overallResult",
+      align: "center",
+      width: 110,
       render: (value: string) => (
-        <Tag color={value === "OK" ? "green" : "red"}>
+        <Tag color={value === "OK" ? "green" : value === "NG" ? "red" : "default"}>
           {value}
         </Tag>
       ),
@@ -539,7 +307,7 @@ function Reports() {
   const station = stats?.stationResults ?? [];
 
   return (
-    <>
+    <div className="reports-page">
       {contextHolder}
 
       <PageHeader
@@ -547,7 +315,7 @@ function Reports() {
         title="Báo cáo kết quả đo"
         description="Thống kê, phân tích và xuất báo cáo kết quả đo gậy Golf."
         extra={
-          <Space>
+          <Space className="reports-header-actions" wrap>
             <Button
               icon={<FileTextOutlined />}
               loading={exporting}
@@ -596,20 +364,20 @@ function Reports() {
           </div>
         </div>
 
-        <Row gutter={[12, 12]}>
-          <Col xs={24} md={8}>
+        <div className="reports-filter-row">
+          <div className="reports-filter-field">
             <DatePicker.RangePicker
               style={{ width: "100%" }}
               value={draftRange}
               onChange={(value) => {
                 if (value?.[0] && value[1]) {
-                  setDraftRange([value[0], value[1]]);
+                  setDraftRange([value[0].startOf("day"), value[1].endOf("day")]);
                 }
               }}
             />
-          </Col>
+          </div>
 
-          <Col xs={12} md={4}>
+          <div className="reports-filter-field">
             <Input
               value={draftProduct}
               onChange={(event) =>
@@ -617,9 +385,9 @@ function Reports() {
               }
               placeholder="Mã sản phẩm"
             />
-          </Col>
+          </div>
 
-          <Col xs={12} md={4}>
+          <div className="reports-filter-field">
             <Input
               value={draftClub}
               onChange={(event) =>
@@ -627,16 +395,16 @@ function Reports() {
               }
               placeholder="Số thứ tự gậy"
             />
-          </Col>
+          </div>
 
           {(
             [
               ["Tip", draftTip, setDraftTip],
               ["Butt", draftButt, setDraftButt],
-              ["Kết quả tổng", draftOverall, setDraftOverall],
+              ["Kết quả tổng thể", draftOverall, setDraftOverall],
             ] as const
           ).map(([label, value, setter]) => (
-            <Col xs={8} md={2} key={label}>
+            <div className="reports-filter-field" key={label}>
               <Select
                 allowClear
                 style={{ width: "100%" }}
@@ -646,30 +414,20 @@ function Reports() {
                 options={[
                   { value: "OK", label: "OK" },
                   { value: "NG", label: "NG" },
+                  { value: "UNMEASURED", label: "Chưa đo" },
                 ]}
               />
-            </Col>
+            </div>
           ))}
-
-          <Col xs={24} md={4}>
-            <Space>
-              <Button
-                type="primary"
-                icon={<DownloadOutlined />}
-                onClick={applyFilters}
-              >
-                Áp dụng
-              </Button>
-
-              <Button
-                icon={<ReloadOutlined />}
-                onClick={reset}
-              >
-                Đặt lại
-              </Button>
-            </Space>
-          </Col>
-        </Row>
+        </div>
+        <div className="reports-filter-actions">
+          <Button type="primary" icon={<FilterOutlined />} onClick={applyFilters}>
+            Áp dụng
+          </Button>
+          <Button icon={<ReloadOutlined />} onClick={reset}>
+            Đặt lại
+          </Button>
+        </div>
       </Card>
 
       {loading ? (
@@ -705,7 +463,8 @@ function Reports() {
               ].map(([title, value]) => (
                 <Col
                   xs={12}
-                  md={4}
+                  md={8}
+                  xl={4}
                   key={title as string}
                 >
                   <Card className="section-card">
@@ -735,10 +494,10 @@ function Reports() {
                       vertical={false}
                     />
 
-                    <XAxis dataKey="date" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Legend />
+                    <XAxis dataKey="date" tick={{ fill: "#627d98", fontSize: 13 }} />
+                    <YAxis allowDecimals={false} tick={{ fill: "#627d98", fontSize: 13 }} />
+                    <Tooltip contentStyle={{ fontSize: 15 }} />
+                    <Legend wrapperStyle={{ fontSize: 14 }} />
 
                     <Bar
                       dataKey="ok"
@@ -776,10 +535,10 @@ function Reports() {
                       vertical={false}
                     />
 
-                    <XAxis dataKey="station" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Legend />
+                    <XAxis dataKey="station" tick={{ fill: "#627d98", fontSize: 13 }} />
+                    <YAxis allowDecimals={false} tick={{ fill: "#627d98", fontSize: 13 }} />
+                    <Tooltip contentStyle={{ fontSize: 15 }} />
+                    <Legend wrapperStyle={{ fontSize: 14 }} />
 
                     <Bar
                       dataKey="ok"
@@ -820,9 +579,11 @@ function Reports() {
                 <Empty description="Không có dữ liệu phù hợp." />
               ) : (
                 <Table
+                  className="reports-table"
                   rowKey="id"
                   columns={columns}
                   dataSource={records}
+                  scroll={{ x: 1059 }}
                   pagination={{
                     current: page,
                     pageSize: 10,
@@ -850,7 +611,7 @@ function Reports() {
           </>
         )
       )}
-    </>
+    </div>
   );
 }
 

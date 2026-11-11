@@ -7,6 +7,7 @@ import Dashboard from "./pages/Dashboard/Dashboard";
 import MeasurementDetail from "./pages/MeasurementDetail/MeasurementDetail";
 import MeasurementHistory from "./pages/MeasurementHistory/MeasurementHistory";
 import Reports from "./pages/Reports/Reports";
+import ConnectionSettings from "./pages/ConnectionSettings/ConnectionSettings";
 import "./App.css";
 
 function App() {
@@ -38,6 +39,7 @@ function App() {
             <Route path="/measurements" element={<MeasurementHistory />} />
             <Route path="/measurements/:measurementId" element={<MeasurementDetail />} />
             <Route path="/reports" element={<Reports />} />
+            <Route path="/settings/connection" element={<ConnectionSettings />} />
           </Route>
         </Routes>
       </BrowserRouter>

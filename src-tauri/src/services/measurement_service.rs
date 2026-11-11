@@ -1,103 +1,92 @@
-use crate::enums::{MeasurementResult, TipPositionResult};
-use crate::models::{calculate_overall_result, calculate_tip_result, CreateMeasurementRequest, Measurement, MeasurementListRequest, MeasurementListResponse, MeasurementStatistics};
-use crate::repositories::MeasurementRepository;
-use chrono::Utc;
-use sqlx::PgPool;
-use sqlx::types::BigDecimal;
-
+use crate::{models::*, repositories::*};
+use sqlx::{PgPool, Postgres, Transaction};
 pub struct MeasurementService;
-
 impl MeasurementService {
-    pub fn validate(request: &CreateMeasurementRequest) -> Result<(MeasurementResult, MeasurementResult), String> {
-        if request.product_code.trim().is_empty() {
-            return Err("Mã sản phẩm là bắt buộc.".to_string());
+    pub fn validate(input: &MeasurementDraft) -> Result<(), String> {
+        if input.source_id <= 0 || input.confirmed_session_id.trim().is_empty() {
+            return Err("Phải có nguồn và phiên PLC đã được xác nhận".into());
         }
-        if request.club_number.trim().is_empty() {
-            return Err("Số thứ tự gậy là bắt buộc.".to_string());
+        if input.product_code.chars().count() > 50 {
+            return Err("ProductCode vượt 50 ký tự".into());
         }
-        if request.weight < BigDecimal::from(0) {
-            return Err("Weight phải là số không âm.".to_string());
+        if input.stations.len() != 2
+            || !input
+                .stations
+                .iter()
+                .any(|s| s.station_type == StationType::Tip)
+            || !input
+                .stations
+                .iter()
+                .any(|s| s.station_type == StationType::Butt)
+        {
+            return Err("Cần đúng hai station TIP và BUTT".into());
         }
-        if request.measured_at > Utc::now() {
-            return Err("Thời gian đo không được ở tương lai.".to_string());
-        }
-        if request.tip_positions.len() != 4 {
-            return Err("Phải có đúng 4 vị trí Tip.".to_string());
-        }
-        for (index, tip) in request.tip_positions.iter().enumerate() {
-            if tip.position_number != (index + 1) as i16 {
-                return Err("Các vị trí Tip phải liên tiếp từ 1 đến 4.".to_string());
+        for station in &input.stations {
+            if !(0..=4).contains(&station.point_count)
+                || station.ng_point.is_some_and(|p| !(0..=4).contains(&p))
+                || station.points.len() != 4
+            {
+                return Err("Station cần 4 điểm, PointCount/NGPoint từ 0 đến 4".into());
             }
-            match tip.result {
-                TipPositionResult::Skipped => {
-                    if !request.tip_positions[..index].iter().any(|previous| previous.result == TipPositionResult::Ng) {
-                        return Err(format!("Tip {} chỉ được SKIPPED sau vị trí NG.", index + 1));
-                    }
-                    if tip.final_distance.is_some() || tip.retry_count.is_some() {
-                        return Err(format!("Tip {} bị SKIPPED không được có dữ liệu.", index + 1));
+            let mut numbers = std::collections::HashSet::new();
+            for point in &station.points {
+                if !(1..=4).contains(&point.point_number)
+                    || !numbers.insert(point.point_number)
+                    || !(0..=4).contains(&point.attempt_count)
+                    || point
+                        .decide_attempt
+                        .is_some_and(|a| a < 1 || a > point.attempt_count)
+                {
+                    return Err("PointNumber/AttemptCount/DecideAttempt không hợp lệ".into());
+                }
+                if point.attempts.len() != point.attempt_count as usize {
+                    return Err("Số attempt lưu phải bằng AttemptCount; không lưu lượt chưa đo như dữ liệu thật".into());
+                }
+                let mut attempts = std::collections::HashSet::new();
+                for attempt in &point.attempts {
+                    if !(1..=point.attempt_count).contains(&attempt.attempt_number)
+                        || !attempts.insert(attempt.attempt_number)
+                    {
+                        return Err("AttemptNumber không phù hợp AttemptCount".into());
                     }
                 }
-                TipPositionResult::Ok | TipPositionResult::Ng => {
-                    let distance = tip.final_distance.as_ref().ok_or_else(|| format!("Tip {} thiếu khoảng cách cuối.", index + 1))?;
-                    if distance < &BigDecimal::from(0) {
-                        return Err(format!("Khoảng cách Tip {} phải là số không âm.", index + 1));
-                    }
-                    let retry = tip.retry_count.ok_or_else(|| format!("Tip {} thiếu số lần kiểm tra lại.", index + 1))?;
-                    if !(0..=4).contains(&retry) {
-                        return Err(format!("Số lần kiểm tra lại của Tip {} phải từ 0 đến 4.", index + 1));
-                    }
-                    if tip.result == TipPositionResult::Ng && retry != 4 {
-                        return Err(format!("Tip {} có kết quả NG phải kiểm tra lại đủ 4 lần.", index + 1));
-                    }
-                }
-            }
-            if request.tip_positions[..index].iter().any(|previous| previous.result == TipPositionResult::Ng)
-                && tip.result != TipPositionResult::Skipped {
-                return Err("Các vị trí Tip phía sau NG phải là SKIPPED.".to_string());
             }
         }
-        if request.butt_distance < BigDecimal::from(0) {
-            return Err("Khoảng cách Butt phải là số không âm.".to_string());
-        }
-        if request.butt_result == MeasurementResult::Incomplete {
-            return Err("Kết quả Butt là bắt buộc.".to_string());
-        }
-        let tip_result = calculate_tip_result(&request.tip_positions);
-        let overall_result = calculate_overall_result(tip_result, request.butt_result);
-        if tip_result == MeasurementResult::Incomplete || overall_result == MeasurementResult::Incomplete {
-            return Err("Dữ liệu đo chưa hoàn chỉnh.".to_string());
-        }
-        Ok((tip_result, overall_result))
+        // Không suy kết quả tổng, NGPoint hay lượt quyết định từ khoảng cách/độ cong.
+        Ok(())
     }
-
-    pub async fn create(pool: &PgPool, request: CreateMeasurementRequest) -> Result<i64, String> {
-        let (tip_result, overall_result) = Self::validate(&request)?;
-        let mut transaction = pool.begin().await.map_err(|_| "Không thể bắt đầu giao dịch lưu dữ liệu.".to_string())?;
-        let id = MeasurementRepository::insert(
-            &mut transaction,
-            &request.product_code,
-            &request.club_number,
-            request.measured_at,
-            &request.weight,
-            tip_result,
-            request.butt_result,
-            &request.butt_distance,
-            overall_result,
-            &request.tip_positions,
-        ).await?;
-        transaction.commit().await.map_err(|_| "Không thể hoàn tất giao dịch lưu dữ liệu.".to_string())?;
+    pub async fn insert(
+        tx: &mut Transaction<'_, Postgres>,
+        input: &MeasurementDraft,
+    ) -> Result<i64, String> {
+        Self::validate(input)?;
+        let id = MeasurementRepository::insert(tx, input).await?;
+        for station in &input.stations {
+            let station_id = StationRepository::insert(tx, id, station).await?;
+            for point in &station.points {
+                let point_id = PointRepository::insert(tx, station_id, point).await?;
+                for attempt in &point.attempts {
+                    AttemptRepository::insert(tx, point_id, attempt).await?;
+                }
+            }
+        }
         Ok(id)
     }
-
-    pub async fn list(pool: &PgPool, request: MeasurementListRequest) -> Result<MeasurementListResponse, String> {
+    pub async fn list(
+        pool: &PgPool,
+        request: MeasurementListRequest,
+    ) -> Result<MeasurementListResponse, String> {
         MeasurementRepository::list(pool, &request).await
     }
-
     pub async fn find_by_id(pool: &PgPool, id: i64) -> Result<Measurement, String> {
-        MeasurementRepository::find_by_id(pool, id).await?.ok_or_else(|| "Không tìm thấy phép đo.".to_string())
+        MeasurementRepository::find_by_id(pool, id)
+            .await?
+            .ok_or_else(|| "Không tìm thấy phép đo".into())
     }
-
-    pub async fn statistics(pool: &PgPool, request: MeasurementListRequest) -> Result<MeasurementStatistics, String> {
+    pub async fn statistics(
+        pool: &PgPool,
+        request: MeasurementListRequest,
+    ) -> Result<MeasurementStatistics, String> {
         MeasurementRepository::statistics(pool, &request).await
     }
 }

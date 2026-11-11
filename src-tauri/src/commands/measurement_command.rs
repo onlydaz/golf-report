@@ -1,10 +1,15 @@
 use crate::database::{DatabaseState, DatabaseStatus};
-use crate::models::{CreateMeasurementRequest, Measurement, MeasurementListRequest, MeasurementListResponse, MeasurementStatistics};
+use crate::models::{
+    Measurement, MeasurementListRequest, MeasurementListResponse, MeasurementStatistics,
+};
 use crate::services::MeasurementService;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
-pub async fn check_database_connection(app: AppHandle, state: State<'_, DatabaseState>) -> Result<String, String> {
+pub async fn check_database_connection(
+    app: AppHandle,
+    state: State<'_, DatabaseState>,
+) -> Result<String, String> {
     let status = state.initialize(&app).await;
     match status.state {
         crate::database::connection::DatabaseConnectionState::Connected => Ok(status.message),
@@ -13,22 +18,18 @@ pub async fn check_database_connection(app: AppHandle, state: State<'_, Database
 }
 
 #[tauri::command]
-pub async fn get_database_status(state: State<'_, DatabaseState>) -> Result<DatabaseStatus, String> {
+pub async fn get_database_status(
+    state: State<'_, DatabaseState>,
+) -> Result<DatabaseStatus, String> {
     Ok(state.status().await)
 }
 
 #[tauri::command]
-pub async fn retry_database_connection(app: AppHandle, state: State<'_, DatabaseState>) -> Result<DatabaseStatus, String> {
-    Ok(state.initialize(&app).await)
-}
-
-#[tauri::command]
-pub async fn create_measurement(
+pub async fn retry_database_connection(
+    app: AppHandle,
     state: State<'_, DatabaseState>,
-    request: CreateMeasurementRequest,
-) -> Result<i64, String> {
-    let pool = state.pool().await?;
-    MeasurementService::create(&pool, request).await
+) -> Result<DatabaseStatus, String> {
+    Ok(state.initialize(&app).await)
 }
 
 #[tauri::command]
@@ -56,4 +57,13 @@ pub async fn get_measurement_statistics(
 ) -> Result<MeasurementStatistics, String> {
     let pool = state.pool().await?;
     MeasurementService::statistics(&pool, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn get_measurement_report(
+    state: State<'_, DatabaseState>,
+    request: Option<MeasurementListRequest>,
+) -> Result<Vec<Measurement>, String> {
+    let pool = state.pool().await?;
+    crate::repositories::MeasurementRepository::report(&pool, &request.unwrap_or_default()).await
 }

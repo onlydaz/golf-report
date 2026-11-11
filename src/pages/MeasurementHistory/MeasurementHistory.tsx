@@ -1,23 +1,21 @@
-
-import { EyeOutlined, FilterOutlined, SearchOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, DatePicker, Empty, Input, Select, Spin, Table, Tag } from "antd";
+import { formatReportTime, reportDateBoundary } from "../../utils/reportTime";
+import { EyeOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, DatePicker, Empty, Input, Select, Spin, Table } from "antd";
 import type { ColumnsType, TablePaginationConfig } from "antd/es/table";
 import type { Dayjs } from "dayjs";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+import { ResultTag } from "../../components/measurement/MeasurementDetails";
 import PageHeader from "../../components/PageHeader";
+import "./MeasurementHistory.css";
 import {
   getMeasurements,
   type BackendMeasurement,
   type MeasurementListRequest,
 } from "../../services/measurementService";
 
-type Result = "OK" | "NG";
-
-function ResultTag({ result }: { result: Result }) {
-  return <Tag color={result === "OK" ? "green" : "red"}>{result}</Tag>;
-}
+type Result = "OK" | "NG" | "UNMEASURED";
 
 function MeasurementHistory() {
   const navigate = useNavigate();
@@ -29,46 +27,66 @@ function MeasurementHistory() {
   const [dateRange, setDateRange] = useState<[Dayjs, Dayjs]>();
   const [data, setData] = useState<BackendMeasurement[]>([]);
   const [total, setTotal] = useState(0);
+  const dataRef = useRef<BackendMeasurement[]>([]);
+  const totalRef = useRef(0);
   const [page, setPage] = useState(1);
+  const requestVersion = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const loadMeasurements = useCallback(async (request: MeasurementListRequest) => {
-    setLoading(true);
-    setError("");
+  const loadMeasurements = useCallback(async (request: MeasurementListRequest, background = false) => {
+    const version = ++requestVersion.current;
+    if (!background) setLoading(true);
 
     try {
       const response = await getMeasurements(request);
-      setData(response.items);
-      setTotal(response.total);
+      if(version !== requestVersion.current) return;
+      if (JSON.stringify(dataRef.current) !== JSON.stringify(response.items)) {
+        dataRef.current = response.items;
+        setData(response.items);
+      }
+      if (totalRef.current !== response.total) {
+        totalRef.current = response.total;
+        setTotal(response.total);
+      }
+      setError("");
     } catch (reason: unknown) {
-      setData([]);
-      setTotal(0);
+      if(version !== requestVersion.current) return;
+      if (!background) {
+        dataRef.current = [];
+        totalRef.current = 0;
+        setData([]);
+        setTotal(0);
+      }
       setError(
         typeof reason === "string"
           ? reason
           : "Không thể tải lịch sử đo từ cơ sở dữ liệu."
       );
     } finally {
-      setLoading(false);
+      if(!background && version === requestVersion.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void loadMeasurements({
-        page,
-        pageSize: 10,
-        search: search.trim() || undefined,
-        result: overallResult,
-        tipResult,
-        buttResult,
-        measuredFrom: dateRange?.[0].startOf("day").toISOString(),
-        measuredTo: dateRange?.[1].endOf("day").toISOString(),
-      });
-    }, 250);
-
-    return () => window.clearTimeout(timer);
+    let disposed = false;
+    let refresh: ReturnType<typeof setTimeout>;
+    ++requestVersion.current;
+    setLoading(true);
+    setError("");
+    let background = false;
+    const poll = async () => {
+      await loadMeasurements({
+        page, pageSize: 10, search: search.trim() || undefined,
+        result: overallResult, tipResult, buttResult,
+        measuredFrom: dateRange ? reportDateBoundary(dateRange[0]) : undefined,
+        measuredTo: dateRange ? reportDateBoundary(dateRange[1], true) : undefined,
+      }, background);
+      background = true;
+      if (!disposed) refresh = setTimeout(() => void poll(), 3000);
+    };
+    const timer = setTimeout(() => void poll(), 250);
+    return () => { disposed = true; ++requestVersion.current; clearTimeout(timer); clearTimeout(refresh); };
   }, [buttResult, dateRange, loadMeasurements, overallResult, page, search, tipResult]);
 
   const clearFilters = () => {
@@ -84,6 +102,8 @@ function MeasurementHistory() {
     {
       title: "Mã bản ghi",
       dataIndex: "id",
+      align: "center",
+      width: 96,
       render: (value: number) => (
         <span style={{ fontWeight: 600, color: "#1769aa" }}>
           #{value}
@@ -93,39 +113,50 @@ function MeasurementHistory() {
     {
       title: "Mã sản phẩm",
       dataIndex: "productCode",
+      width: 176,
     },
     {
       title: "Số thứ tự gậy",
       dataIndex: "clubNumber",
+      align: "center",
+      width: 120,
     },
     {
-      title: "Thời gian đo",
+      title: "Thời gian nhận",
       dataIndex: "measuredAt",
-      render: (value: string) => new Date(value).toLocaleString("vi-VN"),
+      align: "center",
+      width: 172,
+      render: (value: string) => formatReportTime(value),
     },
     {
-      title: "Weight",
-      dataIndex: "weight",
+      title: "RecordSeq", dataIndex: "recordSeq", width: 94, align: "center",
     },
     {
       title: "Kết quả Tip",
       dataIndex: "tipResult",
+      align: "center",
+      width: 102,
       render: (value: Result) => <ResultTag result={value} />,
     },
     {
       title: "Kết quả Butt",
       dataIndex: "buttResult",
+      align: "center",
+      width: 104,
       render: (value: Result) => <ResultTag result={value} />,
     },
     {
       title: "Kết quả tổng thể",
       dataIndex: "overallResult",
+      align: "center",
+      width: 130,
       render: (value: Result) => <ResultTag result={value} />,
     },
     {
-      title: "Thao tác",
+      title: "",
       key: "action",
-      align: "right",
+      align: "center",
+      width: 142,
       render: (_, record) => (
         <Button
           type="link"
@@ -148,7 +179,7 @@ function MeasurementHistory() {
   };
 
   return (
-    <>
+    <div className="measurement-history-page">
       <PageHeader
         eyebrow="Bản ghi"
         title="Lịch sử đo"
@@ -156,7 +187,7 @@ function MeasurementHistory() {
       />
 
       <Card className="section-card">
-        <div className="filter-row" style={{ marginBottom: 22 }}>
+        <div className="history-filter-row">
           <div className="filter-field filter-field-wide">
             <span className="filter-label">
               Mã sản phẩm hoặc số gậy
@@ -173,7 +204,6 @@ function MeasurementHistory() {
               allowClear
             />
           </div>
-
           <div className="filter-field">
             <span className="filter-label">Kết quả tổng thể</span>
 
@@ -189,6 +219,7 @@ function MeasurementHistory() {
               options={[
                 { value: "OK", label: "OK" },
                 { value: "NG", label: "NG" },
+                { value: "UNMEASURED", label: "Chưa đo" },
               ]}
             />
           </div>
@@ -208,6 +239,7 @@ function MeasurementHistory() {
               options={[
                 { value: "OK", label: "OK" },
                 { value: "NG", label: "NG" },
+                { value: "UNMEASURED", label: "Chưa đo" },
               ]}
             />
           </div>
@@ -227,6 +259,7 @@ function MeasurementHistory() {
               options={[
                 { value: "OK", label: "OK" },
                 { value: "NG", label: "NG" },
+                { value: "UNMEASURED", label: "Chưa đo" },
               ]}
             />
           </div>
@@ -248,22 +281,22 @@ function MeasurementHistory() {
             />
           </div>
 
-          <Button
-            icon={<FilterOutlined />}
-            onClick={clearFilters}
-          >
-            Xóa bộ lọc
+        </div>
+        <div className="history-filter-actions">
+          <Button icon={<ReloadOutlined />} onClick={clearFilters}>
+            Đặt lại
           </Button>
         </div>
 
-        {error ? (
+        {error && (
           <Alert
             type="error"
             showIcon
             message="Không thể tải lịch sử đo"
             description={error}
           />
-        ) : loading ? (
+        )}
+        {loading ? (
           <div style={{ padding: 48, textAlign: "center" }}>
             <Spin tip="Đang tải lịch sử đo..." />
           </div>
@@ -271,15 +304,16 @@ function MeasurementHistory() {
           <Empty description="Không có kết quả đo phù hợp." />
         ) : (
           <Table<BackendMeasurement>
+            className="history-table"
             rowKey="id"
             columns={columns}
             dataSource={data}
             pagination={pagination}
-            scroll={{ x: 1100 }}
+            scroll={{ x: 1136 }}
           />
         )}
       </Card>
-    </>
+    </div>
   );
 }
 

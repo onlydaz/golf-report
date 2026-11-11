@@ -567,3 +567,12 @@ select {
 .add-measurement-card .tip-position .ant-tag {
   font-size: 13px;
 }
+.station-summary {
+  margin-bottom: 16px;
+}
+
+.measurement-details {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

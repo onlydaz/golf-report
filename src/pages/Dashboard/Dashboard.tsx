@@ -1,3 +1,4 @@
+import { formatReportTime, reportDateBoundary, vietnamNow } from "../../utils/reportTime";
 import {
   ArrowRightOutlined,
   ReloadOutlined,
@@ -18,8 +19,8 @@ import {
 } from "antd";
 
 import type { ColumnsType } from "antd/es/table";
-import dayjs, { type Dayjs } from "dayjs";
-import { useCallback, useEffect, useState } from "react";
+import type { Dayjs } from "dayjs";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Cell,
@@ -37,6 +38,7 @@ import {
 
 import { useNavigate } from "react-router-dom";
 import PageHeader from "../../components/PageHeader";
+import "./Dashboard.css";
 
 import {
   getMeasurementStatistics,
@@ -47,14 +49,14 @@ import {
 } from "../../services/measurementService";
 
 const initialRange: [Dayjs, Dayjs] = [
-  dayjs().subtract(29, "day").startOf("day"),
-  dayjs().endOf("day"),
+  vietnamNow().subtract(29, "day").startOf("day"),
+  vietnamNow().endOf("day"),
 ];
 
 const resultColors = {
   OK: "#1d9b6c",
   NG: "#d95757",
-  INCOMPLETE: "#829ab1",
+  UNMEASURED: "#829ab1",
 };
 
 function Dashboard() {
@@ -63,16 +65,18 @@ function Dashboard() {
   const [range, setRange] = useState<[Dayjs, Dayjs]>(initialRange);
   const [statistics, setStatistics] = useState<MeasurementStatistics>();
   const [recent, setRecent] = useState<BackendMeasurement[]>([]);
+  const requestVersion = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async (nextRange: [Dayjs, Dayjs]) => {
+    const version = ++requestVersion.current;
     setLoading(true);
     setError("");
 
     const request: MeasurementListRequest = {
-      measuredFrom: nextRange[0].toISOString(),
-      measuredTo: nextRange[1].toISOString(),
+      measuredFrom: reportDateBoundary(nextRange[0]),
+      measuredTo: reportDateBoundary(nextRange[1], true),
     };
 
     try {
@@ -81,9 +85,11 @@ function Dashboard() {
         getMeasurements({ ...request, page: 1, pageSize: 5 }),
       ]);
 
+      if(version !== requestVersion.current) return;
       setStatistics(stats);
       setRecent(records.items);
     } catch (reason: unknown) {
+      if(version !== requestVersion.current) return;
       setStatistics(undefined);
       setRecent([]);
       setError(
@@ -92,7 +98,7 @@ function Dashboard() {
           : "Không thể tải dữ liệu Dashboard từ PostgreSQL."
       );
     } finally {
-      setLoading(false);
+      if(version === requestVersion.current) setLoading(false);
     }
   }, []);
 
@@ -104,6 +110,7 @@ function Dashboard() {
     {
       title: "Mã bản ghi",
       dataIndex: "id",
+      align: "center",
       render: (value: number) => (
         <span style={{ fontWeight: 600, color: "#1769aa" }}>
           #{value}
@@ -117,17 +124,20 @@ function Dashboard() {
     {
       title: "Số gậy",
       dataIndex: "clubNumber",
+      align: "center",
     },
     {
       title: "Thời gian",
       dataIndex: "measuredAt",
-      render: (value: string) => new Date(value).toLocaleString("vi-VN"),
+      align: "center",
+      render: (value: string) => formatReportTime(value),
     },
     {
       title: "Kết quả tổng",
       dataIndex: "overallResult",
-      render: (value: "OK" | "NG") => (
-        <Tag color={value === "OK" ? "green" : "red"}>
+      align: "center",
+      render: (value: "OK" | "NG" | "UNMEASURED") => (
+        <Tag color={value === "OK" ? "green" : value === "NG" ? "red" : "default"}>
           {value}
         </Tag>
       ),
@@ -138,25 +148,27 @@ function Dashboard() {
 
   const distribution = (statistics?.overallDistribution ?? []).map(
     (item) => ({
-      name: item.result,
+      name: item.result === "UNMEASURED" ? "Chưa đo" : item.result,
+      result: item.result,
       value: item.count,
     })
   );
 
+
   return (
-    <>
+    <div className="dashboard-page">
       <PageHeader
         eyebrow="Tổng quan"
         title="Tổng quan kết quả đo"
         description="Theo dõi và thống kê kết quả đo gậy Golf."
         extra={
-          <Space>
+          <Space className="dashboard-header-actions" wrap>
             <DatePicker.RangePicker
               value={range}
               onChange={(value) =>
                 value?.[0] &&
                 value[1] &&
-                setRange([value[0], value[1]])
+                setRange([value[0].startOf("day"), value[1].endOf("day")])
               }
             />
 
@@ -169,6 +181,7 @@ function Dashboard() {
           </Space>
         }
       />
+
 
       {error && (
         <Alert
@@ -193,7 +206,7 @@ function Dashboard() {
             gutter={[16, 16]}
             style={{ marginBottom: 20 }}
           >
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Tổng số lần đo</div>
                 <div className="stat-value">
@@ -202,7 +215,7 @@ function Dashboard() {
               </Card>
             </Col>
 
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Tổng OK</div>
                 <div className="stat-value" style={{ color: "#1d9b6c" }}>
@@ -211,7 +224,7 @@ function Dashboard() {
               </Card>
             </Col>
 
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Tổng NG</div>
                 <div className="stat-value" style={{ color: "#d95757" }}>
@@ -220,7 +233,7 @@ function Dashboard() {
               </Card>
             </Col>
 
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Tỷ lệ đạt</div>
                 <div className="stat-value" style={{ color: "#1d9b6c" }}>
@@ -231,7 +244,7 @@ function Dashboard() {
               </Card>
             </Col>
 
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Tip NG</div>
                 <div className="stat-value" style={{ color: "#d95757" }}>
@@ -240,7 +253,7 @@ function Dashboard() {
               </Card>
             </Col>
 
-            <Col xs={24} sm={12} xl={4}>
+            <Col xs={24} sm={12} lg={8} xl={4}>
               <Card className="section-card stat-card">
                 <div className="stat-label">Butt NG</div>
                 <div className="stat-value" style={{ color: "#d95757" }}>
@@ -252,7 +265,7 @@ function Dashboard() {
 
 
           <div className="content-grid">
-            <Card className="section-card">
+            <Card className="section-card dashboard-chart-card">
               <div className="card-heading">
                 <div>
                   <div className="card-title">
@@ -275,16 +288,16 @@ function Dashboard() {
 
                     <XAxis
                       dataKey="date"
-                      tick={{ fill: "#829ab1", fontSize: 10 }}
+                      tick={{ fill: "#627d98", fontSize: 13 }}
                     />
 
                     <YAxis
                       allowDecimals={false}
-                      tick={{ fill: "#829ab1", fontSize: 11 }}
+                      tick={{ fill: "#627d98", fontSize: 13 }}
                     />
 
-                    <Tooltip />
-                    <Legend />
+                    <Tooltip contentStyle={{ fontSize: 15 }} />
+                    <Legend wrapperStyle={{ fontSize: 14 }} />
 
                     <Bar
                       dataKey="total"
@@ -311,7 +324,7 @@ function Dashboard() {
               </div>
             </Card>
 
-            <Card className="section-card">
+            <Card className="section-card dashboard-chart-card">
               <div className="card-heading">
                 <div>
                   <div className="card-title">
@@ -345,15 +358,15 @@ function Dashboard() {
                             key={item.name}
                             fill={
                               resultColors[
-                                item.name as keyof typeof resultColors
-                              ] ?? resultColors.INCOMPLETE
+                                item.result as keyof typeof resultColors
+                              ] ?? resultColors.UNMEASURED
                             }
                           />
                         ))}
                       </Pie>
 
-                      <Tooltip />
-                      <Legend />
+                      <Tooltip contentStyle={{ fontSize: 15 }} />
+                      <Legend wrapperStyle={{ fontSize: 14 }} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
@@ -388,10 +401,12 @@ function Dashboard() {
               <Empty description="Chưa có phép đo trong khoảng thời gian này." />
             ) : (
               <Table
+                className="dashboard-recent-table"
                 rowKey="id"
                 columns={columns}
                 dataSource={recent}
                 pagination={false}
+                scroll={{ x: 780 }}
                 onRow={(record) => ({
                   onClick: () => navigate(`/measurements/${record.id}`),
                   style: { cursor: "pointer" },
@@ -401,7 +416,7 @@ function Dashboard() {
           </Card>
         </>
       )}
-    </>
+    </div>
   );
 }
 

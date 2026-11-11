@@ -24,3 +24,9 @@ dist-ssr
 *.sw?
 
 database_config.toml
+as200_config.toml
+as200_config.*.backup.toml
+as200_capture_journal.*.backup.json
+as200_capture_journal.json
+as200_capture_journal.tmp
+as200_capture_journal.lock

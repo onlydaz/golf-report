@@ -1,4 +1,3 @@
-
 import {
   BellOutlined,
   DashboardOutlined,
@@ -47,6 +46,7 @@ function MainLayout() {
 
   useEffect(() => {
     let active = true;
+    let timer: number | undefined;
 
     const refreshStatus = async () => {
       try {
@@ -62,19 +62,16 @@ function MainLayout() {
             message: "Không thể đọc trạng thái cơ sở dữ liệu.",
           });
         }
+      } finally {
+        if (active) timer = window.setTimeout(() => void refreshStatus(), 2000);
       }
     };
 
     void refreshStatus();
 
-    const timer = window.setInterval(
-      () => void refreshStatus(),
-      2000
-    );
-
     return () => {
       active = false;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, []);
 
@@ -126,12 +123,13 @@ function MainLayout() {
         <Menu
           theme="dark"
           mode="inline"
-          selectable={false}
+          selectedKeys={[selectedKey]}
+          onClick={({ key }) => navigate(key)}
           items={[
             {
-              key: "settings",
+              key: "/settings/connection",
               icon: <SettingOutlined />,
-              label: "Cài đặt",
+              label: "Cài đặt kết nối",
             },
           ]}
         />

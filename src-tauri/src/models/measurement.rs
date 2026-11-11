@@ -1,61 +1,160 @@
-use crate::enums::{MeasurementResult, TipPositionResult};
-use crate::models::TipPosition;
+use crate::enums::MeasurementResult;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateMeasurementRequest {
-    pub product_code: String,
-    pub club_number: String,
-    pub measured_at: DateTime<Utc>,
-    pub weight: BigDecimal,
-    pub tip_positions: Vec<TipPosition>,
-    pub butt_distance: BigDecimal,
-    pub butt_result: MeasurementResult,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum StationType {
+    Tip,
+    Butt,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Measurement {
-    pub id: i64,
+impl StationType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tip => "TIP",
+            Self::Butt => "BUTT",
+        }
+    }
+}
+impl TryFrom<String> for StationType {
+    type Error = std::io::Error;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "TIP" => Ok(Self::Tip),
+            "BUTT" => Ok(Self::Butt),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid station",
+            )),
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct AttemptInput {
+    pub attempt_number: i32,
+    pub push_dist: Option<BigDecimal>,
+    pub bend: Option<BigDecimal>,
+}
+#[derive(Debug, Clone)]
+pub struct PointInput {
+    pub point_number: i32,
+    pub result: MeasurementResult,
+    pub attempt_count: i32,
+    pub decide_attempt: Option<i32>,
+    pub position: Option<BigDecimal>,
+    pub attempts: Vec<AttemptInput>,
+}
+#[derive(Debug, Clone)]
+pub struct StationInput {
+    pub station_type: StationType,
+    pub result: MeasurementResult,
+    pub point_count: i32,
+    pub ng_point: Option<i32>,
+    pub load: BigDecimal,
+    pub points: Vec<PointInput>,
+}
+#[derive(Debug, Clone)]
+pub struct MeasurementDraft {
+    pub source_id: i64,
+    pub confirmed_session_id: String,
+    pub record_seq: i32,
+    pub total_count: Option<i64>,
     pub product_code: String,
-    pub club_number: String,
+    pub club_number: i32,
     pub measured_at: DateTime<Utc>,
-    pub weight: BigDecimal,
-    pub tip_positions: Vec<TipPosition>,
-    pub tip_result: MeasurementResult,
-    pub butt_distance: BigDecimal,
-    pub butt_result: MeasurementResult,
     pub overall_result: MeasurementResult,
+    pub stations: Vec<StationInput>,
 }
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementAttempt {
+    pub id: i64,
+    pub point_id: i64,
+    pub attempt_number: i32,
+    pub push_dist: Option<BigDecimal>,
+    pub bend: Option<BigDecimal>,
+}
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementPoint {
+    pub id: i64,
+    pub station_id: i64,
+    pub point_number: i32,
+    #[sqlx(try_from = "String")]
+    pub result: MeasurementResult,
+    pub attempt_count: i32,
+    pub decide_attempt: Option<i32>,
+    pub position: Option<BigDecimal>,
+    #[sqlx(skip)]
+    pub attempts: Vec<MeasurementAttempt>,
+}
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementStation {
+    pub id: i64,
+    pub measurement_id: i64,
+    #[sqlx(try_from = "String")]
+    pub station_type: StationType,
+    #[sqlx(try_from = "String")]
+    pub result: MeasurementResult,
+    pub point_count: i32,
+    pub ng_point: Option<i32>,
+    pub load: BigDecimal,
+    pub created_at: DateTime<Utc>,
+    #[sqlx(skip)]
+    pub points: Vec<MeasurementPoint>,
+}
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementSummary {
+    pub id: i64,
+    pub source_id: i64,
+    pub session_id: Option<String>,
+    pub record_seq: i32,
+    pub total_count: Option<i64>,
+    pub product_code: String,
+    pub club_number: i32,
+    pub measured_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    #[sqlx(try_from = "String")]
+    pub overall_result: MeasurementResult,
+    pub tip_result: Option<String>,
+    pub tip_load: Option<BigDecimal>,
+    pub butt_result: Option<String>,
+    pub butt_load: Option<BigDecimal>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Measurement {
+    #[serde(flatten)]
+    pub summary: MeasurementSummary,
+    pub stations: Vec<MeasurementStation>,
+}
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementListRequest {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
     pub search: Option<String>,
     pub product_code: Option<String>,
-    pub club_number: Option<String>,
+    pub club_number: Option<i32>,
     pub measured_from: Option<DateTime<Utc>>,
+    /// Exclusive upper timestamp bound; selected calendar end becomes next-day midnight.
     pub measured_to: Option<DateTime<Utc>>,
     pub tip_result: Option<MeasurementResult>,
     pub butt_result: Option<MeasurementResult>,
     pub result: Option<MeasurementResult>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementListResponse {
-    pub items: Vec<Measurement>,
+    pub items: Vec<MeasurementSummary>,
     pub page: i64,
     pub page_size: i64,
     pub total: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementStatistics {
     pub total_measurements: i64,
@@ -68,50 +167,21 @@ pub struct MeasurementStatistics {
     pub station_results: Vec<StationMeasurementStatistics>,
     pub overall_distribution: Vec<ResultDistribution>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct DailyMeasurementStatistics {
     pub date: String,
     pub total: i64,
     pub ok: i64,
     pub ng: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct StationMeasurementStatistics {
     pub station: String,
     pub ok: i64,
     pub ng: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ResultDistribution {
     pub result: String,
     pub count: i64,
-}
-
-pub fn calculate_tip_result(tips: &[TipPosition]) -> MeasurementResult {
-    if tips.len() != 4 {
-        return MeasurementResult::Incomplete;
-    }
-    if tips.iter().any(|tip| tip.result == TipPositionResult::Ng) {
-        return MeasurementResult::Ng;
-    }
-    if tips.iter().all(|tip| tip.result == TipPositionResult::Ok) {
-        return MeasurementResult::Ok;
-    }
-    MeasurementResult::Incomplete
-}
-
-pub fn calculate_overall_result(tip_result: MeasurementResult, butt_result: MeasurementResult) -> MeasurementResult {
-    if tip_result == MeasurementResult::Ng || butt_result == MeasurementResult::Ng {
-        MeasurementResult::Ng
-    } else if tip_result == MeasurementResult::Ok && butt_result == MeasurementResult::Ok {
-        MeasurementResult::Ok
-    } else {
-        MeasurementResult::Incomplete
-    }
 }
