@@ -42,6 +42,7 @@ fn processed_receipt_matches(row: &InboxRecord, input: &InboxInput) -> bool {
         && row.processing_status == "PROCESSED" && row.measurement_id.is_some() && row.processed_at.is_some()
 }
 
+
 fn verify_return_snapshot_with_receipt(journal: &Journal, report: &PollReport, receipt: Option<&InboxRecord>, trace: &str) -> Result<(), String> {
     let previous = journal.last_total.ok_or_else(|| {
         switch_log(trace, "BUFFER_VERIFY", "COUNTER_CHECKPOINT_MISSING", "expected=stored_last_total actual=none");
@@ -199,6 +200,7 @@ pub struct WorkerState {
     pub(super) settings_path: Arc<Mutex<Option<PathBuf>>>,
     pub(super) settings_directory: Arc<Mutex<Option<PathBuf>>>,
     pub(super) settings_ready: Arc<AtomicBool>,
+    pub(super) runtime_error: Arc<Mutex<Option<String>>>,
     pub(super) settings_restart: Arc<AtomicBool>,
     heartbeat: Arc<std::sync::Mutex<Option<super::as200::heartbeat::HeartbeatMonitor>>>,
     engine: Arc<Mutex<Option<std::sync::Weak<Engine>>>>,
@@ -208,6 +210,16 @@ pub struct WorkerState {
     reconnect_waiters: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
 }
 impl WorkerState {
+    pub(crate) async fn report_runtime_initialization_failure(&self, error: String) {
+        *self.runtime_error.lock().await = Some(error.clone());
+        // A failed runtime check must not enable first-run setup commands.
+        self.settings_ready.store(false, Ordering::SeqCst);
+        let mut status = self.status.write().await;
+        status.enabled = false;
+        status.state = "ERROR".into();
+        status.message = error;
+    }
+
     pub(super) async fn stop_collection(&self) -> Result<(), String> {
         let path = self.settings_path.lock().await.clone().ok_or("Chưa có cấu hình kết nối.")?;
         let engine = self
@@ -350,13 +362,12 @@ struct Journal {
     deliveries: Vec<Delivery>,
 }
 impl Journal {
-    // Reset detection preserves both empty buffers as quarantine evidence. These
-    // entries contain no measurement payload; retain them in the old journal,
-    // but allow the existing explicit reset-confirmation flow to reconcile them.
-    fn has_only_empty_reset_diagnostics(&self, config: &SimulatorConfig) -> bool {
+    // A reset may be isolated to its source only after the old ACK checkpoint is
+    // complete. Keep the pause and any empty-buffer evidence in that journal.
+    fn has_reconciliable_reset_diagnostics(&self, config: &SimulatorConfig) -> bool {
         self.pause.as_deref() == Some("RESET")
-            && self.last_total.is_some_and(|total| total > 0)
-            && !self.quarantine.is_empty()
+            && self.last_total.is_some_and(|total| total > 0 && self.ack.accepted == total)
+            && self.ack.intent.is_none()
             && self.quarantine.iter().all(|q| {
                 q.source_key == config.source_key
                     && q.session_id == config.confirmed_session_id
@@ -374,8 +385,10 @@ impl Journal {
                             && c.pc_read_done == 0 && c.data_ready == 0
                     })
             })
-            && self.warnings.iter().all(|warning| self.quarantine.iter().any(|q|
-                *warning == format!("QUARANTINE: đã giữ dữ liệu lỗi tại buffer {} để đối chiếu; chưa gửi xác nhận đã đọc.", q.buffer_index)))
+            && self.warnings.iter().all(|warning| warning.starts_with("RESET_CONTEXT:")
+                || warning.starts_with("RESET:")
+                || self.quarantine.iter().any(|q|
+                    *warning == format!("QUARANTINE: đã giữ dữ liệu lỗi tại buffer {} để đối chiếu; chưa gửi xác nhận đã đọc.", q.buffer_index)))
     }
 }
 pub(super) struct Engine {
@@ -665,6 +678,36 @@ impl Engine {
                             raw_registers: buffer.raw_registers.clone(),
                             error,
                         });
+                        let quarantine = journal.quarantine.last().expect("quarantine vừa được thêm");
+                        let nonzero_words = quarantine
+                            .raw_registers
+                            .iter()
+                            .filter(|word| **word != 0)
+                            .count();
+                        switch_log(
+                            "worker",
+                            "QUARANTINE",
+                            "RECORDED",
+                            format!(
+                                "buffer={} record_seq={:?} total={} error={} received_at={} raw_words={} nonzero_words={} raw_checksum={} control={:?}",
+                                quarantine.buffer_index,
+                                quarantine.record_seq,
+                                quarantine.total_count,
+                                quarantine.error,
+                                quarantine.received_at,
+                                quarantine.raw_registers.len(),
+                                nonzero_words,
+                                quarantine.raw_registers.iter().fold(0u32, |sum, word| {
+                                    sum.wrapping_add(u32::from(*word))
+                                }),
+                                quarantine.control.as_ref().map(|control| (
+                                    control.total_count,
+                                    control.pc_read_count,
+                                    control.pc_read_done,
+                                    control.data_ready
+                                ))
+                            ),
+                        );
                         Self::warn(
                             journal,
                             format!(
@@ -2034,6 +2077,32 @@ impl WorkerState {
                 "Không thể đọc lịch sử máy đo cũ.".to_string()
             })?;
         switch_log(trace, "JOURNAL_CHECK", "OBSERVED", format!("version={} source_matches={} session_matches={} last_total={:?} deliveries={} quarantine={} pause_present={} retries={}", journal.version, journal.source_key == config.source_key, journal.session_id == config.confirmed_session_id, journal.last_total, journal.deliveries.len(), journal.quarantine.len(), journal.pause.is_some(), journal.retries.len()));
+        for quarantine in &journal.quarantine {
+            switch_log(
+                trace,
+                "QUARANTINE_CHECK",
+                "OBSERVED",
+                format!(
+                    "buffer={} record_seq={:?} total={} error={} received_at={} raw_words={} nonzero_words={} raw_checksum={} control={:?}",
+                    quarantine.buffer_index,
+                    quarantine.record_seq,
+                    quarantine.total_count,
+                    quarantine.error,
+                    quarantine.received_at,
+                    quarantine.raw_registers.len(),
+                    quarantine.raw_registers.iter().filter(|word| **word != 0).count(),
+                    quarantine.raw_registers.iter().fold(0u32, |sum, word| {
+                        sum.wrapping_add(u32::from(*word))
+                    }),
+                    quarantine.control.as_ref().map(|control| (
+                        control.total_count,
+                        control.pc_read_count,
+                        control.pc_read_done,
+                        control.data_ready
+                    ))
+                ),
+            );
+        }
         let busy = "Máy đo cũ còn dữ liệu chưa xử lý. Chưa thể chuyển kết nối.";
         if !matches!(journal.version, 1 | 2) || journal.source_key != config.source_key
             || journal.session_id != config.confirmed_session_id || journal.session_id.is_none() {
@@ -2044,7 +2113,32 @@ impl WorkerState {
             switch_log(trace, "ACK_CHECK", "ACK_INTENT_PENDING", format!("accepted={} intent_present=true", journal.ack.accepted));
             return Err("Máy đo cũ còn ACK chưa có bằng chứng hoàn tất. Chưa thể chuyển kết nối.".into());
         }
-        let empty_reset = for_reset && journal.has_only_empty_reset_diagnostics(config);
+        let empty_reset = for_reset && journal.has_reconciliable_reset_diagnostics(config);
+        if journal.pause.as_deref() == Some("RESET")
+            && (journal
+                .last_total
+                .is_some_and(|total| journal.ack.accepted < total)
+                || journal.deliveries.iter().any(|delivery| !delivery.terminal)
+                || (!journal.quarantine.is_empty() && !empty_reset))
+        {
+            switch_log(
+                trace,
+                "RESET_CHECK",
+                "DATA_LOSS_RISK",
+                format!(
+                    "last_total={:?} accepted={} pending_deliveries={} quarantine={} empty_reset={}",
+                    journal.last_total,
+                    journal.ack.accepted,
+                    journal.deliveries.iter().filter(|delivery| !delivery.terminal).count(),
+                    journal.quarantine.len(),
+                    empty_reset
+                ),
+            );
+            return Err(
+                "PLC đã reset khi còn bản ghi chưa được lưu/ACK đầy đủ; có nguy cơ mất dữ liệu. Không tự tạo epoch mới."
+                    .into(),
+            );
+        }
         if (!empty_reset && (journal.pause.is_some() || !journal.quarantine.is_empty()))
             || journal.session_request.is_some() || config.session_transition.is_some() {
             switch_log(trace, "JOURNAL_CHECK", "DIAGNOSTIC_PENDING", format!("pause_present={} quarantine={} session_request={} transition={}", journal.pause.is_some(), journal.quarantine.len(), journal.session_request.is_some(), config.session_transition.is_some()));
@@ -2064,6 +2158,12 @@ impl WorkerState {
                 .bind(&config.source_key).bind(&config.confirmed_session_id).fetch_one(pool).await.map_err(|_| busy.to_string())?;
             switch_log(trace, "INBOX_CHECK", if last == Some(total) { "PASS" } else { "MEASUREMENT_CHECKPOINT_MISMATCH" }, format!("expected_last_seq={total} actual_last_seq={last:?}"));
             if last != Some(total) { return Err("Lịch sử máy đo cũ không khớp cơ sở dữ liệu. Chưa thể chuyển kết nối.".into()); }
+            if empty_reset {
+                let processed_prefix: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id JOIN measurements m ON m.id=i.measurement_id AND m.source_id=i.source_id AND m.session_id=i.session_id AND m.record_seq=i.record_seq WHERE s.source_key=$1 AND i.session_id=$2 AND i.record_seq BETWEEN 1 AND $3 AND i.processing_status='PROCESSED' AND i.processed_at IS NOT NULL")
+                    .bind(&config.source_key).bind(&config.confirmed_session_id).bind(total)
+                    .fetch_one(pool).await.map_err(|_| busy.to_string())?;
+                if processed_prefix != i64::from(total) { return Err(busy.into()); }
+            }
         }
         for delivery in &journal.deliveries {
             let id = delivery.inbox_id.ok_or(busy)?;
@@ -2107,7 +2207,7 @@ impl WorkerState {
             switch_log(trace, "ACK_CHECK", "ACK_INTENT_PENDING", format!("accepted={} intent_present=true", journal.ack.accepted));
             return Err("Máy đo cũ còn ACK chưa hoàn tất. Vui lòng liên hệ kỹ thuật đối chiếu xác nhận đã đọc trước khi bắt đầu phiên mới.".into());
         }
-        let empty_reset = journal.has_only_empty_reset_diagnostics(config);
+        let empty_reset = journal.has_reconciliable_reset_diagnostics(config);
         if !matches!(journal.version, 1 | 2) || journal.source_key != config.source_key
             || journal.session_id != config.confirmed_session_id
             || (!empty_reset && (journal.pause.is_some() || !journal.quarantine.is_empty()))
@@ -2121,7 +2221,7 @@ impl WorkerState {
             switch_log(trace, "PLC_SNAPSHOT", "PLC_READ_FAILED", format!("reader_error={error}"));
             "Không thể xác minh dữ liệu máy đo."
         })?;
-        if historical {
+        {
             let confirm = As200Reader::new(config.reader()).poll().await.map_err(|error| {
                 switch_log(trace, "PLC_SNAPSHOT", "PLC_READ_FAILED", format!("second_reader_error={error}"));
                 "Không thể đọc lại máy đo để xác minh trạng thái ổn định."
@@ -2388,6 +2488,15 @@ impl WorkerState {
             let mut status = self.status.write().await;
             status.state = "ERROR".into();
             status.message = error;
+            return;
+        }
+        if config.0.ack_enabled && !simulator_config::ack_scope_allows(&config.0) {
+            let mut status = self.status.write().await;
+            status.state = "SETUP_REQUIRED".into();
+            status.message = format!(
+                "Bản phát hành chưa được kỹ thuật phê duyệt cho phạm vi ACK AS200 ({}).",
+                simulator_config::AS200_ACK_SCOPE_ID
+            );
             return;
         }
         eprintln!(

@@ -466,8 +466,6 @@ async fn first_installation_persists_only_endpoint_and_never_creates_identity_or
     for key in [
         "source_key",
         "confirmed_session_id",
-        "word_order",
-        "modbus_address_offset",
     ] {
         assert!(values.get(key).is_none());
     }

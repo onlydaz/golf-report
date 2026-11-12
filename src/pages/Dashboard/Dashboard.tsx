@@ -41,6 +41,7 @@ import PageHeader from "../../components/PageHeader";
 import "./Dashboard.css";
 
 import {
+  getDatabaseStatus,
   getMeasurementStatistics,
   getMeasurements,
   type BackendMeasurement,
@@ -66,12 +67,13 @@ function Dashboard() {
   const [statistics, setStatistics] = useState<MeasurementStatistics>();
   const [recent, setRecent] = useState<BackendMeasurement[]>([]);
   const requestVersion = useRef(0);
+  const hasData = useRef(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const load = useCallback(async (nextRange: [Dayjs, Dayjs]) => {
+  const load = useCallback(async (nextRange: [Dayjs, Dayjs], showLoading = true) => {
     const version = ++requestVersion.current;
-    setLoading(true);
+    if (showLoading) setLoading(true);
     setError("");
 
     const request: MeasurementListRequest = {
@@ -86,24 +88,66 @@ function Dashboard() {
       ]);
 
       if(version !== requestVersion.current) return;
+      hasData.current = true;
       setStatistics(stats);
       setRecent(records.items);
     } catch (reason: unknown) {
       if(version !== requestVersion.current) return;
-      setStatistics(undefined);
-      setRecent([]);
       setError(
         typeof reason === "string"
           ? reason
           : "Không thể tải dữ liệu Dashboard từ PostgreSQL."
       );
     } finally {
-      if(version === requestVersion.current) setLoading(false);
+      if(version === requestVersion.current && showLoading) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load(range);
+    let disposed = false;
+    let checking = false;
+    let ready = false;
+
+    const checkDatabase = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const status = await getDatabaseStatus();
+        if (disposed) return;
+        if (status.state === "CONNECTED") {
+          if (!ready) {
+            ready = true;
+            void load(range, !hasData.current);
+          }
+        } else {
+          if (ready) ++requestVersion.current;
+          ready = false;
+          if (status.state === "CONNECTING") {
+            setLoading(!hasData.current);
+            setError("");
+          } else {
+            setLoading(false);
+            setError(status.message);
+          }
+        }
+      } catch (reason: unknown) {
+        if (disposed) return;
+        ++requestVersion.current;
+        ready = false;
+        setLoading(false);
+        setError(typeof reason === "string" ? reason : "Không thể kiểm tra trạng thái cơ sở dữ liệu.");
+      } finally {
+        checking = false;
+      }
+    };
+
+    void checkDatabase();
+    const timer = window.setInterval(() => void checkDatabase(), 3000);
+    return () => {
+      disposed = true;
+      ++requestVersion.current;
+      window.clearInterval(timer);
+    };
   }, [load, range]);
 
   const columns: ColumnsType<BackendMeasurement> = [

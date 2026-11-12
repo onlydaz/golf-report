@@ -1,9 +1,9 @@
 import { ApiOutlined, CheckCircleOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, Form, Input, InputNumber, Tag } from "antd";
+import { Alert, Button, Card, Form, Input, InputNumber, Modal, Tag } from "antd";
 import { useEffect, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
 import { getAs200WorkerStatus, type As200Status } from "../../services/as200Service";
-import { getPlcConnectionSettings, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
+import { getPlcConnectionSettings, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, updatePlcConnectionSettings, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
 
 export default function ConnectionSettings() {
@@ -17,7 +17,6 @@ export default function ConnectionSettings() {
   const [notice, setNotice] = useState("");
   const [tested, setTested] = useState<"idle" | "ok" | "failed">("idle");
   const [worker, setWorker] = useState<As200Status>();
-  const [resetRequired, setResetRequired] = useState(false);
   const inFlight = useRef(false);
   const mounted = useRef(true);
   useEffect(() => {
@@ -51,15 +50,32 @@ export default function ConnectionSettings() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
   const changed = () => {
-    setResetRequired(false);
     const values = form.getFieldsValue();
     setDirty(!!settings && (!settings.endpoint || values.ip !== settings.endpoint.ip || values.port !== settings.endpoint.port || values.unitId !== settings.endpoint.unitId));
     setTested("idle"); setError(""); setNotice("");
   };
-  const act = async (action: "test" | "save", confirmReset = false) => {
+  const connect = async (values: PlcEndpoint, revision: string) => {
+    try {
+      await connectPlcCollection(values, revision);
+    } catch (e) {
+      if (e !== "RESET_CONFIRMATION_REQUIRED") throw e;
+      const confirmed = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: "Xác nhận phiên đo mới",
+          content: <>Bộ đếm của máy đo đã được đặt lại. Bạn có muốn bắt đầu phiên đo mới không?<br /><br />Dữ liệu đã lưu trước đó vẫn được giữ nguyên.</>,
+          okText: "Xác nhận",
+          cancelText: "Hủy",
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (!confirmed) throw "Chưa xác nhận phiên mới sau khi Simulator reset; dữ liệu và Journal cũ được giữ nguyên.";
+      await connectPlcCollection(values, revision, true);
+    }
+  };
+  const act = async (action: "test" | "save") => {
     if (inFlight.current || !settings) return;
     if (action === "save" && !canEditConnection) return;
-    if (confirmReset && !resetRequired) return;
     inFlight.current = true;
     try {
       const values = await form.validateFields();
@@ -67,10 +83,19 @@ export default function ConnectionSettings() {
       if (action === "test") {
         setTested("idle"); await testPlcConnection(values);
         if (mounted.current) setTested("ok");
+      } else if (!settings.configured) {
+        const saved = await updatePlcConnectionSettings(values, settings.revision);
+        await connect(values, saved.revision);
+        if (mounted.current) {
+          const current = await getAs200WorkerStatus();
+          setSettings(await getPlcConnectionSettings());
+          setDirty(false);
+          setWorker(current);
+          setNotice("Đã lưu cấu hình và bắt đầu thu dữ liệu.");
+        }
       } else {
         setNotice("Đang kết nối với máy đo...");
-        await connectPlcCollection(values, settings.revision, confirmReset);
-        if (mounted.current) { setResetRequired(false); }
+        await connect(values, settings.revision);
         const saved = await getPlcConnectionSettings();
         const current = await getAs200WorkerStatus();
         if (mounted.current) { setSettings(saved); if (saved.endpoint) form.setFieldsValue(saved.endpoint); setDirty(false); setWorker(current); setNotice(""); }
@@ -81,15 +106,11 @@ export default function ConnectionSettings() {
         setNotice("");
         setErrorAction(action);
         if (action === "test") setTested("failed");
-        const needsReset = action === "save" && e === "RESET_CONFIRMATION_REQUIRED";
-        setResetRequired(needsReset);
-        setError(needsReset ? "PLC đã khởi động lại. Vui lòng kiểm tra kết quả đo trước khi tiếp tục." : plcConnectionError(e, action === "test" ? "Không thể kết nối với PLC. Vui lòng kiểm tra địa chỉ IP và cổng kết nối." : "Không thể lưu thay đổi. Vui lòng thử lại hoặc liên hệ kỹ thuật."));
+        setError(plcConnectionError(e, action === "test" ? "Không thể kết nối với PLC. Vui lòng kiểm tra địa chỉ IP và cổng kết nối." : "Không thể lưu và bắt đầu thu dữ liệu."));
       }
     } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
   };
-  const canEditConnection = !!worker && !worker.enabled
-    && (worker.state === "STOPPED" || !settings?.configured)
-    && !worker.message.includes("dữ liệu chưa lưu");
+  const canEditConnection = !!settings && worker?.state !== "STOPPING";
   const receiving = !worker ? "Chưa xác định"
     : worker.state === "STOPPING" ? "Đang dừng thu dữ liệu"
     : worker.state === "STOPPED" ? worker.message.includes("dữ liệu chưa lưu") ? "Đã dừng; còn dữ liệu chờ phục hồi" : "Đã dừng thu dữ liệu"
@@ -131,11 +152,6 @@ export default function ConnectionSettings() {
           </Form>
         <div className="plc-settings-feedback" aria-live="polite">
           {error && errorAction !== "test" && <Alert type="error" showIcon title={error} />}
-          {resetRequired && !worker?.enabled && <div>
-            <Button disabled={!!busy || worker?.state !== "STOPPED"} loading={busy === "save"} onClick={() => void act("save", true)}>
-              Bắt đầu phiên mới
-            </Button>
-          </div>}
           {notice && <p className="plc-settings-saved"><CheckCircleOutlined /> {notice}</p>}
         </div>
           </section>
@@ -152,7 +168,7 @@ export default function ConnectionSettings() {
           <div><dt>Cấu hình đã lưu</dt><dd>{settings?.endpoint ? endpointText(settings.endpoint) : "Chưa thiết lập"}</dd></div>
           <div><dt>Nhận dữ liệu đo</dt><dd>{receiving}
             {!worker && <small>Chưa lấy được trạng thái bộ thu dữ liệu.</small>}
-            {worker && !worker.enabled && <small>Liên hệ kỹ thuật để bật ghi nhận kết quả đo.</small>}
+            {worker && !worker.enabled && <small>Kiểm tra lại hồ sơ AS200 và trạng thái PLC để tiếp tục.</small>}
           </dd></div>
             </dl>
           </section>

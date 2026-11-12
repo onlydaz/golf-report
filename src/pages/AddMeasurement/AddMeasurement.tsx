@@ -72,6 +72,10 @@ function displayNotice(notice: string, fallback: string): string {
     return `Đã lưu kết quả đo thành công. Mã phép đo: ${saved[1]}`;
   }
 
+  if (/RESET\/CONFLICT/.test(notice)) {
+    return "Bộ đếm PLC không khớp dữ liệu đã lưu. Hệ thống chưa xác nhận đã đọc; vui lòng liên hệ kỹ thuật để đối chiếu.";
+  }
+
   if (/RESET|counter giảm|TotalCount thấp hơn/.test(notice)) {
     return "Bộ đếm thiết bị đã giảm so với lần tiếp nhận trước. Vui lòng liên hệ kỹ thuật để đối chiếu phiên. Không đổi phiên để bỏ qua cảnh báo.";
   }
@@ -214,6 +218,9 @@ function AddMeasurement() {
         if (active) {
           setStatus(next);
           setError("");
+          if (next.enabled && next.connection === "CONNECTED" && !next.pauseReason) {
+            setCollectionError("");
+          }
         }
         if (active) setSettings(await getPlcConnectionSettings());
       } catch {
@@ -285,9 +292,24 @@ function AddMeasurement() {
     status.ackStatus === "FAILED" || status.ackStatus === "RECONCILIATION_REQUIRED" ||
     status.pcHeartbeatStatus === "FAILED" || latest?.saveState === "FAILED"
   );
+  const resetNeedsReview = !error && status?.pauseReason === "RESET";
+  const hasIndependentDataRisk = !!status && (
+    status.volatileCount > 0 || status.blockedInboxCount > 0 || latest?.saveState === "FAILED" ||
+    status.ackStatus === "FAILED" || status.ackStatus === "RECONCILIATION_REQUIRED" ||
+    status.warnings.some((warning) => /BUFFER GAP|OVERFLOW|QUEUE_FULL|CONFLICT|LOCAL_HISTORY_MISSING|DIAGNOSTIC_FULL|INBOX_RETRY_BLOCKED/.test(warning))
+  );
+  const resetConfirmationReady = resetNeedsReview && collectionError === "RESET_CONFIRMATION_REQUIRED" && !hasIndependentDataRisk;
   let systemNotice = error;
   if (!systemNotice && status) {
-    if (["ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || status.pauseReason) {
+    if (resetNeedsReview) {
+      systemNotice = status.ackStatus === "RECONCILIATION_REQUIRED"
+        ? "ACK chưa hoàn tất; cần kỹ thuật đối chiếu xác nhận từ PLC."
+        : status.ackStatus === "FAILED"
+          ? "Không xác nhận được ACK với PLC. Vui lòng liên hệ kỹ thuật."
+          : latest?.saveState === "FAILED"
+            ? "Chưa lưu được kết quả đo gần nhất. Vui lòng kiểm tra kết nối dữ liệu."
+            : "Cần kiểm tra kết nối máy đo";
+    } else if (["ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || status.pauseReason) {
       systemNotice = displayNotice(status.message, states[status.state] ?? "Có lỗi cần kiểm tra.");
     } else if (latest?.saveState === "FAILED") {
       systemNotice = "Chưa lưu được kết quả đo gần nhất. Hệ thống sẽ thử lại; vui lòng kiểm tra kết nối dữ liệu.";
@@ -296,7 +318,7 @@ function AddMeasurement() {
     } else if (!status.enabled) {
       systemNotice = "Hệ thống đã dừng thu dữ liệu. Có thể bắt đầu thu tại đây khi đủ điều kiện.";
     } else if (status.connection === "DISCONNECTED") {
-      systemNotice = "Mất kết nối PLC. Hệ thống đang thử kết nối lại.";
+      systemNotice = "Mất kết nối với máy đo. Đang thử kết nối lại...";
     } else if (status.ackStatus === "RECONCILIATION_REQUIRED") {
       systemNotice = "Cần kỹ thuật đối chiếu xác nhận từ PLC. Dữ liệu chờ được giữ nguyên.";
     } else if (status.ackStatus === "FAILED") {
@@ -313,9 +335,19 @@ function AddMeasurement() {
       systemNotice = "Đang theo dõi hoạt động PLC trước khi xác nhận dữ liệu.";
     }
   }
-  const visibleWarnings = [...new Set((status?.warnings ?? []).map((warning) =>
-    displayNotice(warning, "Hệ thống ghi nhận cảnh báo. Vui lòng liên hệ kỹ thuật để kiểm tra.")
-  ))].filter((warning) => warning !== systemNotice);
+  const visibleWarnings = (status?.warnings ?? []).filter((warning) =>
+    !/^(?:RESET_CONTEXT:|RESET:)/.test(warning) && !(resetConfirmationReady && /^QUARANTINE:/.test(warning))
+  ).map((warning) => ({
+    message: displayNotice(warning, "Hệ thống ghi nhận cảnh báo. Vui lòng liên hệ kỹ thuật để kiểm tra."),
+    severity: (/BUFFER GAP|OVERFLOW|QUEUE_FULL|CONFLICT|LOCAL_HISTORY_MISSING|DIAGNOSTIC_FULL|QUARANTINE|INBOX_RETRY_BLOCKED/.test(warning) ? "error" : "warning") as "error" | "warning",
+  })).filter((warning, index, all) => warning.message !== systemNotice &&
+    all.findIndex((other) => other.message === warning.message && other.severity === warning.severity) === index);
+  const hasSpecificPauseError = !!status?.pauseReason && (
+    systemNotice === "Cần kiểm tra kết nối máy đo" ||
+    systemNotice === "Hệ thống đã tạm dừng tiếp nhận. Vui lòng kiểm tra cảnh báo; các kết quả đã nhận vẫn được thử lưu lại."
+  ) && visibleWarnings.some((warning) => warning.severity === "error");
+  const resetActionError = resetNeedsReview && collectionError !== "RESET_CONFIRMATION_REQUIRED" &&
+    /reset|counter|phiên|ACK|Journal|quarantine/i.test(collectionError);
   const committedId = latest?.measurementId;
 
   const [detail, setDetail] = useState<MeasurementDetail>();
@@ -399,8 +431,9 @@ function AddMeasurement() {
               <Button type="primary" icon={<PlayCircleOutlined />} loading={collectionAction === "start"} disabled={!!collectionAction} onClick={() => void changeCollection("start")}>Bắt đầu thu dữ liệu</Button>}
           </div>
         </div>
-        {collectionError && <Alert className="add-measurement-plc-error" type="error" showIcon message={collectionError} />}
-        {!collectionError && status?.enabled && status.connection === "DISCONNECTED" && <Alert className="add-measurement-plc-error" type="error" showIcon message="Mất kết nối PLC. Hệ thống đang thử kết nối lại." />}
+        {collectionError && collectionError !== "RESET_CONFIRMATION_REQUIRED" && <Alert className="add-measurement-plc-error" type="error" showIcon message={collectionError} />}
+        {resetConfirmationReady && <Alert className="add-measurement-plc-error" type="warning" showIcon message="Cần xác nhận phiên đo" description="Bộ đếm máy đo đã được đặt lại. Vui lòng xác nhận phiên đo mới để tiếp tục." />}
+        {!collectionError && status?.enabled && status.connection === "DISCONNECTED" && status.pauseReason !== "RESET" && <Alert className="add-measurement-plc-error" type="error" showIcon message="Mất kết nối với máy đo. Đang thử kết nối lại..." />}
       </Card>
 
       <Card className="section-card add-measurement-results">
@@ -435,11 +468,12 @@ function AddMeasurement() {
         />
       </Card>
 
-      {showSystemNotice && (status?.connection !== "DISCONNECTED" || !!error) && <Alert
-        type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" ? "error" : "warning"}
+      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
+        type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
         showIcon
         className="add-measurement-alert"
         message={systemNotice}
+        description={resetNeedsReview && systemNotice === "Cần kiểm tra kết nối máy đo" ? "Dữ liệu từ PLC chưa được xác nhận đầy đủ. Vui lòng liên hệ kỹ thuật trước khi tiếp tục thu." : undefined}
       />}
 
       {(status?.manualRetryResults?.length ?? 0) > 0 && (
@@ -462,7 +496,7 @@ function AddMeasurement() {
 
       {(status?.volatileCount ?? 0) > 0 && (
         <Alert
-          type="warning"
+          type="error"
           showIcon
           style={{ marginBottom: 16 }}
           message={`${status?.volatileCount} kết quả đo đang chờ lưu dữ liệu.`}
@@ -470,15 +504,15 @@ function AddMeasurement() {
         />
       )}
 
-      {((status?.warnings.length ?? 0) > 0 || status?.pauseReason) && (
+      {(visibleWarnings.length > 0 || (status?.pauseReason && status.pauseReason !== "RESET")) && (
         <Card className="section-card add-measurement-warnings">
           <Space orientation="vertical" style={{ width: "100%" }}>
             {visibleWarnings.map((warning) => (
               <Alert
-                key={warning}
-                type="warning"
+                key={`${warning.severity}:${warning.message}`}
+                type={warning.severity}
                 showIcon
-                message={warning}
+                message={warning.message}
               />
             ))}
 
@@ -497,7 +531,7 @@ function AddMeasurement() {
               </Popconfirm>
             )}
 
-            {status?.pauseReason &&
+            {status?.pauseReason && status.pauseReason !== "RESET" &&
               status.pauseReason !== "OVERFLOW" &&
               status.pauseReason !== "QUEUE_FULL" && (
                 <p>

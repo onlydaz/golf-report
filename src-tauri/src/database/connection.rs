@@ -1,6 +1,10 @@
 use crate::database::config::load_config;
 use serde::Serialize;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -120,24 +124,50 @@ impl DatabaseState {
         let app_config_dir = app.path().app_config_dir().ok();
         let config = load_config(app_config_dir)
             .map_err(|message| (DatabaseConnectionState::ConnectionFailed, message))?;
-        let connection_string = format!(
-            "postgres://{}:{}@{}:{}/{}",
-            urlencoding::encode(&config.username),
-            urlencoding::encode(&config.password),
-            config.host,
-            config.port,
-            config.database
-        );
+        let cloud = config.connection_string.is_some();
+        let options = if let Some(connection_string) = config.connection_string.as_deref() {
+            if connection_string.trim().is_empty() {
+                return Err((
+                    DatabaseConnectionState::ConnectionFailed,
+                    "Connection string PostgreSQL đang trống.".into(),
+                ));
+            }
+            PgConnectOptions::from_str(connection_string)
+                .map_err(|_| {
+                    (
+                        DatabaseConnectionState::ConnectionFailed,
+                        "Connection string PostgreSQL không hợp lệ.".into(),
+                    )
+                })?
+                .ssl_mode(PgSslMode::VerifyFull)
+        } else {
+            if config.host.trim().is_empty()
+                || config.port == 0
+                || config.database.trim().is_empty()
+                || config.username.trim().is_empty()
+            {
+                return Err((
+                    DatabaseConnectionState::ConnectionFailed,
+                    "Thiếu host, port, database hoặc username trong cấu hình PostgreSQL.".into(),
+                ));
+            }
+            PgConnectOptions::new()
+                .host(&config.host)
+                .port(config.port)
+                .database(&config.database)
+                .username(&config.username)
+                .password(&config.password)
+        };
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .acquire_timeout(Duration::from_secs(3))
-            .connect(&connection_string)
+            .acquire_timeout(Duration::from_secs(if cloud { 15 } else { 3 }))
+            .connect_with(options)
             .await
             .map_err(|_| {
                 (
                     DatabaseConnectionState::ConnectionFailed,
-                    "Không thể kết nối cơ sở dữ liệu. Hãy kiểm tra PostgreSQL và cấu hình."
-                        .to_string(),
+                    if cloud { "Không thể kết nối PostgreSQL Cloud qua TLS. Kiểm tra connection string, mạng và chứng chỉ máy chủ." }
+                    else { "Không thể kết nối cơ sở dữ liệu. Hãy kiểm tra PostgreSQL và cấu hình." }.to_string(),
                 )
             })?;
         super::migrations::migrate(&pool)

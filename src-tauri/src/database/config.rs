@@ -1,27 +1,61 @@
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+// Compiled into the installer executable; the source TOML stays outside Git.
+const BUNDLED_CONFIG: &str = include_str!("../../resources/database_config.toml");
+
+#[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
+    #[serde(default)]
+    pub connection_string: Option<String>,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default)]
     pub database: String,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
 }
 
 pub fn load_config(app_config_dir: Option<PathBuf>) -> Result<DatabaseConfig, String> {
-    let mut candidates = Vec::new();
-    if let Some(path) = app_config_dir {
-        candidates.push(path.join("database_config.toml"));
+    let config_path = app_config_dir.map(|dir| dir.join("database_config.toml"));
+    let content = if !cfg!(debug_assertions) {
+        BUNDLED_CONFIG.to_string()
+    } else if let Some(path) = config_path.as_ref().filter(|path| path.is_file()) {
+        fs::read_to_string(path)
+            .map_err(|_| "Không thể đọc file cấu hình PostgreSQL trong AppData.".to_string())?
+    } else {
+        BUNDLED_CONFIG.to_string()
+    };
+    let config = toml::from_str::<DatabaseConfig>(&content)
+        .map_err(|_| "File cấu hình cơ sở dữ liệu không hợp lệ.".to_string())?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseConfig;
+
+    #[test]
+    fn accepts_cloud_connection_string_without_legacy_fields() {
+        let config: DatabaseConfig = toml::from_str(
+            "connection_string = 'postgresql://user:password@example.invalid/golf_report?sslmode=require'",
+        )
+        .unwrap();
+        assert!(config.connection_string.is_some());
+        assert!(config.host.is_empty());
     }
-    if let Ok(current_dir) = std::env::current_dir() {
-        candidates.push(current_dir.join("database_config.toml"));
-        candidates.push(current_dir.join("src-tauri").join("database_config.toml"));
+
+    #[test]
+    fn accepts_existing_local_config() {
+        let config: DatabaseConfig = toml::from_str(
+            "host = 'localhost'\nport = 5432\ndatabase = 'golf_report'\nusername = 'postgres'\npassword = ''",
+        )
+        .unwrap();
+        assert!(config.connection_string.is_none());
+        assert_eq!(config.port, 5432);
     }
-    let config_path = candidates.into_iter().find(|path| path.is_file()).ok_or_else(|| {
-        "Chưa tìm thấy database_config.toml. Hãy tạo file cấu hình trong thư mục cấu hình ứng dụng.".to_string()
-    })?;
-    let content = fs::read_to_string(&config_path).map_err(|_| "Không thể đọc file cấu hình cơ sở dữ liệu.".to_string())?;
-    toml::from_str::<DatabaseConfig>(&content).map_err(|_| "File cấu hình cơ sở dữ liệu không hợp lệ.".to_string())
 }

@@ -1,6 +1,7 @@
 use sqlx::{FromRow, PgPool};
 
 pub const INITIAL_VERSION: i64 = 20261109120000;
+pub const REGISTRY_VERSION: i64 = 20261111120000;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, FromRow)]
@@ -25,7 +26,29 @@ pub async fn audit(pool: &PgPool) -> Result<(Vec<String>, Vec<MigrationHistory>)
 }
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
     let (tables, history) = audit(pool).await?;
-    validate_history(&tables, &history)?;
+    if let Err(error) = validate_history(&tables, &history) {
+        let location: (String, String, String) = sqlx::query_as(
+            "SELECT current_database()::text, current_schema()::text, current_setting('search_path')",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("{error} Không thể đọc database/schema hiện tại: {e}"))?;
+        let found: Vec<(String, String)> = sqlx::query_as(
+            "SELECT n.nspname::text, c.relname::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid=c.relnamespace \
+             WHERE c.relkind IN ('r','p') AND c.relname IN \
+             ('_sqlx_migrations','plc_sources','plc_inbox','measurements', \
+              'measurement_stations','measurement_points','measurement_attempts','plc_source_registry') \
+             ORDER BY n.nspname,c.relname",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("{error} Không thể tra cứu vị trí bảng: {e}"))?;
+        return Err(format!(
+            "{error} Database={}, schema={}, search_path={}, bảng tìm thấy={found:?}.",
+            location.0, location.1, location.2
+        ));
+    }
     MIGRATOR
         .run(pool)
         .await
@@ -64,6 +87,11 @@ pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Resu
                     "Lịch sử SQLx ghi AS200 đã áp dụng nhưng thiếu bảng {table}. Không tự reset lịch sử hoặc chạy chồng migration."
                 ));
             }
+        }
+        if history.iter().any(|item| item.version == REGISTRY_VERSION)
+            && !tables.iter().any(|name| name == "plc_source_registry")
+        {
+            return Err("Lịch sử SQLx ghi registry đã áp dụng nhưng thiếu bảng plc_source_registry. Không tự tạo lại bảng khi chưa đối chiếu schema và dữ liệu.".into());
         }
     }
     Ok(())

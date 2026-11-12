@@ -6,6 +6,21 @@ use std::{
     time::Duration,
 };
 
+/// Engineering approval for the deployed AS200 integration, not for an
+/// individual endpoint. This release is intended only for company PLCs that
+/// use the approved AS200 register map and ACK semantics.
+pub const AS200_ACK_SCOPE_APPROVED: bool = true;
+pub const AS200_ACK_SCOPE_ID: &str = "company-as200-register-map-v1";
+
+pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
+    AS200_ACK_SCOPE_APPROVED
+        && config.mode == "modbus"
+        && config.ack_protocol.as_deref() == Some("as200")
+        && config.word_order == StoredWordOrder::Low
+        && config.modbus_address_offset == 0
+        && !config.pc_heartbeat_enabled
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTransition {
@@ -207,7 +222,8 @@ pub(super) fn locate(app_directory: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = app_directory {
         candidates.push(dir.join("as200_config.toml"));
     }
-    if let Ok(cwd) = std::env::current_dir() {
+    // Release uses the caller-provided ProgramData directory; development can use local files.
+    if cfg!(debug_assertions) && let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("as200_config.toml"));
         candidates.push(cwd.join("src-tauri/as200_config.toml"));
         // Cargo/Tauri thường khởi chạy backend với cwd là src-tauri.
