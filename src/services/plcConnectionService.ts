@@ -11,7 +11,9 @@ export interface PlcConnectionSettings {
   restartRequired: boolean;
 }
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
-export const testPlcConnection = (value: PlcEndpoint) => invoke<void>("test_plc_connection", { value });
+/** Kết nối + đọc FC03 thành công là "đã kết nối"; `mappingWarning` báo dữ liệu không khớp register map. */
+export interface PlcProbeReport { mappingWarning: string | null }
+export const testPlcConnection = (value: PlcEndpoint) => invoke<PlcProbeReport>("test_plc_connection", { value });
 export const stopPlcCollection = () => invoke<void>("stop_plc_collection");
 export const connectPlcCollection = (value: PlcEndpoint, expectedRevision: string, resetConfirmed = false) =>
   invoke<void>("connect_plc_collection", { value, expectedRevision, resetConfirmed });

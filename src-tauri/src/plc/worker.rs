@@ -1745,7 +1745,12 @@ impl Engine {
                 }
                 Err(error) => {
                     eprintln!("AS200 heartbeat monitor: {error}");
-                    self.state.status.write().await.plc_health = "DISCONNECTED".into();
+                    // Đọc được thanh ghi nhưng sai mapping: vẫn là đã kết nối, không phải mất kết nối.
+                    self.state.status.write().await.plc_health = match error {
+                        As200Error::Transport(_) | As200Error::Timeout => "DISCONNECTED",
+                        _ => "INVALID_DATA",
+                    }
+                    .into();
                     if writer.is_some() {
                         self.state.status.write().await.pc_heartbeat_status = "FAILED".into();
                     }

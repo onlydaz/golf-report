@@ -24,7 +24,7 @@ export interface As200Status {
   blockedInboxIds: number[];
   retryWaitingCount: number;
   retryDiagnostics: string[];
-  plcHealth: "UNCONFIGURED" | "OBSERVING" | "RUNNING" | "STALE" | "DISCONNECTED";
+  plcHealth: "UNCONFIGURED" | "OBSERVING" | "RUNNING" | "STALE" | "DISCONNECTED" | "INVALID_DATA";
   pcHeartbeatStatus: string;
   ackStatus:
     | "READ_ONLY_PROTOCOL_UNCONFIRMED"

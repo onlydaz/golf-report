@@ -1,7 +1,7 @@
 //! Controlled QC connection lifecycle with journal/inbox and source continuity checks.
 use super::{
     as200::{
-        map,
+        As200Error, map,
         reader::As200Reader,
     },
     simulator_config::{self, SimulatorConfig},
@@ -21,7 +21,6 @@ const BUSY: &str =
     "Chưa thể thay đổi kết nối vì hệ thống đang xử lý dữ liệu đo. Vui lòng liên hệ kỹ thuật.";
 const CONFIG: &str = "Chưa có cấu hình kết nối phù hợp. Vui lòng liên hệ kỹ thuật để thiết lập.";
 const SAVE: &str = "Không thể lưu thay đổi. Vui lòng thử lại hoặc liên hệ kỹ thuật.";
-#[cfg(test)]
 const CONNECT: &str = "Không thể kết nối với PLC. Vui lòng kiểm tra địa chỉ IP và cổng kết nối.";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -364,12 +363,45 @@ async fn save(
         restart_required: true,
     })
 }
+/// Kết quả kiểm tra: kết nối TCP + đọc FC03 thành công thì là "đã kết nối";
+/// `mapping_warning` mô tả dữ liệu đọc được không khớp register map AS200.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeReport {
+    pub mapping_warning: Option<String>,
+}
+
+/// `Err` chỉ khi không kết nối/đọc được PLC. Đọc được nhưng sai mapping → `Ok(Some(..))`.
+async fn probe_link(config: SimulatorConfig) -> Result<Option<String>, String> {
+    let checked = tokio::time::timeout(config.reader().timeout, async {
+        let report = match As200Reader::new(config.reader()).poll().await {
+            Ok(report) => report,
+            Err(e @ (As200Error::Transport(_) | As200Error::Timeout)) => {
+                eprintln!("PLC settings FC03 probe: {e}");
+                return Err(CONNECT.to_string());
+            }
+            // Đã đọc được thanh ghi; lỗi nằm ở giá trị/mapping.
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        Ok(as200_structure(&report))
+    })
+    .await
+    .map_err(|_| CONNECT.to_string())??;
+    Ok(checked.err().inspect(|warning| {
+        eprintln!("PLC settings FC03 probe: kết nối OK, sai mapping/dữ liệu: {warning}");
+    }))
+}
+/// Dùng trước khi bật thu + ACK: bắt buộc mapping đúng, không chỉ kết nối được.
 async fn probe(config: SimulatorConfig) -> Result<(), String> {
-    tokio::time::timeout(config.reader().timeout, async {
-        let report = As200Reader::new(config.reader())
-            .poll()
-            .await
-            .map_err(|e| format!("FC03/AS200: {e}"))?;
+    match probe_link(config).await? {
+        None => Ok(()),
+        Some(warning) => Err(format!(
+            "Đã kết nối và đọc được PLC nhưng dữ liệu không khớp register map AS200: {warning}"
+        )),
+    }
+}
+fn as200_structure(report: &super::as200::reader::PollReport) -> Result<(), String> {
+    {
         let control = &report.control;
         if report.buffers.len() != map::BUFFER_COUNT
             || report.buffers.iter().any(|buffer| buffer.raw_registers.len() != map::RECORD_SIZE)
@@ -390,15 +422,8 @@ async fn probe(config: SimulatorConfig) -> Result<(), String> {
         if !report.diagnostics.is_empty() {
             return Err("AS200 trả buffer chưa ổn định hoặc có bản ghi không hợp lệ.".into());
         }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|_| "Hết thời gian đọc FC03/AS200 sau 2000 ms.".to_string())?
-    .map_err(|e| {
-        eprintln!("PLC settings FC03 probe: {e}");
-        e
-    })?;
-    Ok(())
+        Ok(())
+    }
 }
 
 async fn prepare_managed_runtime(
@@ -906,7 +931,7 @@ pub async fn get_plc_connection_settings(
 pub async fn test_plc_connection(
     value: Endpoint,
     state: tauri::State<'_, WorkerState>,
-) -> Result<(), String> {
+) -> Result<ProbeReport, String> {
     let _guard = state
         .settings_gate
         .try_lock()
@@ -919,7 +944,8 @@ pub async fn test_plc_connection(
     } else {
         read(&path(&state).await?)?.1
     };
-    probe(value.apply(&config)?).await
+    let mapping_warning = probe_link(value.apply(&config)?).await?;
+    Ok(ProbeReport { mapping_warning })
 }
 #[tauri::command]
 pub async fn update_plc_connection_settings(

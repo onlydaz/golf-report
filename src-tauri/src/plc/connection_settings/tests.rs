@@ -497,3 +497,68 @@ async fn first_installation_persists_only_endpoint_and_never_creates_identity_or
     assert!(create_initial(&other.0, &value()).is_err());
     assert!(!other.0.join("as200_config.toml").exists());
 }
+
+/// Fake AS200 trả FC03 từ mảng register (D25000.., offset 0) cho đến khi client đóng socket.
+fn serve_registers(listener: tokio::net::TcpListener, words: Vec<u16>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 12];
+        while stream.read_exact(&mut request).await.is_ok() {
+            assert_eq!(request[7], 3, "kiểm tra kết nối chỉ được dùng FC03");
+            let base = usize::from(u16::from_be_bytes([request[8], request[9]])) - 25000;
+            let count = usize::from(u16::from_be_bytes([request[10], request[11]]));
+            let mut response = request[..7].to_vec();
+            response[4..6].copy_from_slice(&((count * 2 + 3) as u16).to_be_bytes());
+            response.extend([3, (count * 2) as u8]);
+            for word in &words[base..base + count] {
+                response.extend(word.to_be_bytes());
+            }
+            stream.write_all(&response).await.unwrap();
+        }
+    })
+}
+fn probe_config(address: String) -> SimulatorConfig {
+    let mut cfg = simulator_config::parse(TEXT).unwrap();
+    cfg.address = address;
+    cfg.modbus_address_offset = 0;
+    cfg.timeout_ms = 1000;
+    cfg
+}
+
+#[tokio::test]
+async fn test_connection_succeeds_when_registers_are_read_even_if_mapping_is_wrong() {
+    // Header sai (0/0/0 thay vì 1/240/2): vẫn là kết nối thành công, kèm cảnh báo mapping.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = serve_registers(listener, vec![0; 500]);
+    let warning = probe_link(probe_config(address.clone())).await.unwrap().unwrap();
+    assert!(warning.contains("đọc được = 0/0/0, cần 1/240/2"), "{warning}");
+    server.await.unwrap();
+    // Bật thu + ACK vẫn bắt buộc mapping đúng.
+    let listener = tokio::net::TcpListener::bind(address.as_str()).await.unwrap();
+    let server = serve_registers(listener, vec![0; 500]);
+    let error = probe(probe_config(address)).await.unwrap_err();
+    assert!(error.starts_with("Đã kết nối và đọc được PLC"), "{error}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_connection_without_warning_when_mapping_is_valid() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut words = vec![0u16; 500];
+    words[0] = 1; words[1] = 240; words[2] = 2;
+    let server = serve_registers(listener, words);
+    assert_eq!(probe_link(probe_config(address)).await.unwrap(), None);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_connection_fails_only_when_plc_cannot_be_reached() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let mut cfg = probe_config(address);
+    cfg.timeout_ms = 300;
+    assert_eq!(probe_link(cfg).await.unwrap_err(), CONNECT);
+}

@@ -1,9 +1,9 @@
 use super::{As200Config, As200Error, decode, map, model::*};
-use std::{collections::HashMap, future::Future};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::timeout,
+use std::{collections::HashMap, future::Future, net::SocketAddr};
+use tokio::time::timeout;
+use tokio_modbus::{
+    Request, Response, Slave,
+    client::{Client, Context, tcp},
 };
 
 /// Transport chỉ đọc, dễ thay bằng bộ nhớ giả trong kiểm thử. Không có API FC06/FC16.
@@ -15,69 +15,50 @@ pub trait HoldingRegisterReader {
     ) -> impl Future<Output = Result<Vec<u16>, As200Error>> + Send;
 }
 
+/// FC03 qua `tokio-modbus`: thư viện lo MBAP (transaction/unit/length) và
+/// đối chiếu function code; lớp này giữ timeout, giới hạn WORD và nối lại.
 pub struct ModbusTcpReader {
     config: As200Config,
-    stream: Option<TcpStream>,
-    transaction: u16,
+    ctx: Option<Context>,
 }
 impl ModbusTcpReader {
     pub fn new(config: As200Config) -> Self {
-        Self {
-            config,
-            stream: None,
-            transaction: 0,
-        }
+        Self { config, ctx: None }
     }
 
     async fn exchange(&mut self, address: u16, count: u16) -> Result<Vec<u16>, As200Error> {
-        let transport = |error: std::io::Error| As200Error::Transport(error.to_string());
-        if self.stream.is_none() {
-            self.stream = Some(
-                TcpStream::connect(&self.config.address)
-                    .await
-                    .map_err(transport)?,
-            );
+        if self.ctx.is_none() {
+            let socket: SocketAddr = self.config.address.parse().map_err(|_| {
+                As200Error::Transport(format!(
+                    "Địa chỉ PLC phải là IP:port dạng số: {}",
+                    self.config.address
+                ))
+            })?;
+            let ctx = tcp::connect_slave(socket, Slave(self.config.unit_id))
+                .await
+                .map_err(|e| As200Error::Transport(e.to_string()))?;
+            self.ctx = Some(ctx);
         }
-        self.transaction = self.transaction.wrapping_add(1);
-        let [th, tl] = self.transaction.to_be_bytes();
-        let [ah, al] = address.to_be_bytes();
-        let [ch, cl] = count.to_be_bytes();
-        let stream = self.stream.as_mut().unwrap();
-        stream
-            .write_all(&[th, tl, 0, 0, 0, 6, self.config.unit_id, 3, ah, al, ch, cl])
+        let ctx = self.ctx.as_mut().expect("ctx vừa được tạo");
+        // Gọi `call` trực tiếp thay vì `Reader::read_holding_registers`: hàm đó chỉ
+        // `debug_assert` số WORD (panic ở debug build nếu PLC trả thiếu dữ liệu).
+        let response = ctx
+            .call(Request::ReadHoldingRegisters(address, count))
             .await
-            .map_err(transport)?;
-        let mut header = [0; 7];
-        stream.read_exact(&mut header).await.map_err(transport)?;
-        let length = u16::from_be_bytes([header[4], header[5]]) as usize;
-        if header[..4] != [th, tl, 0, 0]
-            || header[6] != self.config.unit_id
-            || !(3..=254).contains(&length)
-        {
-            return Err(As200Error::Transport(
-                "MBAP sai transaction/protocol/unit/length".into(),
-            ));
-        }
-        let mut body = vec![0; length - 1];
-        stream.read_exact(&mut body).await.map_err(transport)?;
-        if body[0] == 0x83 {
+            .map_err(|e| As200Error::Transport(e.to_string()))?
+            .map_err(|e| As200Error::Transport(format!("PLC trả exception FC03: {e}")))?;
+        let Response::ReadHoldingRegisters(words) = response else {
             return Err(As200Error::Transport(format!(
-                "PLC trả exception FC03: {}",
-                body[1]
+                "FC03 nhận response không đúng loại: {response:?}"
+            )));
+        };
+        if words.len() != usize::from(count) {
+            return Err(As200Error::Transport(format!(
+                "FC03 sai kích thước dữ liệu: cần {count} WORD, nhận {}",
+                words.len()
             )));
         }
-        if body[0] != 3
-            || body.len() != 2 + usize::from(count) * 2
-            || usize::from(body[1]) != usize::from(count) * 2
-        {
-            return Err(As200Error::Transport(
-                "FC03 sai function/byte count/kích thước dữ liệu".into(),
-            ));
-        }
-        Ok(body[2..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect())
+        Ok(words)
     }
 }
 impl HoldingRegisterReader for ModbusTcpReader {
@@ -91,16 +72,16 @@ impl HoldingRegisterReader for ModbusTcpReader {
             || u32::from(address) + u32::from(count) > 65536
         {
             return Err(As200Error::InvalidData(
-                "FC03 cần 1–125 WORD và vùng địa chỉ hợp lệ".into(),
+                format!("FC03 cần 1–{} WORD và vùng địa chỉ hợp lệ", map::FC03_LIMIT),
             ));
         }
         let duration = self.config.timeout;
         let result = timeout(duration, self.exchange(address, count))
             .await
             .unwrap_or(Err(As200Error::Timeout));
-        // Sau timeout, socket có thể chứa response dở. Hủy socket, nối lại ở lần gọi sau.
+        // Sau lỗi/timeout, socket có thể chứa response dở. Hủy kết nối, nối lại ở lần gọi sau.
         if result.is_err() {
-            self.stream = None;
+            self.ctx = None;
         }
         result
     }

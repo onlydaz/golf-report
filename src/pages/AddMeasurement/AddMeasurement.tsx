@@ -329,6 +329,8 @@ function AddMeasurement() {
       systemNotice = "Tín hiệu hoạt động PLC đã đứng yên. Hệ thống chưa gửi xác nhận dữ liệu.";
     } else if (status.plcHealth === "UNCONFIGURED") {
       systemNotice = "Chưa cấu hình giám sát hoạt động PLC. Vui lòng liên hệ kỹ thuật.";
+    } else if (status.plcHealth === "INVALID_DATA") {
+      systemNotice = `Đã kết nối PLC nhưng dữ liệu không khớp register map AS200: ${status.message}`;
     } else if (status.plcHealth === "DISCONNECTED") {
       systemNotice = "Không kiểm tra được tín hiệu hoạt động PLC. Đang thử kết nối lại.";
     } else {

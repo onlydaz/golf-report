@@ -30,6 +30,7 @@ bigdecimal = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "chrono", "bigdecimal", "migrate", "macros", "tls-rustls-ring-native-roots"] }
 tokio = { version = "1", features = ["sync", "net", "io-util", "time", "macros"] }
+tokio-modbus = { version = "0.17.0", default-features = false, features = ["tcp"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -252,7 +252,7 @@ impl HoldingRegisterReader for MemoryReader {
     }
 }
 #[tokio::test]
-async fn chunks_240_words_into_125_and_115_and_applies_address_offset() {
+async fn chunks_240_words_into_100_100_40_and_applies_address_offset() {
     let order = WordOrder::LowWordFirst;
     let mut memory = MemoryReader::new(order, 2);
     memory.offset = -1;
@@ -267,15 +267,19 @@ async fn chunks_240_words_into_125_and_115_and_applies_address_offset() {
         reader.transport.calls,
         vec![
             (24999, 20),
-            (25019, 125),
-            (25144, 115),
-            (25259, 125),
-            (25384, 115),
+            (25019, 100),
+            (25119, 100),
+            (25219, 40),
+            (25259, 100),
+            (25359, 100),
+            (25459, 40),
             (24999, 20),
-            (25019, 125),
-            (25144, 115),
-            (25259, 125),
-            (25384, 115),
+            (25019, 100),
+            (25119, 100),
+            (25219, 40),
+            (25259, 100),
+            (25359, 100),
+            (25459, 40),
             (24999, 20),
         ]
     );
@@ -691,4 +695,177 @@ async fn changed_raw_same_sequence_preserves_both_slots_and_old_checkpoint() {
     assert_eq!(report.buffers[0].raw_registers, &expected[20..260]);
     assert_eq!(report.buffers[1].raw_registers, &expected[260..500]);
     assert!(report.new_records.is_empty());
+}
+
+// ---- Transport tokio-modbus qua TCP loopback thật (không cần PLC) ----
+
+/// Fake Modbus TCP server: nhận tối đa `connections` kết nối; với mỗi request FC03
+/// (12 byte), `handler(kết nối, request)` trả response hoặc `None` để đóng socket.
+fn fake_fc03_server<F>(
+    listener: tokio::net::TcpListener,
+    connections: usize,
+    mut handler: F,
+) -> tokio::task::JoinHandle<Vec<[u8; 12]>>
+where
+    F: FnMut(usize, &[u8; 12]) -> Option<Vec<u8>> + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for connection in 0..connections {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 12];
+            while stream.read_exact(&mut request).await.is_ok() {
+                seen.push(request);
+                match handler(connection, &request) {
+                    Some(response) => stream.write_all(&response).await.unwrap(),
+                    None => break,
+                }
+            }
+        }
+        seen
+    })
+}
+/// Response FC03 hợp lệ, echo transaction/unit của request.
+fn fc03_response(request: &[u8; 12], words: &[u16]) -> Vec<u8> {
+    let mut response = request[..7].to_vec();
+    response[4..6].copy_from_slice(&((words.len() * 2 + 3) as u16).to_be_bytes());
+    response.extend([3, (words.len() * 2) as u8]);
+    for word in words {
+        response.extend(word.to_be_bytes());
+    }
+    response
+}
+async fn loopback(cfg: &mut As200Config) -> tokio::net::TcpListener {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.address = listener.local_addr().unwrap().to_string();
+    listener
+}
+
+#[tokio::test]
+async fn tcp_fc03_exception_response_is_transport_error_and_reconnects() {
+    let mut cfg = config(WordOrder::LowWordFirst);
+    let listener = loopback(&mut cfg).await;
+    let server = fake_fc03_server(listener, 2, |connection, request| {
+        Some(if connection == 0 {
+            // 0x83 = exception FC03, code 2 = Illegal Data Address.
+            vec![request[0], request[1], 0, 0, 0, 3, 1, 0x83, 2]
+        } else {
+            fc03_response(request, &[7, 8])
+        })
+    });
+    let mut transport = ModbusTcpReader::new(cfg);
+    match transport.read_holding_registers(25000, 2).await {
+        Err(As200Error::Transport(message)) => assert!(message.contains("exception"), "{message}"),
+        other => panic!("cần lỗi exception, nhận {other:?}"),
+    }
+    // Lỗi phải hủy kết nối cũ; lần sau mở kết nối mới (connection 1) và đọc được.
+    assert_eq!(transport.read_holding_registers(25000, 2).await.unwrap(), vec![7, 8]);
+    drop(transport);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_fc03_wrong_unit_byte_count_function_or_short_data_is_rejected() {
+    for fault in ["unit", "byte-count", "function", "short", "transaction"] {
+        let mut cfg = config(WordOrder::HighWordFirst);
+        let listener = loopback(&mut cfg).await;
+        let server = fake_fc03_server(listener, 1, move |_, request| {
+            let mut response = fc03_response(request, &[1, 2]);
+            match fault {
+                "unit" => response[6] = 9,
+                "byte-count" => response[8] = 2,
+                "function" => response[7] = 4,
+                "transaction" => response[1] = response[1].wrapping_add(1),
+                _ => response = fc03_response(request, &[1]),
+            }
+            Some(response)
+        });
+        let mut transport = ModbusTcpReader::new(cfg);
+        let result = transport.read_holding_registers(25000, 2).await;
+        assert!(
+            matches!(result, Err(As200Error::Transport(_))),
+            "{fault}: {result:?}"
+        );
+        drop(transport);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tcp_reuses_connection_and_increments_transaction_id() {
+    let mut cfg = config(WordOrder::LowWordFirst);
+    let listener = loopback(&mut cfg).await;
+    let server = fake_fc03_server(listener, 1, |_, request| {
+        let address = u16::from_be_bytes([request[8], request[9]]);
+        Some(fc03_response(request, &[address, 0xffff]))
+    });
+    let mut transport = ModbusTcpReader::new(cfg);
+    for address in [25000, 25020, 25120] {
+        assert_eq!(
+            transport.read_holding_registers(address, 2).await.unwrap(),
+            vec![address, 0xffff]
+        );
+    }
+    drop(transport);
+    // Server chỉ accept 1 kết nối: cả 3 request đi chung socket.
+    let seen = server.await.unwrap();
+    assert_eq!(seen.len(), 3);
+    let ids: std::collections::HashSet<_> = seen.iter().map(|r| [r[0], r[1]]).collect();
+    assert_eq!(ids.len(), 3, "transaction id phải khác nhau");
+    for request in &seen {
+        assert_eq!(&request[2..8], &[0, 0, 0, 6, 1, 3]);
+    }
+}
+
+#[tokio::test]
+async fn tcp_connect_refused_or_bad_address_is_error_without_panic() {
+    let mut cfg = config(WordOrder::LowWordFirst);
+    drop(loopback(&mut cfg).await); // Cổng vừa đóng: không có server.
+    cfg.timeout = Duration::from_millis(300);
+    let mut transport = ModbusTcpReader::new(cfg.clone());
+    let result = transport.read_holding_registers(25000, 2).await;
+    assert!(
+        matches!(result, Err(As200Error::Transport(_) | As200Error::Timeout)),
+        "{result:?}"
+    );
+    cfg.address = "plc-khong-phai-ip:502".into();
+    let mut transport = ModbusTcpReader::new(cfg);
+    assert!(matches!(
+        transport.read_holding_registers(25000, 2).await,
+        Err(As200Error::Transport(_))
+    ));
+}
+
+#[tokio::test]
+async fn as200_reader_polls_full_snapshot_over_real_tcp() {
+    for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
+        let mut cfg = config(order);
+        cfg.modbus_address_offset = -1;
+        let listener = loopback(&mut cfg).await;
+        let mut memory = control(2, order);
+        memory.extend(record(1, order));
+        memory.extend(record(2, order));
+        let server = fake_fc03_server(listener, 1, move |_, request| {
+            let address = usize::from(u16::from_be_bytes([request[8], request[9]]));
+            let count = usize::from(u16::from_be_bytes([request[10], request[11]]));
+            assert!(count <= map::FC03_LIMIT);
+            let base = address + 1 - 25000; // offset -1.
+            Some(fc03_response(request, &memory[base..base + count]))
+        });
+        let mut reader = As200Reader::new(cfg);
+        let report = reader.poll().await.unwrap();
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        assert_eq!(report.control.total_count, 2);
+        let seqs: Vec<_> = report
+            .buffers
+            .iter()
+            .map(|b| b.record.as_ref().unwrap().record_seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(report.buffers[0].raw_registers, record(1, order));
+        drop(reader);
+        let seen = server.await.unwrap();
+        assert!(seen.iter().all(|r| r[7] == 3), "reader chỉ được dùng FC03");
+    }
 }

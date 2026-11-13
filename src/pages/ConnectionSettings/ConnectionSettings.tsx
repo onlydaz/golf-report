@@ -6,6 +6,9 @@ import { getAs200WorkerStatus, type As200Status } from "../../services/as200Serv
 import { getPlcConnectionSettings, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, updatePlcConnectionSettings, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
 
+/** Giá trị điền sẵn khi chưa có cấu hình đã lưu; người dùng vẫn phải kiểm tra và bấm lưu. */
+const DEFAULT_ENDPOINT: Pick<PlcEndpoint, "ip" | "port"> = { ip: "192.168.1.5", port: 502 };
+
 export default function ConnectionSettings() {
   const [form] = Form.useForm<PlcEndpoint>();
   const [settings, setSettings] = useState<PlcConnectionSettings>();
@@ -16,6 +19,7 @@ export default function ConnectionSettings() {
   const [errorAction, setErrorAction] = useState<"test" | "save" | null>(null);
   const [notice, setNotice] = useState("");
   const [tested, setTested] = useState<"idle" | "ok" | "failed">("idle");
+  const [mappingWarning, setMappingWarning] = useState("");
   const [worker, setWorker] = useState<As200Status>();
   const inFlight = useRef(false);
   const mounted = useRef(true);
@@ -52,7 +56,7 @@ export default function ConnectionSettings() {
   const changed = () => {
     const values = form.getFieldsValue();
     setDirty(!!settings && (!settings.endpoint || values.ip !== settings.endpoint.ip || values.port !== settings.endpoint.port || values.unitId !== settings.endpoint.unitId));
-    setTested("idle"); setError(""); setNotice("");
+    setTested("idle"); setMappingWarning(""); setError(""); setNotice("");
   };
   const connect = async (values: PlcEndpoint, revision: string) => {
     try {
@@ -81,8 +85,10 @@ export default function ConnectionSettings() {
       const values = await form.validateFields();
       setBusy(action); setError(""); setNotice("");
       if (action === "test") {
-        setTested("idle"); await testPlcConnection(values);
-        if (mounted.current) setTested("ok");
+        setTested("idle"); setMappingWarning("");
+        const report = await testPlcConnection(values);
+        if (report.mappingWarning) console.warn("PLC mapping warning:", report.mappingWarning);
+        if (mounted.current) { setTested("ok"); setMappingWarning(report.mappingWarning ?? ""); }
       } else if (!settings.configured) {
         const saved = await updatePlcConnectionSettings(values, settings.revision);
         await connect(values, saved.revision);
@@ -117,6 +123,7 @@ export default function ConnectionSettings() {
     : !worker.enabled ? "Chưa bật"
     : worker.pauseReason ? "Tạm dừng"
     : worker.connection === "CONNECTED" && worker.plcHealth === "RUNNING" ? "Đang thu dữ liệu"
+    : worker.plcHealth === "INVALID_DATA" ? "Đã kết nối, dữ liệu không khớp mapping"
     : worker.connection === "DISCONNECTED" ? "Mất kết nối"
     : "Đang chờ thiết bị";
   const endpointText = (endpoint: PlcEndpoint) =>
@@ -132,9 +139,9 @@ export default function ConnectionSettings() {
               <span className="plc-settings-icon"><ApiOutlined /></span>
               <h2 id="plc-settings-form-title">Thông tin PLC</h2>
             </div>
-          <Form form={form} layout="vertical" disabled={!!busy || loading} onValuesChange={changed} requiredMark={false}>
+          <Form form={form} layout="vertical" initialValues={DEFAULT_ENDPOINT} disabled={!!busy || loading} onValuesChange={changed} requiredMark={false}>
             <Form.Item name="ip" label="Địa chỉ IP" rules={[{ required: true, message: "Vui lòng nhập địa chỉ IP." }, { validator: (_, value: string) => !value || isPlcIp(value) ? Promise.resolve() : Promise.reject(new Error("Địa chỉ IP chưa hợp lệ. Vui lòng kiểm tra lại.")) }]}>
-              <Input placeholder="Ví dụ: 192.168.1.10" autoComplete="off" size="large" disabled={!canEditConnection} />
+              <Input placeholder="Ví dụ: 192.168.1.5" autoComplete="off" size="large" disabled={!canEditConnection} />
             </Form.Item>
             <div className="plc-settings-fields">
               <Form.Item name="port" label="Cổng kết nối" rules={[{ required: true, message: "Vui lòng nhập cổng kết nối." }, { type: "integer", min: 1, max: 65535, message: "Cổng kết nối phải từ 1 đến 65535." }]}>
@@ -164,11 +171,15 @@ export default function ConnectionSettings() {
               {busy === "test" ? "Đang kiểm tra" : tested === "ok" ? "Kết nối thành công" : tested === "failed" ? "Không thể kết nối" : "Chưa kiểm tra"}
             </Tag>
             {error && errorAction === "test" && <small className="plc-settings-test-error" role="alert">{error}</small>}
+            {tested === "ok" && mappingWarning && <Alert type="warning" showIcon style={{ marginTop: 8 }}
+              title="Đã đọc được thanh ghi nhưng dữ liệu không khớp register map AS200. Chưa thể thu dữ liệu."
+              description={mappingWarning} />}
           </dd></div>
           <div><dt>Cấu hình đã lưu</dt><dd>{settings?.endpoint ? endpointText(settings.endpoint) : "Chưa thiết lập"}</dd></div>
           <div><dt>Nhận dữ liệu đo</dt><dd>{receiving}
             {!worker && <small>Chưa lấy được trạng thái bộ thu dữ liệu.</small>}
             {worker && !worker.enabled && <small>Kiểm tra lại hồ sơ AS200 và trạng thái PLC để tiếp tục.</small>}
+            {worker?.plcHealth === "INVALID_DATA" && worker.message && <small role="alert">{worker.message}</small>}
           </dd></div>
             </dl>
           </section>

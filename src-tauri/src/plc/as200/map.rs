@@ -4,7 +4,8 @@ pub const CONTROL_SIZE: usize = 20;
 pub const RECORD_BASE: u16 = 25020;
 pub const RECORD_SIZE: usize = 240;
 pub const BUFFER_COUNT: usize = 2;
-pub const FC03_LIMIT: usize = 125;
+// Modbus spec allows 125, but the real AS200 rejects >100 WORD per FC03 (exception 4).
+pub const FC03_LIMIT: usize = 100;
 pub const FORMAT_VERSION: i16 = 1;
 
 pub mod control {

@@ -90,9 +90,17 @@ pub fn control(words: &[u16], order: WordOrder) -> Result<PlcControl, As200Error
         || value.record_size != map::RECORD_SIZE as i16
         || value.buffer_count != map::BUFFER_COUNT as i16
     {
-        return Err(invalid(
-            "FormatVersion/RecordSize/BufferCount không khớp map v1/240/2",
-        ));
+        return Err(As200Error::InvalidData(format!(
+            "FormatVersion/RecordSize/BufferCount đọc được = {}/{}/{}, cần {}/{}/{} (D{}..D{})",
+            value.format_version,
+            value.record_size,
+            value.buffer_count,
+            map::FORMAT_VERSION,
+            map::RECORD_SIZE,
+            map::BUFFER_COUNT,
+            map::CONTROL_BASE,
+            map::CONTROL_BASE + 2
+        )));
     }
     if !(0..2).contains(&value.write_idx)
         || !(0..2).contains(&value.last_idx)
