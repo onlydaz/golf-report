@@ -1,63 +1,262 @@
-.add-measurement-results { margin-bottom: 12px; }
+
+.add-measurement-results {
+  margin-bottom: 12px;
+}
+
 .add-measurement-results > .ant-card-body,
-.add-measurement-details-card > .ant-card-body { padding: 18px 22px; }
+.add-measurement-details-card > .ant-card-body {
+  padding: 18px 22px;
+}
+
 .add-measurement-results .form-section-title,
-.add-measurement-details-card .form-section-title { margin: 0 0 14px; font-size: clamp(18px, 1.4vw, 20px); font-weight: 700; color: #243b53; }
-.add-measurement-result-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
-.add-measurement-result { display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; min-height: 112px; padding: 12px 18px; border: 1px solid #e3ebf3; border-radius: 12px; background: #f7fafc; text-align: center; }
-.add-measurement-result span { color: #405b72; font-size: clamp(16px, 1.1vw, 18px); font-weight: 700; letter-spacing: .03em; }
-.add-measurement-result strong { margin-top: 4px; font-size: clamp(36px, 2.3vw, 42px); font-weight: 800; line-height: 1.1; color: #627d98; overflow-wrap: anywhere; }
-.add-measurement-result-ok { border-color: #b8e4cd; background: #eefaf3; }
-.add-measurement-result-ok strong { color: #167451; }
-.add-measurement-result-ng { border-color: #f0c2c2; background: #fff1f0; }
-.add-measurement-result-ng strong { color: #bc3030; }
-.add-measurement-result-overall { border-width: 2px; }
-.add-measurement-result-overall strong { font-size: clamp(40px, 2.5vw, 42px); }
-.add-measurement-summary .ant-descriptions-item { padding-bottom: 8px; }
+.add-measurement-details-card .form-section-title {
+  margin: 0 0 14px;
+  font-size: clamp(18px, 1.4vw, 20px);
+  font-weight: 700;
+  color: #243b53;
+}
+
+.add-measurement-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.add-measurement-result {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 112px;
+  padding: 12px 18px;
+  border: 1px solid #e3ebf3;
+  border-radius: 12px;
+  background: #f7fafc;
+  text-align: center;
+}
+
+.add-measurement-result span {
+  color: #405b72;
+  font-size: clamp(16px, 1.1vw, 18px);
+  font-weight: 700;
+  letter-spacing: .03em;
+}
+
+.add-measurement-result strong {
+  margin-top: 4px;
+  font-size: clamp(36px, 2.3vw, 42px);
+  font-weight: 800;
+  line-height: 1.1;
+  color: #627d98;
+  overflow-wrap: anywhere;
+}
+
+.add-measurement-result-ok {
+  border-color: #b8e4cd;
+  background: #eefaf3;
+}
+
+.add-measurement-result-ok strong {
+  color: #167451;
+}
+
+.add-measurement-result-ng {
+  border-color: #f0c2c2;
+  background: #fff1f0;
+}
+
+.add-measurement-result-ng strong {
+  color: #bc3030;
+}
+
+.add-measurement-result-overall {
+  border-width: 2px;
+}
+
+.add-measurement-result-overall strong {
+  font-size: clamp(40px, 2.5vw, 42px);
+}
+
+.add-measurement-summary .ant-descriptions-item {
+  padding-bottom: 8px;
+}
+
 .add-measurement-summary .ant-descriptions-item-label,
-.add-measurement-details-card .ant-descriptions-item-label { color: #526b83; font-size: clamp(15px, 1vw, 16px); }
+.add-measurement-details-card .ant-descriptions-item-label {
+  color: #526b83;
+  font-size: clamp(15px, 1vw, 16px);
+}
+
 .add-measurement-summary .ant-descriptions-item-content,
-.add-measurement-details-card .ant-descriptions-item-content { color: #243b53; font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
-.add-measurement-summary .ant-tag { margin: 0; font-size: 15px; white-space: normal; }
-.add-measurement-alert { margin-bottom: 12px; }
-.add-measurement-warnings { margin-bottom: 12px; }
-.add-measurement-details-card .measurement-details { gap: 10px; }
-.add-measurement-details-card .measurement-details > .ant-card > .ant-card-body { padding: 14px 18px 16px; }
-.add-measurement-details-card .measurement-details > .ant-card > .ant-card-head { min-height: 46px; }
-.add-measurement-details-card .measurement-details > .ant-card > .ant-card-head .ant-card-head-title { font-size: clamp(18px, 1.3vw, 20px); font-weight: 700; }
-.add-measurement-details-card .station-summary { margin-bottom: 10px; }
-.add-measurement-details-card .measurement-point-table .ant-table-cell { font-size: clamp(15px, 1.05vw, 16px); white-space: normal; }
-.add-measurement-details-card .measurement-point-table .ant-table-thead > tr > th { font-size: clamp(15px, 1vw, 16px); color: #334e68; white-space: normal; }
+.add-measurement-details-card .ant-descriptions-item-content {
+  color: #243b53;
+  font-size: 16px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.add-measurement-summary .ant-tag {
+  margin: 0;
+  font-size: 15px;
+  white-space: normal;
+}
+
+.add-measurement-alert {
+  margin-bottom: 12px;
+}
+
+.add-measurement-warnings {
+  margin-bottom: 12px;
+}
+
+.add-measurement-details-card .measurement-details {
+  gap: 10px;
+}
+
+.add-measurement-details-card .measurement-details > .ant-card > .ant-card-body {
+  padding: 14px 18px 16px;
+}
+
+.add-measurement-details-card .measurement-details > .ant-card > .ant-card-head {
+  min-height: 46px;
+}
+
+.add-measurement-details-card .measurement-details > .ant-card > .ant-card-head .ant-card-head-title {
+  font-size: clamp(18px, 1.3vw, 20px);
+  font-weight: 700;
+}
+
+.add-measurement-details-card .station-summary {
+  margin-bottom: 10px;
+}
+
+.add-measurement-details-card .measurement-point-table .ant-table-cell {
+  font-size: clamp(15px, 1.05vw, 16px);
+  white-space: normal;
+}
+
+.add-measurement-details-card .measurement-point-table .ant-table-thead > tr > th {
+  font-size: clamp(15px, 1vw, 16px);
+  color: #334e68;
+  white-space: normal;
+}
+
 .add-measurement-details-card .measurement-point-table .ant-tag,
-.add-measurement-details-card .station-summary .ant-tag { font-size: 15px; margin-inline-end: 0; }
-.add-measurement-details-card .measurement-point-table .ant-table-tbody > tr > td { padding-top: 9px; padding-bottom: 9px; }
-.add-measurement-details-card .measurement-attempt-table .ant-table-cell { font-size: clamp(15px, 1.05vw, 16px); }
-.add-measurement-details-card .measurement-attempt-table .ant-table-thead > tr > th { color: #334e68; font-size: clamp(15px, 1vw, 16px); }
+.add-measurement-details-card .station-summary .ant-tag {
+  font-size: 15px;
+  margin-inline-end: 0;
+}
+
+.add-measurement-details-card .measurement-point-table .ant-table-tbody > tr > td {
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+
+.add-measurement-details-card .measurement-attempt-table .ant-table-cell {
+  font-size: clamp(15px, 1.05vw, 16px);
+}
+
+.add-measurement-details-card .measurement-attempt-table .ant-table-thead > tr > th {
+  color: #334e68;
+  font-size: clamp(15px, 1vw, 16px);
+}
+
 .add-measurement-details-card .ant-btn,
 .add-measurement-warnings .ant-btn,
-.add-measurement-retry-alert .ant-btn { font-size: 15px; }
+.add-measurement-retry-alert .ant-btn {
+  font-size: 15px;
+}
 
 @media (max-width: 760px) {
-  .add-measurement-result-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .add-measurement-result-overall { grid-column: 1 / -1; }
+  .add-measurement-result-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .add-measurement-result-overall {
+    grid-column: 1 / -1;
+  }
 }
+
 @media (max-width: 520px) {
   .add-measurement-results > .ant-card-body,
-  .add-measurement-details-card > .ant-card-body { padding: 16px; }
-  .add-measurement-result-grid { grid-template-columns: 1fr; }
-  .add-measurement-result-overall { grid-column: auto; }
+  .add-measurement-details-card > .ant-card-body {
+    padding: 16px;
+  }
+
+  .add-measurement-result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .add-measurement-result-overall {
+    grid-column: auto;
+  }
 }
-.add-measurement-plc-card { margin-bottom: 20px; }
-.add-measurement-plc-card > .ant-card-body { padding: 18px 22px; }
-.add-measurement-plc-main { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-width: 0; }
-.add-measurement-plc-copy { min-width: 0; }
-.add-measurement-plc-card .card-title { font-size: clamp(18px, 1.4vw, 20px); font-weight: 700; }
-.add-measurement-plc-detail { margin-top: 5px; color: #627d98; font-size: 16px; overflow-wrap: anywhere; }
-.add-measurement-plc-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
-.add-measurement-plc-controls .ant-tag { margin: 0; padding: 4px 10px; font-size: 15px; white-space: normal; }
-.add-measurement-plc-controls .ant-btn { min-height: 38px; }
-.add-measurement-plc-error { margin-top: 12px; }
+
+.add-measurement-plc-card {
+  margin-bottom: 20px;
+}
+
+.add-measurement-plc-card > .ant-card-body {
+  padding: 18px 22px;
+}
+
+.add-measurement-plc-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+}
+
+.add-measurement-plc-copy {
+  min-width: 0;
+}
+
+.add-measurement-plc-card .card-title {
+  font-size: clamp(18px, 1.4vw, 20px);
+  font-weight: 700;
+}
+
+.add-measurement-plc-detail {
+  margin-top: 5px;
+  color: #627d98;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+
+.add-measurement-plc-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.add-measurement-plc-controls .ant-tag {
+  margin: 0;
+  padding: 4px 10px;
+  font-size: 15px;
+  white-space: normal;
+}
+
+.add-measurement-plc-controls .ant-btn {
+  min-height: 38px;
+}
+
+.add-measurement-plc-error {
+  margin-top: 12px;
+}
+
 @media (max-width: 900px) {
-  .add-measurement-plc-main { align-items: flex-start; flex-direction: column; gap: 14px; }
-  .add-measurement-plc-controls { justify-content: flex-start; }
+  .add-measurement-plc-main {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .add-measurement-plc-controls {
+    justify-content: flex-start;
+  }
 }

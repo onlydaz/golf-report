@@ -74,7 +74,6 @@ export interface MeasurementListRequest {
   productCode?: string;
   clubNumber?: number;
   measuredFrom?: string;
-  /** Exclusive upper bound (next day midnight for calendar ranges). */
   measuredTo?: string;
   tipResult?: MeasurementResult;
   buttResult?: MeasurementResult;

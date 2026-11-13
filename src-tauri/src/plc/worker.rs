@@ -1777,9 +1777,50 @@ impl Engine {
     }
 }
 impl Engine {
+    // A pending read, retry or temporary loss of storage/heartbeat verification is
+    // not evidence that a previously reported ACK failure has been resolved.
+    async fn ack_progress_status(&self, next: &'static str) {
+        let mut status = self.state.status.write().await;
+        if !matches!(status.ack_status, "FAILED" | "RECONCILIATION_REQUIRED") {
+            status.ack_status = next;
+        }
+    }
+
     async fn ack_step(&self, report: &PollReport) -> Result<(), String> {
         if !self.state.fresh_health().await {
-            self.state.status.write().await.ack_status = "WAITING";
+            // Heartbeat freshness gates new ACK writes, but an already accepted
+            // checkpoint can still be confirmed by this read-only snapshot.
+            if self.storage_verified.load(Ordering::SeqCst) && report.diagnostics.is_empty() {
+                let journal = self.journal.lock().await;
+                let mut binding = format!(
+                    "{}|{}|{}|{}|{:?}|{}|{:?}",
+                    self.config.mode,
+                    self.config.address,
+                    self.config.unit_id,
+                    self.config.source_key,
+                    self.config.confirmed_session_id,
+                    self.config.modbus_address_offset,
+                    self.config.word_order
+                );
+                if self.config.ack_protocol.as_deref() == Some("as200") {
+                    binding.push_str("|as200");
+                }
+                let checkpoint = journal.ack.accepted;
+                if journal.pause.is_none()
+                    && journal.session_id == self.config.confirmed_session_id
+                    && journal.ack.binding == binding
+                    && journal.ack.intent.is_none()
+                    && checkpoint > 0
+                    && report.control.total_count == checkpoint
+                    && report.control.pc_read_count == checkpoint
+                    && report.control.pc_read_done == 0
+                    && report.control.data_ready == 0
+                {
+                    self.state.status.write().await.ack_status = "ACKNOWLEDGED";
+                    return Ok(());
+                }
+            }
+            self.ack_progress_status("WAITING").await;
             return Ok(());
         }
         for record in report.buffers.iter().filter_map(|b| b.record.as_ref()) {
@@ -1787,7 +1828,7 @@ impl Engine {
             record.validate_workflow()?;
         }
         if !self.storage_verified.load(Ordering::SeqCst) {
-            self.state.status.write().await.ack_status = "WAITING";
+            self.ack_progress_status("WAITING").await;
             return Ok(());
         }
         use super::as200::ack::{AckIntent, AckWriter, accepted, accepted_as200, same_records};
@@ -1803,7 +1844,7 @@ impl Engine {
             return Err("ACK bị chặn: phiên cấu hình chưa được đối chiếu với journal".into());
         }
         if journal.pause.is_some() || !report.diagnostics.is_empty() {
-            self.state.status.write().await.ack_status = "WAITING";
+            self.ack_progress_status("WAITING").await;
             return Ok(());
         }
         let mut binding = format!(
@@ -1874,7 +1915,7 @@ impl Engine {
                 // Nếu Count đã ghi nhưng mất response, PC_ReadCount khác accepted nên không vào đây.
                 journal.ack.intent = None;
                 self.persist(&journal)?;
-                self.state.status.write().await.ack_status = "WAITING";
+                self.ack_progress_status("WAITING").await;
                 return Ok(());
             }
             if as200
@@ -1900,14 +1941,13 @@ impl Engine {
             }
             if report.control.pc_read_done == 1 {
                 // Không lặp xung khi chưa biết PLC đã áp dụng lệnh trước hay chưa.
-                self.state.status.write().await.ack_status =
-                    if intent.submitted_at_ms.is_some_and(|at| {
-                        Utc::now().timestamp_millis() - at < self.config.timeout_ms as i64
-                    }) {
-                        "WAITING"
-                    } else {
-                        "FAILED"
-                    };
+                if intent.submitted_at_ms.is_some_and(|at| {
+                    Utc::now().timestamp_millis() - at < self.config.timeout_ms as i64
+                }) {
+                    self.ack_progress_status("WAITING").await;
+                } else {
+                    self.state.status.write().await.ack_status = "FAILED";
+                }
                 return Ok(());
             }
             if as200 && intent.phase() != super::as200::ack::AckPhase::NotSent {
@@ -1933,7 +1973,7 @@ impl Engine {
             let fresh = writer.verify_snapshot(&intent).await?;
             if is_accepted(&intent, &fresh) {
                 // Chỉ poll tiếp; lần sau sẽ lưu checkpoint đã xác nhận.
-                self.state.status.write().await.ack_status = "WAITING";
+                self.ack_progress_status("WAITING").await;
                 return Ok(());
             }
             if fresh.control.total_count < intent.target
@@ -1944,7 +1984,7 @@ impl Engine {
             {
                 return Err("ACK control changed/refused".into());
             }
-            self.state.status.write().await.ack_status = "PENDING";
+            self.ack_progress_status("PENDING").await;
             if !self.state.fresh_health().await {
                 return Ok(());
             }
@@ -1968,7 +2008,7 @@ impl Engine {
             // Crash sau persist/trước write vẫn là kết quả không rõ: không thể
             // giải quyết atomicity giữa ổ đĩa và socket bằng một flag phần mềm.
             writer.done_prepared(prepared).await?;
-            self.state.status.write().await.ack_status = "WAITING";
+            self.ack_progress_status("WAITING").await;
             return Ok(());
         }
         if report.control.total_count == journal.ack.accepted && journal.ack.accepted > 0 {
@@ -1989,8 +2029,17 @@ impl Engine {
         if target < journal.ack.accepted || (!as200 && target - journal.ack.accepted > 2) {
             return Err("ACK sequence gap/reset".into());
         }
-        self.state.status.write().await.ack_status = "WAITING";
-        if target == 0 || report.control.data_ready != 1 {
+        if target == 0 {
+            // Empty baseline with no pending intent and a matching remote checkpoint.
+            if report.control.data_ready == 0 {
+                self.state.status.write().await.ack_status = "WAITING";
+            } else {
+                self.ack_progress_status("WAITING").await;
+            }
+            return Ok(());
+        }
+        self.ack_progress_status("WAITING").await;
+        if report.control.data_ready != 1 {
             return Ok(());
         }
         if i64::from(target) - i64::from(journal.ack.accepted) > journal.deliveries.len() as i64 {
@@ -2045,7 +2094,7 @@ impl Engine {
             observed_done_high: false,
         });
         self.persist(&journal)?; // Ý định bền vững trước mọi lệnh mạng; không có DB transaction đang mở.
-        self.state.status.write().await.ack_status = "PENDING";
+        self.ack_progress_status("PENDING").await;
         Ok(())
     }
 }

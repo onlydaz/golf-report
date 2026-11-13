@@ -309,6 +309,10 @@ function AddMeasurement() {
           : latest?.saveState === "FAILED"
             ? "Chưa lưu được kết quả đo gần nhất. Vui lòng kiểm tra kết nối dữ liệu."
             : "Cần kiểm tra kết nối máy đo";
+    } else if (status.ackStatus === "RECONCILIATION_REQUIRED") {
+      systemNotice = "Cần kỹ thuật đối chiếu xác nhận từ PLC. Dữ liệu chờ được giữ nguyên.";
+    } else if (status.ackStatus === "FAILED") {
+      systemNotice = "Chưa nhận được xác nhận đã đọc từ PLC. Vui lòng liên hệ kỹ thuật nếu cảnh báo kéo dài.";
     } else if (["ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || status.pauseReason) {
       systemNotice = displayNotice(status.message, states[status.state] ?? "Có lỗi cần kiểm tra.");
     } else if (latest?.saveState === "FAILED") {
@@ -319,10 +323,6 @@ function AddMeasurement() {
       systemNotice = "Hệ thống đã dừng thu dữ liệu. Có thể bắt đầu thu tại đây khi đủ điều kiện.";
     } else if (status.connection === "DISCONNECTED") {
       systemNotice = "Mất kết nối với máy đo. Đang thử kết nối lại...";
-    } else if (status.ackStatus === "RECONCILIATION_REQUIRED") {
-      systemNotice = "Cần kỹ thuật đối chiếu xác nhận từ PLC. Dữ liệu chờ được giữ nguyên.";
-    } else if (status.ackStatus === "FAILED") {
-      systemNotice = "Chưa nhận được xác nhận đã đọc từ PLC. Vui lòng liên hệ kỹ thuật nếu cảnh báo kéo dài.";
     } else if (status.pcHeartbeatStatus === "FAILED") {
       systemNotice = "Chưa gửi được tín hiệu hoạt động từ phần mềm tới PLC. Vui lòng kiểm tra kết nối.";
     } else if (status.plcHealth === "STALE") {
@@ -348,6 +348,15 @@ function AddMeasurement() {
   ) && visibleWarnings.some((warning) => warning.severity === "error");
   const resetActionError = resetNeedsReview && collectionError !== "RESET_CONFIRMATION_REQUIRED" &&
     /reset|counter|phiên|ACK|Journal|quarantine/i.test(collectionError);
+  const pendingStorageFailure = !!status?.volatileCount && (
+    ["ERROR", "FAILED", "PAUSED", "STOPPING", "STOPPED"].includes(status.state) ||
+    status.connection === "DISCONNECTED" || !!status.pauseReason
+  );
+  const journalWriteFailure = !!status?.volatileCount && /Không lưu được journal|Journal lỗi|Không thể đọc hoặc lưu dữ liệu chờ/i.test(status.message);
+  const duplicateStorageNotice = !error && !!status?.volatileCount &&
+    status.ackStatus !== "FAILED" && status.ackStatus !== "RECONCILIATION_REQUIRED" &&
+    /Hết thời gian PostgreSQL|pool|database|inbox thất bại|Không lưu được journal|Journal lỗi/i.test(status.message) &&
+    ["ERROR", "FAILED"].includes(status.state);
   const committedId = latest?.measurementId;
 
   const [detail, setDetail] = useState<MeasurementDetail>();
@@ -468,7 +477,7 @@ function AddMeasurement() {
         />
       </Card>
 
-      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
+      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && !duplicateStorageNotice && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
         type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
         showIcon
         className="add-measurement-alert"
@@ -494,13 +503,15 @@ function AddMeasurement() {
           </Space>} />
       )}
 
-      {(status?.volatileCount ?? 0) > 0 && (
+      {(status?.volatileCount ?? 0) > 0 && (pendingStorageFailure || journalWriteFailure) && (
         <Alert
           type="error"
           showIcon
           style={{ marginBottom: 16 }}
-          message={`${status?.volatileCount} kết quả đo đang chờ lưu dữ liệu.`}
-          description="Kết quả đo chưa được xác nhận lưu vào hệ thống. Đóng ứng dụng lúc này có nguy cơ mất dữ liệu; vui lòng chờ lưu hoàn tất hoặc liên hệ kỹ thuật nếu lỗi kéo dài."
+          message={`${status?.volatileCount} kết quả đo chưa lưu được vào PostgreSQL.`}
+          description={journalWriteFailure
+            ? "Chưa xác nhận được dữ liệu chờ đã lưu an toàn vào Journal. Vui lòng liên hệ kỹ thuật; không đóng ứng dụng."
+            : "Dữ liệu đang chờ trong Journal trên máy, chưa được xác nhận lưu vào PostgreSQL. Vui lòng kiểm tra nguyên nhân trước khi tiếp tục."}
         />
       )}
 
