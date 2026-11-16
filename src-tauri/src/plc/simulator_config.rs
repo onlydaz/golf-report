@@ -25,7 +25,9 @@ pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct SessionTransition {
     pub previous_session_id: Option<String>,
-    pub previous_total_count: Option<i32>,
+    // Preserve the legacy TOML key; Published ACK v4 rejects session_transition before collection.
+    #[serde(rename = "previous_total_count")]
+    pub _previous_total_count: Option<i32>,
     pub previous_ack_count: i32,
     pub expected_total_count: i32,
     pub reason: String,
@@ -90,12 +92,17 @@ impl Default for SimulatorConfig {
 impl SimulatorConfig {
     /// Resolve runtime state relative to its owning configuration, including legacy defaults.
     pub(super) fn journal_file(&self, configuration: &Path) -> PathBuf {
-        let journal = self.journal_path.clone()
+        let journal = self
+            .journal_path
+            .clone()
             .unwrap_or_else(|| PathBuf::from("as200_capture_journal.json"));
         if journal.is_absolute() {
             journal
         } else {
-            configuration.parent().unwrap_or_else(|| Path::new(".")).join(journal)
+            configuration
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(journal)
         }
     }
 
@@ -154,15 +161,11 @@ impl SimulatorConfig {
                 "plc" | "modbus" => {
                     self.allow_plc_connection && self.ack_protocol.as_deref() == Some("as200")
                 }
-                "simulator" => {
-                    matches!(self.ack_protocol.as_deref(), Some("simulator-v1" | "as200"))
-                }
+                "simulator" => self.ack_protocol.as_deref() == Some("as200"),
                 _ => false,
             }
         {
-            return Err(
-                "ACK yêu cầu protocol phù hợp: plc=as200; simulator=as200 hoặc simulator-v1".into(),
-            );
+            return Err("ACK yêu cầu protocol AS200 đã được xác nhận".into());
         }
         if self.ack_enabled && self.confirmed_session_id.is_none() {
             return Err("ACK yêu cầu phiên được xác nhận rõ ràng".into());
@@ -222,8 +225,14 @@ pub(super) fn locate(app_directory: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = app_directory {
         candidates.push(dir.join("as200_config.toml"));
     }
-    // Release uses the caller-provided ProgramData directory; development can use local files.
-    if cfg!(debug_assertions) && let Ok(cwd) = std::env::current_dir() {
+    // An explicitly selected application directory is authoritative. Never fall back elsewhere.
+    if app_directory.is_some() {
+        return candidates.into_iter().find(|p| p.is_file());
+    }
+    // Standalone development helpers may still resolve their project working directory.
+    if cfg!(debug_assertions)
+        && let Ok(cwd) = std::env::current_dir()
+    {
         candidates.push(cwd.join("as200_config.toml"));
         candidates.push(cwd.join("src-tauri/as200_config.toml"));
         // Cargo/Tauri thường khởi chạy backend với cwd là src-tauri.
@@ -248,8 +257,8 @@ pub fn load(app_directory: Option<&Path>) -> Result<Option<(SimulatorConfig, Pat
 /// Read historical configuration without granting any former DEMO reset capability.
 /// All other unknown fields remain rejected when deserializing SimulatorConfig.
 pub(super) fn configuration_values(text: &str) -> Result<toml::Value, String> {
-    let mut values: toml::Value = toml::from_str(text)
-        .map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
+    let mut values: toml::Value =
+        toml::from_str(text).map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
     if let Some(table) = values.as_table_mut() {
         table.remove("demo_device_id");
         table.remove("demo_boundary_id");
@@ -259,8 +268,10 @@ pub(super) fn configuration_values(text: &str) -> Result<toml::Value, String> {
 
 pub(super) fn parse(text: &str) -> Result<SimulatorConfig, String> {
     let values = configuration_values(text)?;
-    let config: SimulatorConfig =
-        values.clone().try_into().map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
+    let config: SimulatorConfig = values
+        .clone()
+        .try_into()
+        .map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
     if config.mode == "plc" {
         for key in [
             "address",
@@ -327,11 +338,9 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.allow_plc_heartbeat_write = true;
         assert!(cfg.validate().is_ok());
-        use crate::plc::as200::ack::{AckWriter, HeartbeatWriter};
+        use crate::plc::as200::ack::AckWriter;
         assert!(AckWriter::new(cfg.reader(), "modbus", true, Some("as200"), false).is_err());
         assert!(AckWriter::new(cfg.reader(), "modbus", true, Some("as200"), true).is_ok());
-        assert!(HeartbeatWriter::new(cfg.reader(), "modbus", true, true, false).is_err());
-        assert!(HeartbeatWriter::new(cfg.reader(), "modbus", true, true, true).is_ok());
         assert!(parse(&text.replace("word_order='HIGH'\n", "")).is_err());
         assert!(
             parse(&text.replace(

@@ -1,8 +1,7 @@
 //! Công cụ chỉ đọc AS200, không chạy Tauri, PostgreSQL hay ACK.
-#[path = "../plc/as200/mod.rs"]
-mod as200;
-
-use as200::{As200Config, WordOrder, model::PlcStickRecord, reader::As200Reader};
+use golf_report_lib::as200::{
+    As200Config, WordOrder, model::PlcStickRecord, reader::As200Reader,
+};
 use std::time::Duration;
 
 fn record_output(record: &PlcStickRecord, raw: bool) {
@@ -114,45 +113,35 @@ async fn run() -> Result<(), String> {
         config.address, config.unit_id, config.word_order, config.modbus_address_offset
     );
     let mut reader = As200Reader::new(config);
-    let mut previous_total = None;
+    let mut previous = None;
     loop {
-        match reader.poll_logged().await {
-            Ok(report) => {
-                if once
-                    || previous_total != Some(report.control.total_count)
-                    || !report.diagnostics.is_empty()
-                {
+        match reader.poll_published_record().await {
+            Ok(snapshot) => {
+                let key = (
+                    snapshot.control.total_count,
+                    snapshot.control.pc_read_count,
+                    snapshot.control.pc_read_done,
+                    snapshot.control.data_ready,
+                    snapshot
+                        .buffer
+                        .as_ref()
+                        .and_then(|b| b.record.as_ref())
+                        .map(|r| r.record_seq),
+                );
+                if once || previous != Some(key) || !snapshot.diagnostics.is_empty() {
                     println!(
                         "Control={}",
-                        serde_json::to_string(&report.control).map_err(|e| e.to_string())?
+                        serde_json::to_string(&snapshot.control).map_err(|e| e.to_string())?
                     );
-                    println!(
-                        "Observed new records={} (không có nghĩa đã lưu hoặc ACK)",
-                        report.new_records.len()
-                    );
-                    for buffer in &report.buffers {
+                    if let Some(buffer) = &snapshot.buffer {
                         if let Some(record) = &buffer.record {
                             record_output(record, raw);
-                        } else {
-                            println!(
-                                "Buffer={} WORD={} Status bit0=0; chưa có record hợp lệ",
-                                buffer.buffer_index,
-                                buffer.raw_registers.len()
-                            );
                         }
                     }
-                    previous_total = Some(report.control.total_count);
-                }
-                if report.diagnostics.iter().any(|d| {
-                    matches!(
-                        d,
-                        as200::reader::Diagnostic::TrackerRejected {
-                            session_unconfirmed: true,
-                            ..
-                        }
-                    )
-                }) {
-                    return Err(as200::As200Error::SessionUnconfirmed.to_string());
+                    for diagnostic in &snapshot.diagnostics {
+                        eprintln!("{diagnostic:?}");
+                    }
+                    previous = Some(key);
                 }
                 if once {
                     return Ok(());
@@ -162,10 +151,7 @@ async fn run() -> Result<(), String> {
                 if once {
                     return Err(error.to_string());
                 }
-                if error == as200::As200Error::SessionUnconfirmed {
-                    return Err("Counter/phiên PLC thay đổi. Xác nhận reset rồi chạy lại reader để lấy mốc mới.".into());
-                }
-                // Transport hủy socket lỗi và tự nối lại ở lượt polling sau.
+                eprintln!("{error}");
             }
         }
         tokio::time::sleep(interval).await;

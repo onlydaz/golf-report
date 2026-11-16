@@ -1,11 +1,5 @@
 //! Freshness dùng đồng hồ monotonic; không suy reset phiên từ Heartbeat wrap.
 use std::time::{Duration, Instant};
-pub fn next_pc_heartbeat(last: u16) -> Result<u16, String> {
-    if last > 32767 {
-        return Err("PC_Heartbeat ngoài phạm vi, không tự sửa giá trị PLC".into());
-    }
-    Ok((last + 1) % 32768)
-}
 
 pub struct HeartbeatMonitor {
     timeout: Option<Duration>,
@@ -55,8 +49,5 @@ mod tests {
             HeartbeatMonitor::new(None, now).observe(1, now),
             "UNCONFIGURED"
         );
-        assert_eq!(next_pc_heartbeat(32767).unwrap(), 0);
-        assert_eq!(next_pc_heartbeat(0).unwrap(), 1);
-        assert!(next_pc_heartbeat(32768).is_err());
     }
 }

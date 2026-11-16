@@ -23,8 +23,15 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "resources": {
+      "resources/database_config.toml": "resources/database_config.toml"
+    },
     "windows": {
+      "wix": {
+        "fragmentPaths": ["installer-permissions.wxs"],
+        "componentRefs": ["ApplicationRuntimePermissions"]
+      },
       "nsis": {
         "installMode": "perMachine",
         "installerHooks": "installer-hooks.nsh"

@@ -9,9 +9,7 @@ pub(crate) fn options() -> PgConnectOptions {
         std::env::var("AS200_TEST_DATABASE").as_deref(),
         Ok("golf_report_test")
     );
-    let app =
-        std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("com.golf.report"));
-    let settings = super::config::load_config(app).unwrap();
+    let settings = super::config::load_config().unwrap();
     assert!(
         matches!(settings.host.as_str(), "localhost" | "127.0.0.1" | "::1"),
         "Only the explicitly authorized local PostgreSQL test server is allowed"

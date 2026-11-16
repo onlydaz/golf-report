@@ -101,7 +101,9 @@ impl PlcStickRecord {
     /// Quy tắc điểm/lượt và kết quả theo Excel AS200, dùng chung cho mọi nguồn.
     /// Không kiểm tra ngưỡng số đo, quan hệ StickNo/sequence hoặc các bit status chưa chốt.
     pub fn validate_workflow(&self) -> Result<(), String> {
-        if self.product_code.trim().is_empty() || !self.product_code.bytes().all(|b| (32..=126).contains(&b)) {
+        if self.product_code.trim().is_empty()
+            || !self.product_code.bytes().all(|b| (32..=126).contains(&b))
+        {
             return Err("ProductCode missing or contains invalid characters".into());
         }
         for (name, station) in [("TIP", &self.tip), ("BUTT", &self.butt)] {

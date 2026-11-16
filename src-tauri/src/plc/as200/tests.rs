@@ -1,7 +1,4 @@
-use super::{
-    As200Config, As200Error, DisabledAcknowledgement, PlcAcknowledgement, WordOrder, decode, map,
-    model::PlcResult, reader::*,
-};
+use super::{As200Config, As200Error, WordOrder, decode, map, model::PlcResult, reader::*};
 use std::time::Duration;
 
 fn config(order: WordOrder) -> As200Config {
@@ -252,449 +249,202 @@ impl HoldingRegisterReader for MemoryReader {
     }
 }
 #[tokio::test]
-async fn chunks_240_words_into_100_100_40_and_applies_address_offset() {
-    let order = WordOrder::LowWordFirst;
-    let mut memory = MemoryReader::new(order, 2);
-    memory.offset = -1;
-    let mut cfg = config(order);
-    cfg.modbus_address_offset = -1;
-    let mut reader = As200Reader::with_transport(cfg, memory);
-    let report = reader.poll().await.unwrap();
-    assert!(report.new_records.is_empty());
-    assert_eq!(report.buffers[0].record.as_ref().unwrap().record_seq, 1);
-    assert_eq!(report.buffers[1].record.as_ref().unwrap().record_seq, 2);
-    assert_eq!(
-        reader.transport.calls,
-        vec![
-            (24999, 20),
-            (25019, 100),
-            (25119, 100),
-            (25219, 40),
-            (25259, 100),
-            (25359, 100),
-            (25459, 40),
-            (24999, 20),
-            (25019, 100),
-            (25119, 100),
-            (25219, 40),
-            (25259, 100),
-            (25359, 100),
-            (25459, 40),
-            (24999, 20),
-        ]
-    );
-}
-#[tokio::test]
-async fn detects_new_records_from_both_buffers_and_deduplicates() {
-    let order = WordOrder::HighWordFirst;
-    let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 2));
-    reader.poll().await.unwrap();
-    reader.transport.words = MemoryReader::new(order, 4).words;
-    let report = reader.poll().await.unwrap();
-    assert_eq!(
-        report
-            .new_records
-            .iter()
-            .map(|r| r.record_seq)
-            .collect::<Vec<_>>(),
-        vec![3, 4]
-    );
-    assert!(reader.poll().await.unwrap().new_records.is_empty());
-}
-#[tokio::test]
-async fn rejects_torn_records_short_reads_and_does_not_advance_checkpoint() {
-    let order = WordOrder::LowWordFirst;
-    let mut memory = MemoryReader::new(order, 2);
-    memory.mutate_on_call = Some(7);
-    let mut reader = As200Reader::with_transport(config(order), memory);
-    assert_eq!(reader.poll().await.unwrap_err(), As200Error::Unstable);
-    assert!(reader.tracker.total_count.is_none());
-    reader.transport.mutate_on_call = None;
-    reader.transport.short_on_call = Some(13);
-    assert!(reader.poll().await.is_err());
-    assert!(reader.tracker.total_count.is_none());
-}
-#[tokio::test]
-async fn reports_overrun_and_requires_explicit_session_confirmation_after_reset() {
-    let order = WordOrder::LowWordFirst;
-    let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 2));
-    reader.poll().await.unwrap();
-    reader.transport.words = MemoryReader::new(order, 7).words;
-    let report = reader.poll().await.unwrap();
-    assert!(report.diagnostics.contains(&Diagnostic::BufferOverrunRisk {
-        created_since_last_poll: 5,
-        capacity: 2
-    }));
-    assert!(
-        report
-            .diagnostics
-            .contains(&Diagnostic::UnaccountedRecords {
-                created_since_last_poll: 5,
-                available_new_records: 2
-            })
-    );
-    assert_eq!(report.new_records.len(), 2); // Không tự dựng ba bản ghi đã mất.
-    reader.transport.words = MemoryReader::new(order, 2).words;
-    assert!(
-        reader
-            .poll()
-            .await
-            .unwrap()
-            .diagnostics
-            .iter()
-            .any(|d| matches!(
-                d,
-                Diagnostic::TrackerRejected {
-                    session_unconfirmed: true,
-                    ..
-                }
-            ))
-    );
-    reader.transport.words = MemoryReader::new(order, 8).words;
-    assert!(
-        reader
-            .poll()
-            .await
-            .unwrap()
-            .diagnostics
-            .iter()
-            .any(|d| matches!(
-                d,
-                Diagnostic::TrackerRejected {
-                    session_unconfirmed: true,
-                    ..
-                }
-            ))
-    );
-    reader.tracker.reset_after_confirmed_session_change();
-    assert!(reader.poll().await.unwrap().new_records.is_empty());
-}
-#[tokio::test]
-async fn handles_empty_slots_incomplete_records_and_reconnection() {
-    let order = WordOrder::LowWordFirst;
-    let mut memory = MemoryReader::new(order, 2);
-    memory.words[20..260].fill(0);
-    memory.fail_on_call = Some(1);
-    let mut reader = As200Reader::with_transport(config(order), memory);
-    assert!(reader.poll().await.is_err());
-    let report = reader.poll().await.unwrap();
-    assert!(report.buffers[0].record.is_none());
-    reader.transport.words = MemoryReader::new(order, 3).words;
-    reader.transport.words[260 + 20] = 0;
-    let report = reader.poll().await.unwrap();
-    assert!(report.new_records.is_empty());
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, Diagnostic::IncompleteRecord { record_seq: 3, .. }))
-    );
-    assert_eq!(reader.tracker.total_count, Some(2));
-}
-#[test]
-fn ack_is_explicitly_disabled() {
-    assert_eq!(
-        DisabledAcknowledgement.acknowledge(10),
-        Err(As200Error::AckDisabled)
-    );
-}
-
-#[test]
-fn excel_workflow_checks_results_points_attempts_and_unused_fields() {
-    let order = WordOrder::LowWordFirst;
-    let mut raw = record(1, order);
-    for base in [32, 54, 76, 98, 128, 150, 172, 194] {
-        raw[base + 2] = 4;
-    }
-    assert!(
-        decode::record(&raw, 0, order)
-            .unwrap()
-            .validate_workflow()
-            .is_ok()
-    );
-    for (header, points) in [(24, 32), (120, 128)] {
-        let mut ng = raw.clone();
-        ng[20] = 2;
-        ng[header] = 2;
-        ng[header + 1] = 2;
-        ng[header + 2] = 2;
-        ng[points + 22] = 2;
-        ng[points + 44..points + 88].fill(0);
-        assert!(
-            decode::record(&ng, 0, order)
-                .unwrap()
-                .validate_workflow()
-                .is_ok()
-        );
-        // Enum/range vẫn đúng nhưng nghiệp vụ NG trước lượt thứ tư là sai.
-        let mut early = ng.clone();
-        early[points + 23] = 2;
-        early[points + 24] = 2;
-        assert!(
-            decode::record(&early, 0, order)
-                .unwrap()
-                .validate_workflow()
-                .is_err()
-        );
-        for (offset, value) in [
-            (20, 1),
-            (header + 1, 3),
-            (header + 2, 3),
-            (points, 0),
-            (points + 24, 3),
-            (points + 44, 1),
-            (points + 50, 1),
-        ] {
-            let mut invalid = ng.clone();
-            invalid[offset] = value;
-            assert!(
-                decode::record(&invalid, 0, order)
-                    .map(|r| r.validate_workflow().is_err())
-                    .unwrap_or(true),
-                "offset {offset}"
-            );
-        }
-    }
-    let mut first_ok = raw;
-    first_ok[33] = 1;
-    first_ok[34] = 1;
-    first_ok[42..54].fill(0);
-    assert!(
-        decode::record(&first_ok, 0, order)
-            .unwrap()
-            .validate_workflow()
-            .is_ok()
-    );
-    first_ok[42] = 1;
-    assert!(
-        decode::record(&first_ok, 0, order)
-            .unwrap()
-            .validate_workflow()
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn stable_decode_failure_preserves_raw_and_the_other_slot_without_checkpoint_advance() {
-    let order = WordOrder::LowWordFirst;
-    for bad_offset in [20, 36] {
-        let mut memory = MemoryReader::new(order, 2);
-        if bad_offset == 20 {
-            memory.words[20 + bad_offset] = 9;
-        } else {
-            put32(
-                &mut memory.words,
-                20 + bad_offset,
-                f32::NAN.to_bits(),
-                order,
-            );
-        }
-        let original = memory.words[20..260].to_vec();
-        let mut reader = As200Reader::with_transport(config(order), memory);
-        let snapshot = reader.poll().await.unwrap();
-        assert_eq!(snapshot.buffers[0].raw_registers, original);
-        assert!(snapshot.buffers[0].record.is_none());
-        assert_eq!(snapshot.buffers[1].record.as_ref().unwrap().record_seq, 2);
-        assert!(matches!(
-            &snapshot.diagnostics[0],
-            Diagnostic::InvalidRecord {
-                buffer_index: 0,
-                ..
-            }
-        ));
-        assert!(reader.tracker.total_count.is_none());
-        assert!(reader.poll().await.unwrap().new_records.is_empty());
-    }
-}
-
-#[tokio::test]
-async fn business_error_is_returned_before_tracker_can_hide_its_raw() {
-    let order = WordOrder::LowWordFirst;
-    let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 2));
-    reader.poll().await.unwrap();
-    // Cùng seq đổi raw: validation nghiệp vụ phải giữ được raw trước tracker.
-    reader.transport.words[20 + 20] = 2; // Overall NG nhưng hai trạm OK.
-    let raw = reader.transport.words[20..260].to_vec();
-    let snapshot = reader.poll().await.unwrap();
-    assert_eq!(snapshot.buffers[0].raw_registers, raw);
-    assert!(matches!(
-        &snapshot.diagnostics[0],
-        Diagnostic::InvalidRecord {
-            buffer_index: 0,
-            ..
-        }
-    ));
-    assert_eq!(snapshot.buffers[1].record.as_ref().unwrap().record_seq, 2);
-    assert_eq!(reader.tracker.total_count, Some(2));
-}
-
-#[tokio::test]
-async fn control_changes_invalidate_snapshot_but_heartbeat_changes_do_not() {
-    let order = WordOrder::LowWordFirst;
-    let mut memory = MemoryReader::new(order, 2);
-    memory.mutate_on_call = Some(6);
-    memory.mutation_offset = 4;
-    let mut reader = As200Reader::with_transport(config(order), memory);
-    assert_eq!(reader.poll().await.unwrap_err(), As200Error::Unstable);
-    assert!(reader.tracker.total_count.is_none());
-    let mut memory = MemoryReader::new(order, 2);
-    memory.mutate_on_call = Some(6);
-    memory.mutation_offset = 7;
-    let mut reader = As200Reader::with_transport(config(order), memory);
-    assert!(reader.poll().await.is_ok());
-}
-
-#[tokio::test]
-async fn rejects_duplicate_sequences_and_sequence_changes_without_count_changes() {
-    let order = WordOrder::LowWordFirst;
-    let mut memory = MemoryReader::new(order, 2);
-    put32(&mut memory.words, 20 + 22, 2, order);
-    let mut reader = As200Reader::with_transport(config(order), memory);
-    assert!(
-        reader
-            .poll()
-            .await
-            .unwrap()
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, Diagnostic::TrackerRejected { .. }))
-    );
-    reader.transport.words = MemoryReader::new(order, 2).words;
-    reader.poll().await.unwrap();
-    reader.transport.words[260..500].copy_from_slice(&record(3, order));
-    assert!(!reader.poll().await.unwrap().diagnostics.is_empty());
-    assert_eq!(reader.tracker.total_count, Some(2));
-}
-
-#[tokio::test]
-async fn tcp_transport_uses_fc03_validates_mbap_and_reconnects_after_bad_response() {
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 12];
-        stream.read_exact(&mut request).await.unwrap();
-        assert_eq!(&request[2..], &[0, 0, 0, 6, 1, 3, 0x61, 0xa8, 0, 2]); // 25000, 2 WORD.
-        let response = [
-            request[0], request[1], 0, 0, 0, 7, 1, 3, 4, 0x12, 0x34, 0xab, 0xcd,
-        ];
-        stream.write_all(&response).await.unwrap();
-        stream.read_exact(&mut request).await.unwrap();
-        let mut wrong = response;
-        wrong[1] = request[1].wrapping_add(1); // Transaction không khớp.
-        stream.write_all(&wrong).await.unwrap();
-        drop(stream);
-        let (mut stream, _) = listener.accept().await.unwrap();
-        stream.read_exact(&mut request).await.unwrap();
-        assert_eq!(request[7], 3);
-        let response = [request[0], request[1], 0, 0, 0, 7, 1, 3, 4, 0, 1, 0, 2];
-        stream.write_all(&response).await.unwrap();
-    });
-    let mut cfg = config(WordOrder::LowWordFirst);
-    cfg.address = address;
-    let mut transport = ModbusTcpReader::new(cfg);
-    assert_eq!(
-        transport.read_holding_registers(25000, 2).await.unwrap(),
-        vec![0x1234, 0xabcd]
-    );
-    assert!(transport.read_holding_registers(25000, 2).await.is_err());
-    assert_eq!(
-        transport.read_holding_registers(25000, 2).await.unwrap(),
-        vec![1, 2]
-    );
-    assert!(transport.read_holding_registers(25000, 126).await.is_err());
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn tcp_timeout_discards_partial_connection() {
-    use tokio::{io::AsyncReadExt, net::TcpListener};
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut cfg = config(WordOrder::LowWordFirst);
-    cfg.address = listener.local_addr().unwrap().to_string();
-    cfg.timeout = Duration::from_millis(50);
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0; 12];
-        stream.read_exact(&mut request).await.unwrap();
-        // Không gửi response, chỉ giả lập trong loopback trên cổng ngẫu nhiên.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    });
-    let mut transport = ModbusTcpReader::new(cfg);
-    assert_eq!(
-        transport
-            .read_holding_registers(25000, 2)
-            .await
-            .unwrap_err(),
-        As200Error::Timeout
-    );
-    server.abort();
-}
-
-#[tokio::test]
-async fn metadata_conflicts_preserve_raw_without_advancing_tracker() {
+async fn published_record_reads_only_first_region_and_accepts_ready_held_high() {
     for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
-        for seq in [-1_i32, 999] {
-            let mut memory = MemoryReader::new(order, 1);
-            put32(&mut memory.words, 20 + 22, seq as u32, order);
-            let raw = memory.words[20..260].to_vec();
-            let mut reader = As200Reader::with_transport(config(order), memory);
-            let report = reader.poll().await.unwrap();
-            assert!(!report.diagnostics.is_empty());
-            assert_eq!(report.buffers[0].raw_registers, raw);
-            assert_eq!(report.control.total_count, 1);
-            assert!(reader.tracker.total_count.is_none());
-        }
-        let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 42));
-        assert!(
-            reader
-                .poll()
-                .await
-                .unwrap()
-                .diagnostics
-                .iter()
-                .all(|d| !matches!(
-                    d,
-                    Diagnostic::InvalidRecord { .. } | Diagnostic::TrackerRejected { .. }
-                ))
+        let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 12));
+        let first = reader.poll_published_record().await.unwrap();
+        assert!(first.diagnostics.is_empty());
+        assert_eq!(first.control.buffer_count, 2);
+        assert_eq!(first.control.total_count, 12);
+        assert_eq!(first.buffer.unwrap().record.unwrap().record_seq, 11);
+        assert_eq!(
+            reader.transport.calls,
+            vec![
+                (25000, 20),
+                (25020, 100),
+                (25120, 100),
+                (25220, 40),
+                (25000, 20),
+                (25020, 100),
+                (25120, 100),
+                (25220, 40),
+                (25000, 20),
+            ]
         );
-        let mut memory = MemoryReader::new(order, 1);
-        put32(&mut memory.words, 20 + 22, 0, order);
-        let mut reader = As200Reader::with_transport(config(order), memory);
-        assert!(
-            reader
-                .poll()
-                .await
-                .unwrap()
-                .diagnostics
-                .iter()
-                .all(|d| !matches!(d, Diagnostic::InvalidRecord { .. }))
-        );
+        // PLC đưa record kế tiếp ra cùng vùng, không đổi TotalCount/DataReady.
+        reader.transport.words[20..260].copy_from_slice(&record(12, order));
+        let next = reader.poll_published_record().await.unwrap();
+        assert!(next.diagnostics.is_empty());
+        assert_eq!(next.buffer.unwrap().record.unwrap().record_seq, 12);
     }
 }
 
 #[tokio::test]
-async fn changed_raw_same_sequence_preserves_both_slots_and_old_checkpoint() {
+async fn published_record_not_ready_reads_only_control_then_observes_ready_level() {
     let order = WordOrder::LowWordFirst;
-    let mut reader = As200Reader::with_transport(config(order), MemoryReader::new(order, 2));
-    reader.poll().await.unwrap();
-    reader.transport.words[20 + 2] ^= 1;
-    let expected = reader.transport.words.clone();
-    let report = reader.poll().await.unwrap();
+    let mut memory = MemoryReader::new(order, 2);
+    memory.words[11] = 0;
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    let snapshot = reader.poll_published_record().await.unwrap();
+    assert!(snapshot.buffer.is_none());
+    assert!(snapshot.diagnostics.is_empty());
+    assert_eq!(reader.transport.calls, vec![(25000, 20), (25000, 20)]);
+    reader.transport.words[11] = 1;
+    let snapshot = reader.poll_published_record().await.unwrap();
+    assert!(snapshot.buffer.is_some());
+    assert!(snapshot.diagnostics.is_empty());
+}
+
+#[tokio::test]
+async fn published_record_rejects_changing_raw_control_and_short_reads() {
+    let order = WordOrder::LowWordFirst;
+    // Call 5: control giữa hai lần đọc; call 6: bắt đầu đọc lại raw.
+    for (call, offset) in [(6, 100), (5, 11), (5, 8), (5, 12)] {
+        let mut memory = MemoryReader::new(order, 2);
+        memory.mutate_on_call = Some(call);
+        memory.mutation_offset = offset;
+        let mut reader = As200Reader::with_transport(config(order), memory);
+        assert_eq!(
+            reader.poll_published_record().await.unwrap_err(),
+            As200Error::Unstable
+        );
+    }
+    let mut memory = MemoryReader::new(order, 2);
+    memory.short_on_call = Some(2);
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    assert!(reader.poll_published_record().await.is_err());
+}
+
+#[tokio::test]
+async fn published_record_preserves_invalid_raw_and_existing_validation() {
+    let order = WordOrder::LowWordFirst;
+    // Status thiếu valid, workflow sai, metadata vượt TotalCount, REAL NaN.
+    for (offset, value) in [(21, 0), (45, 3), (42, 3), (49, 0x7fc0)] {
+        let mut memory = MemoryReader::new(order, 2);
+        memory.words[offset] = value;
+        let expected_raw = memory.words[20..260].to_vec();
+        let mut reader = As200Reader::with_transport(config(order), memory);
+        let snapshot = reader.poll_published_record().await.unwrap();
+        assert!(!snapshot.diagnostics.is_empty());
+        assert_eq!(snapshot.buffer.unwrap().raw_registers, expected_raw);
+    }
+}
+
+#[test]
+fn published_ack_requires_durable_done_high_then_matching_low_checkpoint() {
+    use super::ack::{PublishedAckIntent, PublishedAckPhase};
+    let order = WordOrder::LowWordFirst;
+    let mut control = decode::control(&control(1, order), order).unwrap();
+    control.pc_read_count = 1;
+    control.pc_read_done = 0;
+    control.data_ready = 0;
+    let mut snapshot = PublishedRecordSnapshot {
+        control,
+        buffer: None,
+        diagnostics: Vec::new(),
+    };
+    let mut intent = PublishedAckIntent {
+        target: 1,
+        inbox_id: 42,
+        raw_registers: record(1, order),
+        phase: PublishedAckPhase::DoneWriteUncertain,
+        observed_done_high: false,
+    };
+    assert!(!intent.confirmed_by(&snapshot)); // Count and Ready=0 do not prove a missed Done.
+    intent.observed_done_high = true;
+    assert!(intent.confirmed_by(&snapshot));
+    for phase in [
+        PublishedAckPhase::Prepared,
+        PublishedAckPhase::CountWriteUncertain,
+        PublishedAckPhase::CountVerified,
+        PublishedAckPhase::AckConfirmed,
+    ] {
+        intent.phase = phase;
+        assert!(!intent.confirmed_by(&snapshot));
+    }
+    intent.phase = PublishedAckPhase::DoneWriteUncertain;
+    snapshot.control.pc_read_count = 0;
+    assert!(!intent.confirmed_by(&snapshot));
+    snapshot.control.pc_read_count = 1;
+    snapshot.control.pc_read_done = 1;
+    assert!(!intent.confirmed_by(&snapshot));
+    snapshot.control.pc_read_done = 0;
+    snapshot.control.total_count = 0;
+    assert!(!intent.confirmed_by(&snapshot));
+}
+
+#[test]
+fn published_ack_blocks_count_ahead_and_revalidates_raw_before_each_write() {
+    use super::ack::{PublishedAckIntent, PublishedAckPhase};
+    let order = WordOrder::LowWordFirst;
+    let raw = record(11, order);
+    let mut c = decode::control(&control(12, order), order).unwrap();
+    c.pc_read_count = 10;
+    let mut snapshot = PublishedRecordSnapshot {
+        control: c,
+        buffer: Some(BufferSnapshot {
+            buffer_index: 0,
+            record: Some(decode::record(&raw, 0, order).unwrap()),
+            raw_registers: raw.clone(),
+        }),
+        diagnostics: Vec::new(),
+    };
+    let intent = PublishedAckIntent {
+        target: 11,
+        inbox_id: 42,
+        raw_registers: raw,
+        phase: PublishedAckPhase::Prepared,
+        observed_done_high: false,
+    };
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, Diagnostic::TrackerRejected { .. }))
+        intent
+            .check_before_write(&snapshot, 10)
+            .unwrap_err()
+            .contains("TotalCount")
     );
-    assert_eq!(reader.tracker.total_count, Some(2));
-    assert_eq!(report.buffers[0].raw_registers, &expected[20..260]);
-    assert_eq!(report.buffers[1].raw_registers, &expected[260..500]);
-    assert!(report.new_records.is_empty());
+    snapshot.control.total_count = 11;
+    assert!(intent.check_before_write(&snapshot, 10).is_ok());
+    snapshot.control.pc_read_done = 1;
+    assert!(intent.check_before_write(&snapshot, 10).is_err());
+    snapshot.control.pc_read_done = 0;
+    snapshot.buffer.as_mut().unwrap().raw_registers[28] ^= 1;
+    assert!(intent.check_before_write(&snapshot, 10).is_err());
+}
+
+#[test]
+fn published_ack_next_record_with_ready_held_high_is_not_independent_evidence() {
+    use super::ack::{PublishedAckIntent, PublishedAckPhase};
+    let order = WordOrder::LowWordFirst;
+    let raw = record(2, order);
+    let mut control = decode::control(&control(2, order), order).unwrap();
+    control.pc_read_count = 1;
+    let mut snapshot = PublishedRecordSnapshot {
+        control,
+        buffer: Some(BufferSnapshot {
+            buffer_index: 0,
+            record: Some(decode::record(&raw, 0, order).unwrap()),
+            raw_registers: raw,
+        }),
+        diagnostics: Vec::new(),
+    };
+    let mut intent = PublishedAckIntent {
+        target: 1,
+        inbox_id: 42,
+        raw_registers: record(1, order),
+        phase: PublishedAckPhase::DoneWriteUncertain,
+        observed_done_high: false,
+    };
+    assert!(!intent.confirmed_by(&snapshot));
+    intent.observed_done_high = true;
+    assert!(intent.confirmed_by(&snapshot));
+    snapshot.control.total_count = 3;
+    let raw = record(3, order);
+    snapshot.buffer = Some(BufferSnapshot {
+        buffer_index: 0,
+        record: Some(decode::record(&raw, 0, order).unwrap()),
+        raw_registers: raw,
+    });
+    assert!(!intent.confirmed_by(&snapshot)); // A skipped publication is not accepted silently.
 }
 
 // ---- Transport tokio-modbus qua TCP loopback thật (không cần PLC) ----
@@ -760,7 +510,10 @@ async fn tcp_fc03_exception_response_is_transport_error_and_reconnects() {
         other => panic!("cần lỗi exception, nhận {other:?}"),
     }
     // Lỗi phải hủy kết nối cũ; lần sau mở kết nối mới (connection 1) và đọc được.
-    assert_eq!(transport.read_holding_registers(25000, 2).await.unwrap(), vec![7, 8]);
+    assert_eq!(
+        transport.read_holding_registers(25000, 2).await.unwrap(),
+        vec![7, 8]
+    );
     drop(transport);
     server.await.unwrap();
 }
@@ -838,34 +591,27 @@ async fn tcp_connect_refused_or_bad_address_is_error_without_panic() {
 }
 
 #[tokio::test]
-async fn as200_reader_polls_full_snapshot_over_real_tcp() {
+async fn published_snapshot_over_tcp_never_reads_second_region() {
     for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
         let mut cfg = config(order);
         cfg.modbus_address_offset = -1;
         let listener = loopback(&mut cfg).await;
         let mut memory = control(2, order);
         memory.extend(record(1, order));
-        memory.extend(record(2, order));
         let server = fake_fc03_server(listener, 1, move |_, request| {
             let address = usize::from(u16::from_be_bytes([request[8], request[9]]));
             let count = usize::from(u16::from_be_bytes([request[10], request[11]]));
             assert!(count <= map::FC03_LIMIT);
-            let base = address + 1 - 25000; // offset -1.
+            let base = address + 1 - 25000;
+            assert!(base + count <= 260, "No Buffer 2 reads");
             Some(fc03_response(request, &memory[base..base + count]))
         });
         let mut reader = As200Reader::new(cfg);
-        let report = reader.poll().await.unwrap();
-        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
-        assert_eq!(report.control.total_count, 2);
-        let seqs: Vec<_> = report
-            .buffers
-            .iter()
-            .map(|b| b.record.as_ref().unwrap().record_seq)
-            .collect();
-        assert_eq!(seqs, vec![1, 2]);
-        assert_eq!(report.buffers[0].raw_registers, record(1, order));
+        let snapshot = reader.poll_published_record().await.unwrap();
+        assert!(snapshot.diagnostics.is_empty());
+        assert_eq!(snapshot.control.total_count, 2);
+        assert_eq!(snapshot.buffer.unwrap().record.unwrap().record_seq, 1);
         drop(reader);
-        let seen = server.await.unwrap();
-        assert!(seen.iter().all(|r| r[7] == 3), "reader chỉ được dùng FC03");
+        assert!(server.await.unwrap().iter().all(|r| r[7] == 3));
     }
 }

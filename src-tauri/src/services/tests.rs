@@ -132,7 +132,11 @@ fn missing_or_control_character_product_code_never_becomes_a_draft() {
         let mut input = input(1, 1, Some("confirmed"), "bad-product");
         input.raw_registers[4] = value;
         let inbox = row(input);
-        assert!(draft_from_inbox(&inbox).unwrap_err().contains("ProductCode"));
+        assert!(
+            draft_from_inbox(&inbox)
+                .unwrap_err()
+                .contains("ProductCode")
+        );
     }
 }
 #[test]

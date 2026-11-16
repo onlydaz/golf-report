@@ -3,8 +3,9 @@ import { Alert, Button, Card, Form, Input, InputNumber, Modal, Tag } from "antd"
 import { useEffect, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
 import { getAs200WorkerStatus, type As200Status } from "../../services/as200Service";
-import { getPlcConnectionSettings, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, updatePlcConnectionSettings, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
+import { getPlcConnectionSettings, getPlcRegisterUiEnabled, isPlcIp, plcConnectionError, testPlcConnection, connectPlcCollection, updatePlcConnectionSettings, type PlcConnectionSettings, type PlcEndpoint } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
+import PlcRegisterCard from "./PlcRegisterCard";
 
 /** Giá trị điền sẵn khi chưa có cấu hình đã lưu; người dùng vẫn phải kiểm tra và bấm lưu. */
 const DEFAULT_ENDPOINT: Pick<PlcEndpoint, "ip" | "port"> = { ip: "192.168.1.5", port: 502 };
@@ -15,6 +16,8 @@ export default function ConnectionSettings() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"test" | "save" | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [registerBusy, setRegisterBusy] = useState(false);
+  const [registerUiEnabled, setRegisterUiEnabled] = useState(false);
   const [error, setError] = useState("");
   const [errorAction, setErrorAction] = useState<"test" | "save" | null>(null);
   const [notice, setNotice] = useState("");
@@ -23,6 +26,25 @@ export default function ConnectionSettings() {
   const [worker, setWorker] = useState<As200Status>();
   const inFlight = useRef(false);
   const mounted = useRef(true);
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const enabled = await getPlcRegisterUiEnabled();
+        if (!disposed) {
+          setRegisterUiEnabled(enabled);
+          if (!enabled) setRegisterBusy(false);
+        }
+      } catch {
+        if (!disposed) { setRegisterUiEnabled(false); setRegisterBusy(false); }
+      } finally {
+        if (!disposed) timer = setTimeout(() => void refresh(), 2000);
+      }
+    };
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -78,7 +100,7 @@ export default function ConnectionSettings() {
     }
   };
   const act = async (action: "test" | "save") => {
-    if (inFlight.current || !settings) return;
+    if (inFlight.current || !settings || registerBusy) return;
     if (action === "save" && !canEditConnection) return;
     inFlight.current = true;
     try {
@@ -116,7 +138,7 @@ export default function ConnectionSettings() {
       }
     } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
   };
-  const canEditConnection = !!settings && worker?.state !== "STOPPING";
+  const canEditConnection = !!settings && worker?.state !== "STOPPING" && !registerBusy;
   const receiving = !worker ? "Chưa xác định"
     : worker.state === "STOPPING" ? "Đang dừng thu dữ liệu"
     : worker.state === "STOPPED" ? worker.message.includes("dữ liệu chưa lưu") ? "Đã dừng; còn dữ liệu chờ phục hồi" : "Đã dừng thu dữ liệu"
@@ -139,7 +161,7 @@ export default function ConnectionSettings() {
               <span className="plc-settings-icon"><ApiOutlined /></span>
               <h2 id="plc-settings-form-title">Thông tin PLC</h2>
             </div>
-          <Form form={form} layout="vertical" initialValues={DEFAULT_ENDPOINT} disabled={!!busy || loading} onValuesChange={changed} requiredMark={false}>
+          <Form form={form} layout="vertical" initialValues={DEFAULT_ENDPOINT} disabled={!!busy || loading || registerBusy} onValuesChange={changed} requiredMark={false}>
             <Form.Item name="ip" label="Địa chỉ IP" rules={[{ required: true, message: "Vui lòng nhập địa chỉ IP." }, { validator: (_, value: string) => !value || isPlcIp(value) ? Promise.resolve() : Promise.reject(new Error("Địa chỉ IP chưa hợp lệ. Vui lòng kiểm tra lại.")) }]}>
               <Input placeholder="Ví dụ: 192.168.1.5" autoComplete="off" size="large" disabled={!canEditConnection} />
             </Form.Item>
@@ -153,7 +175,7 @@ export default function ConnectionSettings() {
             </div>
             {dirty && <p className="plc-settings-dirty" role="status">Thay đổi chưa được lưu.</p>}
             <div className="plc-settings-actions">
-              <Button icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
+              <Button icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings || registerBusy} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
               <Button type="primary" icon={<SaveOutlined />} loading={busy === "save"} disabled={!!busy || !canEditConnection || !settings} onClick={() => void act("save")}>Lưu và kết nối</Button>
             </div>
           </Form>
@@ -186,5 +208,7 @@ export default function ConnectionSettings() {
         </div>
       </>}
     </Card>
+    {registerUiEnabled && <PlcRegisterCard form={form} worker={worker} disabled={!!busy || loading} onBusyChange={setRegisterBusy}
+      onStopped={async () => { setWorker(await getAs200WorkerStatus()); }} />}
   </div>;
 }

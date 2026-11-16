@@ -44,9 +44,7 @@ mod report_tests {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         let target = std::env::var("AS200_TEST_DATABASE").expect("Specify development database");
         assert_eq!(target, "golf_report");
-        let app_dir = std::env::var_os("APPDATA")
-            .map(|p| std::path::PathBuf::from(p).join("com.golf.report"));
-        let config = crate::database::config::load_config(app_dir).unwrap();
+        let config = crate::database::config::load_config().unwrap();
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(

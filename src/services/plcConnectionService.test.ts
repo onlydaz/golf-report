@@ -8,7 +8,28 @@
     it("keeps technical invoke errors out of the QC message", () => {
       expect(plcConnectionError("Connection refused", "Không thể kết nối với PLC.")).toBe("Không thể kết nối với PLC.");
       const reset = "Bộ đếm máy đo đã giảm từ 2 xuống 0. Có dấu hiệu reset; không thể tiếp tục phiên cũ.";
-      expect(plcConnectionError(reset, "fallback")).toBe("Chưa đủ bằng chứng để tiếp tục phiên máy đo cũ. Vui lòng liên hệ kỹ thuật.");
+      expect(plcConnectionError(reset, "fallback")).toBe(reset);
       expect(plcConnectionError("Cổng kết nối phải từ 1 đến 65535.", "fallback")).toBe("Cổng kết nối phải từ 1 đến 65535.");
+    });
+    it("preserves protective Vietnamese warnings and translates technical protective errors", () => {
+      for (const warning of [
+        "ACK chưa đủ bằng chứng hoàn tất; không gửi lại tín hiệu.",
+        "Không lưu được Journal; dữ liệu có nguy cơ mất.",
+        "Session không khớp; không tự tạo phiên mới.",
+      ]) expect(plcConnectionError(warning, "fallback")).toBe(warning);
+      for (const [error, expected] of [
+        ["ACK checkpoint mismatch", "không tự gửi lại ACK"],
+        ["ACK_CHECKPOINT_MISMATCH", "không tự gửi lại ACK"],
+        ["Journal write failed", "Dữ liệu có nguy cơ mất"],
+        ["SESSION_UNCONFIRMED", "không tự đổi phiên"],
+        ["counter decreased after reset", "sau reset"],
+      ]) {
+        const message = plcConnectionError(error, "fallback");
+        expect(message).toContain(expected);
+        expect(message).not.toBe(error);
+      }
+      for (const error of ["Connection refused", "request timed out", "internal error", new Error("Connection refused"), null]) {
+        expect(plcConnectionError(error, "Không thể kết nối với PLC.")).toBe("Không thể kết nối với PLC.");
+      }
     });
   });

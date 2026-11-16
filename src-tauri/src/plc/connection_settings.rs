@@ -1,14 +1,11 @@
 //! Controlled QC connection lifecycle with journal/inbox and source continuity checks.
 use super::{
-    as200::{
-        As200Error, map,
-        reader::As200Reader,
-    },
+    as200::{As200Error, map, reader::As200Reader},
     simulator_config::{self, SimulatorConfig},
     worker::{WorkerState, switch_log},
 };
-use serde::{Deserialize, Serialize};
 use crate::models::StoredWordOrder;
+use serde::{Deserialize, Serialize};
 use std::{
     hash::{Hash, Hasher},
     io::Write,
@@ -36,10 +33,7 @@ fn managed_source_identity(endpoint: &Endpoint) -> (String, String) {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     identity.hash(&mut hash);
     let suffix = format!("{:016x}", hash.finish());
-    (
-        format!("as200-{suffix}"),
-        format!("as200-{suffix}-session"),
-    )
+    (format!("as200-{suffix}"), format!("as200-{suffix}-session"))
 }
 
 async fn ensure_managed_source(
@@ -183,22 +177,6 @@ fn patch(text: &str, next: &SimulatorConfig) -> Result<String, String> {
     Ok(result)
 }
 fn replace(path: &Path, before: &str, after: &str) -> Result<(), String> {
-    let resolved = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(dir) = std::env::var_os(key) {
-            let root = PathBuf::from(dir).to_string_lossy().to_lowercase();
-            if resolved
-                .to_string_lossy()
-                .to_lowercase()
-                .starts_with(&(root + "\\"))
-            {
-                return Err(
-                    "Configuration in Program Files requires technical provisioning in AppData"
-                        .into(),
-                );
-            }
-        }
-    }
     let config_lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -296,10 +274,19 @@ async fn save(
                 "Thông tin kết nối đã thay đổi. Vui lòng mở lại ứng dụng trước khi lưu.".into(),
             );
         }
-        if cfg!(debug_assertions) && let Ok(cwd)=std::env::current_dir() {
-            let mut folders=vec![cwd.clone(),cwd.join("src-tauri")];
-            if cwd.file_name().is_some_and(|n|n=="src-tauri") {if let Some(parent)=cwd.parent(){folders.push(parent.to_path_buf());}}
-            if folders.iter().any(|folder|folder.join("as200_capture_journal.json").exists() || folder.join("as200_capture_journal.lock").exists()) {
+        if cfg!(debug_assertions)
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            let mut folders = vec![cwd.clone(), cwd.join("src-tauri")];
+            if cwd.file_name().is_some_and(|n| n == "src-tauri") {
+                if let Some(parent) = cwd.parent() {
+                    folders.push(parent.to_path_buf());
+                }
+            }
+            if folders.iter().any(|folder| {
+                folder.join("as200_capture_journal.json").exists()
+                    || folder.join("as200_capture_journal.lock").exists()
+            }) {
                 return Err(BUSY.into()); // Missing config is not proof of a clean installation.
             }
         }
@@ -374,7 +361,10 @@ pub struct ProbeReport {
 /// `Err` chỉ khi không kết nối/đọc được PLC. Đọc được nhưng sai mapping → `Ok(Some(..))`.
 async fn probe_link(config: SimulatorConfig) -> Result<Option<String>, String> {
     let checked = tokio::time::timeout(config.reader().timeout, async {
-        let report = match As200Reader::new(config.reader()).poll().await {
+        let report = match As200Reader::new(config.reader())
+            .poll_published_record()
+            .await
+        {
             Ok(report) => report,
             Err(e @ (As200Error::Transport(_) | As200Error::Timeout)) => {
                 eprintln!("PLC settings FC03 probe: {e}");
@@ -400,13 +390,16 @@ async fn probe(config: SimulatorConfig) -> Result<(), String> {
         )),
     }
 }
-fn as200_structure(report: &super::as200::reader::PollReport) -> Result<(), String> {
+fn as200_structure(report: &super::as200::reader::PublishedRecordSnapshot) -> Result<(), String> {
     {
         let control = &report.control;
-        if report.buffers.len() != map::BUFFER_COUNT
-            || report.buffers.iter().any(|buffer| buffer.raw_registers.len() != map::RECORD_SIZE)
+        if (control.data_ready == 1 && report.buffer.is_none())
+            || report
+                .buffer
+                .as_ref()
+                .is_some_and(|b| b.buffer_index != 0 || b.raw_registers.len() != map::RECORD_SIZE)
         {
-            return Err("AS200 cần đúng hai buffer, mỗi buffer 240 WORD.".into());
+            return Err("AS200 cần vùng Bản ghi 1 hợp lệ, đúng 240 WORD khi DataReady=1.".into());
         }
         if control.total_count < 0
             || control.pc_read_count < 0
@@ -416,7 +409,10 @@ fn as200_structure(report: &super::as200::reader::PollReport) -> Result<(), Stri
         {
             return Err(format!(
                 "Trạng thái AS200 không hợp lệ: TotalCount={}, PC_ReadCount={}, DataReady={}, PC_ReadDone={}.",
-                control.total_count, control.pc_read_count, control.data_ready, control.pc_read_done
+                control.total_count,
+                control.pc_read_count,
+                control.data_ready,
+                control.pc_read_done
             ));
         }
         if !report.diagnostics.is_empty() {
@@ -456,15 +452,27 @@ async fn prepare_managed_runtime(
     next.source_key = source_key.clone();
     next.confirmed_session_id = Some(session_id);
 
-    let journal = file.parent().unwrap_or_else(|| Path::new("."))
+    let journal = file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
         .join("local-runtime")
         .join("managed-sources")
-        .join(source_key.chars().map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' }
-        }).collect::<String>())
+        .join(
+            source_key
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>(),
+        )
         .join("capture.json");
     next.journal_path = Some(journal.clone());
-    next.validate().map_err(|error| format!("Cấu hình runtime AS200 không hợp lệ: {error}"))?;
+    next.validate()
+        .map_err(|error| format!("Cấu hình runtime AS200 không hợp lệ: {error}"))?;
 
     if journal.exists() {
         let existing = std::fs::read_to_string(&journal)
@@ -473,6 +481,12 @@ async fn prepare_managed_runtime(
             return Err("Journal của nguồn PLC bị rỗng; chưa thể ACK an toàn.".into());
         }
     } else {
+        let history: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1) OR EXISTS(SELECT 1 FROM measurements m JOIN plc_sources s ON s.id=m.source_id WHERE s.source_key=$1)")
+            .bind(&next.source_key).fetch_one(pool).await.map_err(|e| e.to_string())?;
+        if history {
+            return Err("Nguồn đã có lịch sử nhưng thiếu Journal v4; cần kỹ thuật đối chiếu, không tự tạo checkpoint.".into());
+        }
+        read_new_baseline(&next).await?;
         std::fs::create_dir_all(journal.parent().ok_or(CONFIG)?)
             .map_err(|_| "Không thể tạo thư mục runtime cho Journal PLC.".to_string())?;
         WorkerState::initialize_separate_journal(next.clone(), journal.clone()).await?;
@@ -480,16 +494,48 @@ async fn prepare_managed_runtime(
 
     let mut document = simulator_config::configuration_values(before)?;
     set_document_value(&mut document, "mode", toml::Value::String("modbus".into()))?;
-    set_document_value(&mut document, "address", toml::Value::String(next.address.clone()))?;
-    set_document_value(&mut document, "unit_id", toml::Value::Integer(i64::from(next.unit_id)))?;
+    set_document_value(
+        &mut document,
+        "address",
+        toml::Value::String(next.address.clone()),
+    )?;
+    set_document_value(
+        &mut document,
+        "unit_id",
+        toml::Value::Integer(i64::from(next.unit_id)),
+    )?;
     set_document_value(&mut document, "enabled", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "technical_setup_confirmed", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "allow_plc_connection", toml::Value::Boolean(true))?;
+    set_document_value(
+        &mut document,
+        "technical_setup_confirmed",
+        toml::Value::Boolean(true),
+    )?;
+    set_document_value(
+        &mut document,
+        "allow_plc_connection",
+        toml::Value::Boolean(true),
+    )?;
     set_document_value(&mut document, "ack_enabled", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "ack_protocol", toml::Value::String("as200".into()))?;
-    set_document_value(&mut document, "word_order", toml::Value::String("LOW".into()))?;
-    set_document_value(&mut document, "modbus_address_offset", toml::Value::Integer(0))?;
-    set_document_value(&mut document, "plc_heartbeat_timeout_ms", toml::Value::Integer(5000))?;
+    set_document_value(
+        &mut document,
+        "ack_protocol",
+        toml::Value::String("as200".into()),
+    )?;
+    set_document_value(
+        &mut document,
+        "word_order",
+        toml::Value::String("LOW".into()),
+    )?;
+    set_document_value(
+        &mut document,
+        "modbus_address_offset",
+        toml::Value::Integer(0),
+    )?;
+    set_document_value(
+        &mut document,
+        "plc_heartbeat_timeout_ms",
+        toml::Value::Integer(5000),
+    )?;
     set_document_value(&mut document, "poll_interval_ms", toml::Value::Integer(500))?;
     set_document_value(&mut document, "timeout_ms", toml::Value::Integer(2000))?;
     set_document_value(&mut document, "source_key", toml::Value::String(source_key))?;
@@ -498,7 +544,11 @@ async fn prepare_managed_runtime(
         "confirmed_session_id",
         toml::Value::String(next.confirmed_session_id.clone().ok_or(CONFIG)?),
     )?;
-    set_document_value(&mut document, "journal_path", toml::Value::String(journal.to_string_lossy().into_owned()))?;
+    set_document_value(
+        &mut document,
+        "journal_path",
+        toml::Value::String(journal.to_string_lossy().into_owned()),
+    )?;
     let after = toml::to_string(&document).map_err(|_| SAVE.to_string())?;
     simulator_config::parse(&after)
         .and_then(|parsed| parsed.validate())
@@ -511,58 +561,96 @@ pub async fn stop_plc_collection(state: tauri::State<'_, WorkerState>) -> Result
     state.stop_collection().await
 }
 
-pub(super) fn clean_new_baseline(report: &super::as200::reader::PollReport) -> Result<(), String> {
+pub(super) fn clean_new_baseline(
+    report: &super::as200::reader::PublishedRecordSnapshot,
+) -> Result<(), String> {
     let c = &report.control;
-    if c.total_count != 0 || c.pc_read_count != 0 || c.pc_read_done != 0 || c.data_ready != 0
-        || !report.diagnostics.is_empty() || report.buffers.len() != 2
-        || report.buffers.iter().any(|b| b.record.is_some() || b.raw_registers.len() != 240 || b.raw_registers.iter().any(|w| *w != 0)) {
+    if c.total_count != 0
+        || c.pc_read_count != 0
+        || c.pc_read_done != 0
+        || c.data_ready != 0
+        || !report.diagnostics.is_empty()
+        || report.buffer.is_some()
+    {
         return Err("Chưa thể xác minh phiên đo mới. Máy đo cần ở trạng thái khởi tạo sạch, chưa có kết quả đo. Vui lòng liên hệ kỹ thuật.".into());
     }
     Ok(())
 }
 
-async fn read_new_baseline(config: &SimulatorConfig) -> Result<(), String> {
-    let report = super::as200::reader::As200Reader::new(config.reader()).poll().await
-        .map_err(|_| "Không thể kiểm tra dữ liệu máy đo mới.".to_string())?;
-    clean_new_baseline(&report)?;
-    let confirm = super::as200::reader::As200Reader::new(config.reader()).poll().await
-        .map_err(|_| "Không thể đọc lại máy đo để xác minh baseline ổn định.".to_string())?;
-    clean_new_baseline(&confirm)?;
-    if !report.control.same_buffer_state(&confirm.control)
-        || report.control.pc_read_count != confirm.control.pc_read_count
-        || report.control.pc_read_done != confirm.control.pc_read_done
-        || report.control.reserve != confirm.control.reserve
-        || report.buffers.iter().zip(&confirm.buffers).any(|(a, b)| a.raw_registers != b.raw_registers)
-    {
-        return Err("Baseline máy đo thay đổi khi xác minh. Vui lòng thử lại sau khi máy ổn định.".into());
+pub(super) async fn read_new_baseline(config: &SimulatorConfig) -> Result<(), String> {
+    use super::as200::reader::PublishedRecordSnapshot;
+    let mut reader = As200Reader::new(config.reader());
+    let before = reader.read_control().await.map_err(|e| e.to_string())?;
+    clean_new_baseline(&PublishedRecordSnapshot {
+        control: before.clone(),
+        buffer: None,
+        diagnostics: Vec::new(),
+    })?;
+    let raw = reader
+        .read_published_words()
+        .await
+        .map_err(|e| e.to_string())?;
+    let middle = reader.read_control().await.map_err(|e| e.to_string())?;
+    let confirm = reader
+        .read_published_words()
+        .await
+        .map_err(|e| e.to_string())?;
+    let after = reader.read_control().await.map_err(|e| e.to_string())?;
+    for control in [middle, after] {
+        clean_new_baseline(&PublishedRecordSnapshot {
+            control: control.clone(),
+            buffer: None,
+            diagnostics: Vec::new(),
+        })?;
+        if !before.same_buffer_state(&control) || before.reserve != control.reserve {
+            return Err("Baseline máy đo thay đổi khi xác minh; chưa thể tạo phiên mới.".into());
+        }
+    }
+    if raw != confirm || raw.len() != map::RECORD_SIZE || raw.iter().any(|word| *word != 0) {
+        return Err("Vùng Bản ghi 1 chưa rỗng và ổn định; chưa thể tạo phiên mới.".into());
     }
     Ok(())
 }
 
-struct RecordedProfile { text: String, config: SimulatorConfig }
+struct RecordedProfile {
+    text: String,
+    config: SimulatorConfig,
+}
 
 const RESET_CONFIRMATION_REQUIRED: &str = "RESET_CONFIRMATION_REQUIRED";
 
 // The caller holds the closed-source journal lock. This creates a separate journal;
 // neither the old checkpoint nor its receipts are rewritten.
 async fn prepare_confirmed_reset(
-    file: &Path, previous_text: &str, previous: &SimulatorConfig, pool: &sqlx::PgPool,
+    file: &Path,
+    previous_text: &str,
+    previous: &SimulatorConfig,
+    pool: &sqlx::PgPool,
     confirmed: bool,
 ) -> Result<RecordedProfile, String> {
-    if previous.pc_heartbeat_enabled
-        || !file.with_extension("operator-stop").exists() {
+    if previous.pc_heartbeat_enabled || !file.with_extension("operator-stop").exists() {
         return Err("Chưa thể bắt đầu phiên mới: cần dừng thu và tắt PC Heartbeat ghi.".into());
     }
     read_new_baseline(previous).await?;
     if !confirmed {
         return Err(RESET_CONFIRMATION_REQUIRED.into());
     }
-    let session = format!("qc-reset-{}-{}", chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?, std::process::id());
+    let session = format!(
+        "qc-reset-{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?,
+        std::process::id()
+    );
     let used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND i.session_id=$2) OR EXISTS(SELECT 1 FROM measurements m JOIN plc_sources s ON s.id=m.source_id WHERE s.source_key=$1 AND m.session_id=$2)")
         .bind(&previous.source_key).bind(&session).fetch_one(pool).await
         .map_err(|_| "Không thể đối chiếu phiên mới trong cơ sở dữ liệu.".to_string())?;
-    if used { return Err("Phiên mới đã có lịch sử; chưa thể tiếp tục.".into()); }
-    let directory = file.parent().ok_or(CONFIG)?.join("local-runtime/managed-sources").join(&session);
+    if used {
+        return Err("Phiên mới đã có lịch sử; chưa thể tiếp tục.".into());
+    }
+    let directory = file
+        .parent()
+        .ok_or(CONFIG)?
+        .join("local-runtime/managed-sources")
+        .join(&session);
     std::fs::create_dir_all(directory.parent().ok_or(SAVE)?).map_err(|_| SAVE.to_string())?;
     std::fs::create_dir(&directory).map_err(|_| SAVE.to_string())?;
     let mut next = previous.clone();
@@ -579,26 +667,56 @@ async fn prepare_confirmed_reset(
     set_document_value(
         &mut document,
         "journal_path",
-        toml::Value::String(next.journal_path.as_ref().ok_or(CONFIG)?.to_string_lossy().into_owned()),
+        toml::Value::String(
+            next.journal_path
+                .as_ref()
+                .ok_or(CONFIG)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
     )?;
     let serialized = toml::to_string(&document).map_err(|_| SAVE.to_string())?;
-    let text = format!("# Người phụ trách xác nhận đúng nguồn vật lý, PLC đã reset và không còn phép đo bị bỏ sót lúc {}.\n{}", chrono::Utc::now(), serialized);
+    let text = format!(
+        "# Người phụ trách xác nhận đúng nguồn vật lý, PLC đã reset và không còn phép đo bị bỏ sót lúc {}.\n{}",
+        chrono::Utc::now(),
+        serialized
+    );
     for (name, contents) in [
-        ("previous-config.toml", previous_text), ("target-config.toml", text.as_str()),
+        ("previous-config.toml", previous_text),
+        ("target-config.toml", text.as_str()),
     ] {
-        let mut output = std::fs::OpenOptions::new().create_new(true).write(true)
-            .open(directory.join(name)).map_err(|_| SAVE.to_string())?;
-        output.write_all(contents.as_bytes()).and_then(|_| output.sync_all()).map_err(|_| SAVE.to_string())?;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.join(name))
+            .map_err(|_| SAVE.to_string())?;
+        output
+            .write_all(contents.as_bytes())
+            .and_then(|_| output.sync_all())
+            .map_err(|_| SAVE.to_string())?;
     }
-    WorkerState::initialize_separate_journal(next.clone(), next.journal_path.clone().ok_or(CONFIG)?).await?;
+    WorkerState::initialize_separate_journal(
+        next.clone(),
+        next.journal_path.clone().ok_or(CONFIG)?,
+    )
+    .await?;
     read_new_baseline(&next).await?;
     Ok(RecordedProfile { text, config: next })
 }
 
 fn endpoint_link(file: &Path, value: &Endpoint) -> Result<PathBuf, String> {
     let ip: IpAddr = value.ip.parse().map_err(|_| CONFIG.to_string())?;
-    Ok(file.parent().ok_or(CONFIG)?.join("local-runtime").join("endpoint-links")
-        .join(format!("{}-{}-{}.toml", ip.to_string().replace(':', "_"), value.port, value.unit_id)))
+    Ok(file
+        .parent()
+        .ok_or(CONFIG)?
+        .join("local-runtime")
+        .join("endpoint-links")
+        .join(format!(
+            "{}-{}-{}.toml",
+            ip.to_string().replace(':', "_"),
+            value.port,
+            value.unit_id
+        )))
 }
 
 fn remember_endpoint(file: &Path, text: &str, config: &SimulatorConfig) -> Result<(), String> {
@@ -608,34 +726,69 @@ fn remember_endpoint(file: &Path, text: &str, config: &SimulatorConfig) -> Resul
     set_document_value(
         &mut document,
         "journal_path",
-        toml::Value::String(profile_journal(file, config)?.to_string_lossy().into_owned()),
+        toml::Value::String(
+            profile_journal(file, config)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
     )?;
     let after = toml::to_string(&document).map_err(|_| SAVE.to_string())?;
     if path.exists() {
         let before = std::fs::read_to_string(&path).map_err(|_| SAVE.to_string())?;
         replace(&path, &before, &after)
     } else {
-        let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?));
-        let mut output = std::fs::OpenOptions::new().create_new(true).write(true).open(&temp).map_err(|_| SAVE.to_string())?;
-        output.write_all(after.as_bytes()).and_then(|_| output.sync_all()).map_err(|_| SAVE.to_string())?;
+        let temp = path.with_extension(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?
+        ));
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|_| SAVE.to_string())?;
+        output
+            .write_all(after.as_bytes())
+            .and_then(|_| output.sync_all())
+            .map_err(|_| SAVE.to_string())?;
         drop(output);
         std::fs::rename(temp, path).map_err(|_| SAVE.to_string())
     }
 }
 
 fn retain_current_profile(file: &Path, text: &str, config: &SimulatorConfig) -> Result<(), String> {
-    let managed = file.parent().ok_or(CONFIG)?.join("local-runtime").join("managed-sources");
-    if !managed.exists() { return Ok(()); }
+    let managed = file
+        .parent()
+        .ok_or(CONFIG)?
+        .join("local-runtime")
+        .join("managed-sources");
+    if !managed.exists() {
+        return Ok(());
+    }
     let journal = profile_journal(file, config)?;
     let directory = journal.parent().ok_or(CONFIG)?;
-    if directory.parent() != Some(managed.canonicalize().map_err(|_| CONFIG.to_string())?.as_path()) {
+    if directory.parent()
+        != Some(
+            managed
+                .canonicalize()
+                .map_err(|_| CONFIG.to_string())?
+                .as_path(),
+        )
+    {
         return Ok(()); // Legacy external journals remain described by previous-config backups.
     }
     let target = directory.join("target-config.toml");
     if !target.exists() {
         // Preserve provenance before switching away from a legacy profile; never rewrite an existing record.
-        let mut saved = std::fs::OpenOptions::new().create_new(true).write(true).open(target).map_err(|_| SAVE.to_string())?;
-        saved.write_all(text.as_bytes()).and_then(|_| saved.sync_all()).map_err(|_| SAVE.to_string())?;
+        let mut saved = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(target)
+            .map_err(|_| SAVE.to_string())?;
+        saved
+            .write_all(text.as_bytes())
+            .and_then(|_| saved.sync_all())
+            .map_err(|_| SAVE.to_string())?;
     }
     Ok(())
 }
@@ -643,13 +796,36 @@ fn retain_current_profile(file: &Path, text: &str, config: &SimulatorConfig) -> 
 fn profile_journal(file: &Path, config: &SimulatorConfig) -> Result<PathBuf, String> {
     config.journal_path.as_ref().ok_or(CONFIG)?;
     let p = config.journal_file(file);
-    Ok(p.parent().ok_or(CONFIG)?.canonicalize().map_err(|_| CONFIG.to_string())?.join(p.file_name().ok_or(CONFIG)?))
+    let journal = p
+        .parent()
+        .ok_or(CONFIG)?
+        .canonicalize()
+        .map_err(|_| CONFIG.to_string())?
+        .join(p.file_name().ok_or(CONFIG)?);
+    let runtime = file
+        .parent()
+        .ok_or(CONFIG)?
+        .join("local-runtime")
+        .canonicalize()
+        .map_err(|_| CONFIG.to_string())?;
+    if !journal.starts_with(runtime) {
+        return Err("Journal phải nằm trong local-runtime cạnh ứng dụng; cần kỹ thuật đối chiếu lịch sử cũ.".into());
+    }
+    Ok(journal)
 }
 
 fn previous_endpoint(file: &Path, requested: &Endpoint) -> Result<Option<RecordedProfile>, String> {
-    let root = file.parent().ok_or(CONFIG)?.join("local-runtime").join("managed-sources");
+    let root = file
+        .parent()
+        .ok_or(CONFIG)?
+        .join("local-runtime")
+        .join("managed-sources");
     if !root.exists() {
-        return if endpoint_link(file, requested)?.exists() { Err("HISTORY_INCOMPLETE".into()) } else { Ok(None) };
+        return if endpoint_link(file, requested)?.exists() {
+            Err("HISTORY_INCOMPLETE".into())
+        } else {
+            Ok(None)
+        };
     }
     let unknown = "HISTORY_INCOMPLETE";
     let (text, config) = read(file)?;
@@ -657,14 +833,21 @@ fn previous_endpoint(file: &Path, requested: &Endpoint) -> Result<Option<Recorde
     let link = endpoint_link(file, requested)?;
     let remembered = if link.exists() {
         let (text, mut config) = read(&link).map_err(|_| unknown.to_string())?;
-        if endpoint(&config)? != *requested { return Err(unknown.into()); }
-        config.journal_path = Some(profile_journal(file, &config).map_err(|_| unknown.to_string())?);
+        if endpoint(&config)? != *requested {
+            return Err(unknown.into());
+        }
+        config.journal_path =
+            Some(profile_journal(file, &config).map_err(|_| unknown.to_string())?);
         Some(RecordedProfile { text, config })
-    } else { None };
+    } else {
+        None
+    };
     let mut directories = Vec::new();
     for entry in std::fs::read_dir(&root).map_err(|_| unknown.to_string())? {
         let dir = entry.map_err(|_| unknown.to_string())?.path();
-        if !dir.is_dir() { return Err(unknown.into()); }
+        if !dir.is_dir() {
+            return Err(unknown.into());
+        }
         directories.push(dir.clone());
         for name in ["previous-config.toml", "target-config.toml"] {
             let path = dir.join(name);
@@ -676,18 +859,26 @@ fn previous_endpoint(file: &Path, requested: &Endpoint) -> Result<Option<Recorde
     }
     // A later previous-config is also authoritative provenance for a legacy profile without target-config.
     for dir in directories {
-        let journal = dir.canonicalize().map_err(|_| unknown.to_string())?.join("capture.json");
-        if !records.iter().any(|r| profile_journal(file, &r.config).ok().as_ref() == Some(&journal)) {
+        let journal = dir
+            .canonicalize()
+            .map_err(|_| unknown.to_string())?
+            .join("capture.json");
+        if !records
+            .iter()
+            .any(|r| profile_journal(file, &r.config).ok().as_ref() == Some(&journal))
+        {
             return Err(unknown.into());
         }
     }
     if let Some(remembered) = remembered {
-        if !records.iter().any(|r| endpoint(&r.config).ok().as_ref() == Some(requested)
-            && r.config.source_key == remembered.config.source_key
-            && r.config.confirmed_session_id == remembered.config.confirmed_session_id
-            && r.config.word_order.as_str() == remembered.config.word_order.as_str()
-            && r.config.modbus_address_offset == remembered.config.modbus_address_offset
-            && profile_journal(file, &r.config).ok() == remembered.config.journal_path) {
+        if !records.iter().any(|r| {
+            endpoint(&r.config).ok().as_ref() == Some(requested)
+                && r.config.source_key == remembered.config.source_key
+                && r.config.confirmed_session_id == remembered.config.confirmed_session_id
+                && r.config.word_order.as_str() == remembered.config.word_order.as_str()
+                && r.config.modbus_address_offset == remembered.config.modbus_address_offset
+                && profile_journal(file, &r.config).ok() == remembered.config.journal_path
+        }) {
             return Err(unknown.into());
         }
         // This pointer records a completed/closed application association, not hardware identity.
@@ -696,7 +887,9 @@ fn previous_endpoint(file: &Path, requested: &Endpoint) -> Result<Option<Recorde
     }
     let mut found: Option<RecordedProfile> = None;
     for mut record in records {
-        if endpoint(&record.config)? != *requested { continue; }
+        if endpoint(&record.config)? != *requested {
+            continue;
+        }
         let journal = profile_journal(file, &record.config).map_err(|_| unknown.to_string())?;
         record.config.journal_path = Some(journal.clone());
         if let Some(previous) = &found {
@@ -708,7 +901,9 @@ fn previous_endpoint(file: &Path, requested: &Endpoint) -> Result<Option<Recorde
             {
                 return Err("HISTORY_AMBIGUOUS".into());
             }
-        } else { found = Some(record); }
+        } else {
+            found = Some(record);
+        }
     }
     Ok(found)
 }
@@ -721,8 +916,23 @@ pub async fn connect_plc_collection(
     state: tauri::State<'_, WorkerState>,
     database: tauri::State<'_, crate::database::DatabaseState>,
 ) -> Result<(), String> {
-    let trace = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
-    switch_log(&trace, "SWITCH_START", "OBSERVED", format!("target_endpoint={}:{} unit={} reset_confirmed={}", value.ip, value.port, value.unit_id, reset_confirmed == Some(true)));
+    let trace = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    switch_log(
+        &trace,
+        "SWITCH_START",
+        "OBSERVED",
+        format!(
+            "target_endpoint={}:{} unit={} reset_confirmed={}",
+            value.ip,
+            value.port,
+            value.unit_id,
+            reset_confirmed == Some(true)
+        ),
+    );
     let mut stage = "SWITCH_START";
     let result: Result<(), String> = async {
     let _guard = state.settings_gate.lock().await;
@@ -914,8 +1124,18 @@ pub async fn connect_plc_collection(
     Ok(())
     }.await;
     match &result {
-        Ok(()) => switch_log(&trace, "SWITCH_ALLOWED", "PASS", "configuration_committed=true worker_started=true"),
-        Err(error) => switch_log(&trace, "SWITCH_BLOCKED", "GUARD_OR_OPERATION_FAILED", format!("failed_step={stage} error={error}")),
+        Ok(()) => switch_log(
+            &trace,
+            "SWITCH_ALLOWED",
+            "PASS",
+            "configuration_committed=true worker_started=true",
+        ),
+        Err(error) => switch_log(
+            &trace,
+            "SWITCH_BLOCKED",
+            "GUARD_OR_OPERATION_FAILED",
+            format!("failed_step={stage} error={error}"),
+        ),
     }
     result
 }
@@ -974,21 +1194,38 @@ pub async fn confirm_initial_plc_setup(
         return Err("Cấu hình đã thay đổi. Vui lòng tải lại trang trước khi xác nhận.".into());
     }
     if !value.new_source_confirmed || !value.register_map_confirmed || !value.ack_confirmed {
-        return Err("Cần xác nhận nguồn PLC mới, thông số AS200 và quyền ACK trước khi bật thu.".into());
+        return Err(
+            "Cần xác nhận nguồn PLC mới, thông số AS200 và quyền ACK trước khi bật thu.".into(),
+        );
     }
-    if config.mode != "modbus" || config.enabled || config.technical_setup_confirmed
-        || !config.source_key.is_empty() || config.confirmed_session_id.is_some()
-        || config.journal_path.is_some() || config.ack_enabled || config.pc_heartbeat_enabled
+    if config.mode != "modbus"
+        || config.enabled
+        || config.technical_setup_confirmed
+        || !config.source_key.is_empty()
+        || config.confirmed_session_id.is_some()
+        || config.journal_path.is_some()
+        || config.ack_enabled
+        || config.pc_heartbeat_enabled
         || state.status.read().await.enabled
         || file.with_extension("connection-pending").exists()
         || file.with_extension("operator-stop").exists()
         || file.parent().ok_or(CONFIG)?.join("local-runtime").exists()
-        || file.parent().ok_or(CONFIG)?.join("as200_capture_journal.json").exists()
-        || file.parent().ok_or(CONFIG)?.join("as200_capture_journal.lock").exists()
+        || file
+            .parent()
+            .ok_or(CONFIG)?
+            .join("as200_capture_journal.json")
+            .exists()
+        || file
+            .parent()
+            .ok_or(CONFIG)?
+            .join("as200_capture_journal.lock")
+            .exists()
     {
         return Err("Cấu hình hoặc lịch sử nguồn đo đã tồn tại; cần kỹ thuật đối chiếu trước khi xác nhận nguồn mới.".into());
     }
-    let _safe = state.ensure_connection_edit_safe(&file, &config).await
+    let _safe = state
+        .ensure_connection_edit_safe(&file, &config)
+        .await
         .map_err(|_| "Worker chưa dừng an toàn hoặc còn lịch sử cần đối chiếu.".to_string())?;
     let mut next = config.clone();
     next.word_order = value.word_order;
@@ -1005,11 +1242,26 @@ pub async fn confirm_initial_plc_setup(
     }
     read_new_baseline(&next).await?;
     let pool = database.pool().await?;
-    let id = format!("qc-{}-{}", chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?, std::process::id());
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_sources WHERE source_key=$1)")
-        .bind(&id).fetch_one(&pool).await.map_err(|_| "Không thể kiểm tra nguồn dữ liệu mới.".to_string())?;
-    if exists { return Err("Mã nguồn mới đã tồn tại; vui lòng thử lại.".into()); }
-    let directory = file.parent().ok_or(SAVE)?.join("local-runtime").join("managed-sources").join(&id);
+    let id = format!(
+        "qc-{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().ok_or(SAVE)?,
+        std::process::id()
+    );
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_sources WHERE source_key=$1)")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|_| "Không thể kiểm tra nguồn dữ liệu mới.".to_string())?;
+    if exists {
+        return Err("Mã nguồn mới đã tồn tại; vui lòng thử lại.".into());
+    }
+    let directory = file
+        .parent()
+        .ok_or(SAVE)?
+        .join("local-runtime")
+        .join("managed-sources")
+        .join(&id);
     std::fs::create_dir_all(directory.parent().ok_or(SAVE)?).map_err(|_| SAVE.to_string())?;
     std::fs::create_dir(&directory).map_err(|_| SAVE.to_string())?;
     let journal = directory.join("capture.json");
@@ -1018,23 +1270,70 @@ pub async fn confirm_initial_plc_setup(
     next.journal_path = Some(journal.clone());
     next.validate()?;
     let mut document = simulator_config::configuration_values(&before)?;
-    set_document_value(&mut document, "word_order", toml::Value::String(next.word_order.as_str().into()))?;
-    set_document_value(&mut document, "modbus_address_offset", toml::Value::Integer(next.modbus_address_offset.into()))?;
-    set_document_value(&mut document, "plc_heartbeat_timeout_ms", toml::Value::Integer(value.plc_heartbeat_timeout_ms.try_into().map_err(|_| CONFIG)?))?;
-    set_document_value(&mut document, "ack_protocol", toml::Value::String("as200".into()))?;
+    set_document_value(
+        &mut document,
+        "word_order",
+        toml::Value::String(next.word_order.as_str().into()),
+    )?;
+    set_document_value(
+        &mut document,
+        "modbus_address_offset",
+        toml::Value::Integer(next.modbus_address_offset.into()),
+    )?;
+    set_document_value(
+        &mut document,
+        "plc_heartbeat_timeout_ms",
+        toml::Value::Integer(
+            value
+                .plc_heartbeat_timeout_ms
+                .try_into()
+                .map_err(|_| CONFIG)?,
+        ),
+    )?;
+    set_document_value(
+        &mut document,
+        "ack_protocol",
+        toml::Value::String("as200".into()),
+    )?;
     set_document_value(&mut document, "ack_enabled", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "allow_plc_connection", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "technical_setup_confirmed", toml::Value::Boolean(true))?;
+    set_document_value(
+        &mut document,
+        "allow_plc_connection",
+        toml::Value::Boolean(true),
+    )?;
+    set_document_value(
+        &mut document,
+        "technical_setup_confirmed",
+        toml::Value::Boolean(true),
+    )?;
     set_document_value(&mut document, "enabled", toml::Value::Boolean(true))?;
-    set_document_value(&mut document, "source_key", toml::Value::String(next.source_key.clone()))?;
-    set_document_value(&mut document, "confirmed_session_id", toml::Value::String(next.confirmed_session_id.clone().ok_or(CONFIG)?))?;
-    set_document_value(&mut document, "journal_path", toml::Value::String(journal.to_string_lossy().into_owned()))?;
+    set_document_value(
+        &mut document,
+        "source_key",
+        toml::Value::String(next.source_key.clone()),
+    )?;
+    set_document_value(
+        &mut document,
+        "confirmed_session_id",
+        toml::Value::String(next.confirmed_session_id.clone().ok_or(CONFIG)?),
+    )?;
+    set_document_value(
+        &mut document,
+        "journal_path",
+        toml::Value::String(journal.to_string_lossy().into_owned()),
+    )?;
     let after = toml::to_string(&document).map_err(|_| SAVE.to_string())?;
     simulator_config::parse(&after).and_then(|c| c.validate())?;
     // Endpoint-only setup has no source history; only the confirmed profile is reusable.
-    let mut output = std::fs::OpenOptions::new().create_new(true).write(true)
-        .open(directory.join("target-config.toml")).map_err(|_| SAVE.to_string())?;
-    output.write_all(after.as_bytes()).and_then(|_| output.sync_all()).map_err(|_| SAVE.to_string())?;
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(directory.join("target-config.toml"))
+        .map_err(|_| SAVE.to_string())?;
+    output
+        .write_all(after.as_bytes())
+        .and_then(|_| output.sync_all())
+        .map_err(|_| SAVE.to_string())?;
     WorkerState::initialize_separate_journal(next.clone(), journal).await?;
     read_new_baseline(&next).await?;
     replace(&file, &before, &after).map_err(|_| "Đã giữ hồ sơ nguồn mới nhưng chưa cập nhật được cấu hình; cần kỹ thuật đối chiếu trước khi thử lại.".to_string())?;

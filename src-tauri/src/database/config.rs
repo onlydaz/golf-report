@@ -1,8 +1,5 @@
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
-
-// Compiled into the installer executable; the source TOML stays outside Git.
-const BUNDLED_CONFIG: &str = include_str!("../../resources/database_config.toml");
+use std::fs;
 
 #[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
@@ -20,16 +17,19 @@ pub struct DatabaseConfig {
     pub password: String,
 }
 
-pub fn load_config(app_config_dir: Option<PathBuf>) -> Result<DatabaseConfig, String> {
-    let config_path = app_config_dir.map(|dir| dir.join("database_config.toml"));
-    let content = if !cfg!(debug_assertions) {
-        BUNDLED_CONFIG.to_string()
-    } else if let Some(path) = config_path.as_ref().filter(|path| path.is_file()) {
-        fs::read_to_string(path)
-            .map_err(|_| "Không thể đọc file cấu hình PostgreSQL trong AppData.".to_string())?
-    } else {
-        BUNDLED_CONFIG.to_string()
-    };
+pub fn load_config() -> Result<DatabaseConfig, String> {
+    #[cfg(debug_assertions)]
+    let config_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/database_config.toml");
+    #[cfg(not(debug_assertions))]
+    let config_path = crate::application_directory()?.join("resources/database_config.toml");
+    read_config(&config_path)
+}
+
+fn read_config(config_path: &std::path::Path) -> Result<DatabaseConfig, String> {
+    let content = fs::read_to_string(config_path).map_err(|_| {
+        "Thiếu hoặc không đọc được resources/database_config.toml trong thư mục ứng dụng (Dev: src-tauri/resources). Hãy kiểm tra file và thử kết nối lại.".to_string()
+    })?;
     let config = toml::from_str::<DatabaseConfig>(&content)
         .map_err(|_| "File cấu hình cơ sở dữ liệu không hợp lệ.".to_string())?;
     Ok(config)
@@ -37,7 +37,35 @@ pub fn load_config(app_config_dir: Option<PathBuf>) -> Result<DatabaseConfig, St
 
 #[cfg(test)]
 mod tests {
-    use super::DatabaseConfig;
+    use super::*;
+
+    #[test]
+    fn external_config_is_preserved_and_invalid_config_never_falls_back_or_leaks() {
+        let dir = std::env::temp_dir().join(format!(
+            "golf-report-config-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("database_config.toml");
+        let content = "connection_string = 'postgresql://fixture:dummy@example.invalid/external'";
+        fs::write(&path, content).unwrap();
+        let config = read_config(&path).unwrap();
+        assert_eq!(
+            config.connection_string.as_deref(),
+            Some("postgresql://fixture:dummy@example.invalid/external")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+
+        let invalid = "connection_string = 'fixture-secret-not-to-log";
+        fs::write(&path, invalid).unwrap();
+        let error = read_config(&path).err().unwrap();
+        assert_eq!(error, "File cấu hình cơ sở dữ liệu không hợp lệ.");
+        assert!(!error.contains("fixture-secret"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn accepts_cloud_connection_string_without_legacy_fields() {

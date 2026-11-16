@@ -1,6 +1,8 @@
 //! Địa chỉ D theo tài liệu; offset Modbus chỉ được áp dụng khi tạo request.
 pub const CONTROL_BASE: u16 = 25000;
 pub const CONTROL_SIZE: usize = 20;
+// The full two-slot map is retained for register-map tests; production reads only the published region.
+#[cfg(test)]
 pub const RECORD_BASE: u16 = 25020;
 pub const RECORD_SIZE: usize = 240;
 pub const BUFFER_COUNT: usize = 2;
@@ -39,6 +41,7 @@ pub mod record {
     pub const ATTEMPT_COUNT: usize = 4;
 }
 
+#[cfg(test)]
 pub fn record_base(index: usize) -> Option<u16> {
     (index < BUFFER_COUNT).then(|| RECORD_BASE + index as u16 * RECORD_SIZE as u16)
 }

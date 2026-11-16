@@ -1,14 +1,16 @@
-import { ConfigProvider } from "antd";
+import { ConfigProvider, Spin } from "antd";
 import viVN from "antd/locale/vi_VN";
+import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import MainLayout from "./layouts/MainLayout";
 import AddMeasurement from "./pages/AddMeasurement/AddMeasurement";
 import Dashboard from "./pages/Dashboard/Dashboard";
-import MeasurementDetail from "./pages/MeasurementDetail/MeasurementDetail";
-import MeasurementHistory from "./pages/MeasurementHistory/MeasurementHistory";
-import Reports from "./pages/Reports/Reports";
 import ConnectionSettings from "./pages/ConnectionSettings/ConnectionSettings";
 import "./App.css";
+
+const MeasurementDetail = lazy(() => import("./pages/MeasurementDetail/MeasurementDetail"));
+const MeasurementHistory = lazy(() => import("./pages/MeasurementHistory/MeasurementHistory"));
+const Reports = lazy(() => import("./pages/Reports/Reports"));
 
 function App() {
   return (
@@ -36,9 +38,21 @@ function App() {
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/measurements/add" element={<AddMeasurement />} />
-            <Route path="/measurements" element={<MeasurementHistory />} />
-            <Route path="/measurements/:measurementId" element={<MeasurementDetail />} />
-            <Route path="/reports" element={<Reports />} />
+            <Route path="/measurements" element={
+              <Suspense fallback={<Spin size="large" />}>
+                <MeasurementHistory />
+              </Suspense>
+            } />
+            <Route path="/measurements/:measurementId" element={
+              <Suspense fallback={<Spin size="large" />}>
+                <MeasurementDetail />
+              </Suspense>
+            } />
+            <Route path="/reports" element={
+              <Suspense fallback={<Spin size="large" />}>
+                <Reports />
+              </Suspense>
+            } />
             <Route path="/settings/connection" element={<ConnectionSettings />} />
           </Route>
         </Routes>

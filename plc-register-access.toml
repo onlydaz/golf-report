@@ -1,0 +1,37 @@
+
+version = 1
+ui_enabled = false
+
+[[profiles]]
+ip = "192.168.1.5"
+port = 502
+unit_id = 1
+
+# PLC Delta AS228R chạy chương trình demo đã xác minh
+device_model = "AS228R"
+program_id = "AS228R-DEMO-M0-DMOV"
+
+# Mapping Modbus đã được xác minh
+mapping_verified = true
+
+# Địa chỉ Modbus PDU 0-based
+m_coil_base = 0
+d_register_base = 0
+address_offset = 0
+
+# Chỉ cho phép ghi trên PLC demo đã cách ly an toàn
+isolated_test = true
+write_enabled = true
+
+# TEST 1: Cho phép ghi M0 = OFF/ON
+[[profiles.writes]]
+address = "M0"
+values = [0, 1]
+control_write_approved = true
+
+# TEST 2: Chưa mở quyền ghi D25000
+# Chỉ bật sau khi TEST 1 thành công
+[[profiles.writes]]
+address = "D25000"
+values = [0, 1234]
+control_write_approved = true

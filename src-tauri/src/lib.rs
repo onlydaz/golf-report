@@ -3,40 +3,129 @@ pub mod database;
 pub mod enums;
 pub mod models;
 mod plc;
+pub use plc::as200;
 pub mod repositories;
 pub mod services;
 
 use tauri::Manager;
 
-#[cfg(not(debug_assertions))]
-fn release_plc_directory(app_config_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    use std::{fs, fs::OpenOptions, io::Write, path::PathBuf};
-    let root = std::env::var_os("ProgramData")
-        .filter(|value| !value.is_empty())
-        .ok_or("Windows không cung cấp đường dẫn ProgramData.")?;
-    let dir = PathBuf::from(root).join("GolfReport");
-    // Existing per-user PLC history must be reconciled; an empty shared directory
-    // alone cannot establish that this is a new physical source.
-    if !dir.join("as200_config.toml").exists() {
-        if ["as200_capture_journal.json", "as200_capture_journal.lock", "local-runtime"]
-            .iter().any(|name| dir.join(name).exists()) {
-            return Err("Đã tìm thấy lịch sử PLC trong ProgramData nhưng thiếu cấu hình. Cần kỹ thuật đối chiếu trước khi thiết lập.".into());
+pub(crate) fn application_directory() -> Result<std::path::PathBuf, String> {
+    #[cfg(debug_assertions)]
+    {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| "Không xác định được thư mục project Golf Report.".into())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .ok_or_else(|| "Không xác định được thư mục cài đặt Golf Report.".into())
+    }
+}
+
+fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
+    use std::{fs, fs::OpenOptions, io::Write};
+    fn probe(dir: &std::path::Path) -> Result<(), String> {
+        let first = dir.join(format!(
+            ".golf-write-check-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let second = first.with_extension("renamed");
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&first)?;
+            file.write_all(b"check")?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&first, &second)?;
+            fs::remove_file(&second)
+        })();
+        if first.exists() {
+            let _ = fs::remove_file(&first);
         }
-        if ["as200_config.toml", "as200_capture_journal.json", "as200_capture_journal.lock", "local-runtime"]
-            .iter().any(|name| app_config_dir.join(name).exists()) {
-            return Err("Đã tìm thấy lịch sử PLC trong AppData. Cần kỹ thuật đối chiếu trước khi thiết lập trong ProgramData.".into());
+        if second.exists() {
+            let _ = fs::remove_file(&second);
+        }
+        result.map_err(|_: std::io::Error| format!("Không thể ghi/sync/đổi tên dữ liệu trong {}. Chưa bật thu hoặc ACK. Hãy kiểm tra quyền ghi thư mục ứng dụng.", dir.display()))
+    }
+    fn inspect(path: &std::path::Path) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| format!("Không đọc được thư mục runtime: {}", path.display()))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(
+                    "Runtime PLC chứa reparse point; cần kỹ thuật đối chiếu đường dẫn.".into(),
+                );
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return Err("Runtime PLC chứa symlink; cần kỹ thuật đối chiếu đường dẫn.".into());
+        }
+        if metadata.is_dir() {
+            probe(path)?;
+            for entry in fs::read_dir(path).map_err(|_| "Không đọc được runtime PLC.")? {
+                inspect(&entry.map_err(|_| "Không đọc được runtime PLC.")?.path())?;
+            }
+        } else if path.file_name().is_some_and(|name| name == "capture.json") {
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|_| "Không có quyền ghi Journal PLC; chưa bật thu hoặc ACK.")?;
+        }
+        Ok(())
+    }
+    probe(dir)?;
+    let file = dir.join("as200_config.toml");
+    let runtime = dir.join("local-runtime");
+    if !file.exists()
+        && (runtime.exists()
+            || dir.join("as200_capture_journal.json").exists()
+            || dir.join("as200_capture_journal.lock").exists())
+    {
+        // An empty installer-created local-runtime is allowed on a clean installation.
+        let has_history = !runtime.is_dir()
+            || fs::read_dir(&runtime)
+                .map_err(|_| "Không đọc được local-runtime.")?
+                .next()
+                .is_some();
+        if has_history
+            || dir.join("as200_capture_journal.json").exists()
+            || dir.join("as200_capture_journal.lock").exists()
+        {
+            return Err("Đã có lịch sử PLC nhưng thiếu as200_config.toml cạnh ứng dụng. Cần kỹ thuật đối chiếu; không tự tạo phiên hoặc cấu hình thay thế.".into());
         }
     }
-    fs::create_dir_all(&dir).map_err(|_| "Không thể tạo thư mục GolfReport trong ProgramData. Hãy kiểm tra bản cài đặt và quyền ghi.".to_string())?;
-    let probe = dir.join(format!(".write-check-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&probe)
-        .map_err(|_| "Không có quyền ghi vào thư mục GolfReport trong ProgramData. Hãy chạy lại bộ cài hoặc liên hệ kỹ thuật.".to_string())?;
-    let result = file.write_all(b"check").and_then(|_| file.sync_all());
-    drop(file);
-    let cleanup = fs::remove_file(&probe);
-    result.map_err(|_| "Không thể ghi dữ liệu PLC vào ProgramData.".to_string())?;
-    cleanup.map_err(|_| "Không thể hoàn tất kiểm tra quyền ghi ProgramData.".to_string())?;
-    Ok(dir)
+    if file.exists() {
+        inspect(&file)?;
+        OpenOptions::new().write(true).open(&file).map_err(
+            |_| "Không có quyền cập nhật as200_config.toml cạnh ứng dụng; chưa bật thu hoặc ACK.",
+        )?;
+        if let Some((config, journal)) = plc::simulator_config::load(Some(dir))? {
+            if config.enabled && config.journal_path.is_none() {
+                return Err("Cấu hình PLC đang bật nhưng thiếu đường dẫn Journal trong local-runtime; cần kỹ thuật đối chiếu, chưa bật thu hoặc ACK.".into());
+            }
+            if config.journal_path.is_some()
+                && (!journal.starts_with(&runtime)
+                    || journal
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)))
+            {
+                return Err("Journal phải nằm trong local-runtime cạnh ứng dụng. Giữ nguyên lịch sử cũ và yêu cầu kỹ thuật đối chiếu; không tự di chuyển.".into());
+            }
+        }
+    }
+    if runtime.exists() {
+        inspect(&runtime)?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -52,19 +141,17 @@ pub fn run() {
             let database_state = app.state::<database::DatabaseState>().inner().clone();
             let worker = app.state::<plc::worker::WorkerState>().inner().clone();
             let worker_database = database_state.clone();
-            let app_config_dir = app.path().app_config_dir()?;
-            #[cfg(debug_assertions)]
-            let config_dir = Ok(app_config_dir);
-            #[cfg(not(debug_assertions))]
-            let config_dir = release_plc_directory(&app_config_dir);
+            let config_dir = application_directory().and_then(|dir| {
+                check_plc_directory(&dir)?;
+                Ok(dir)
+            });
             tauri::async_runtime::spawn(async move {
+                // verify_open needs the migrated pool; do not race database startup.
+                database_state.initialize(&app_handle).await;
                 match config_dir {
                     Ok(config_dir) => worker.launch(Some(config_dir), worker_database).await,
                     Err(error) => worker.report_runtime_initialization_failure(error).await,
                 }
-            });
-            tauri::async_runtime::spawn(async move {
-                database_state.initialize(&app_handle).await;
             });
             Ok(())
         })
@@ -84,10 +171,42 @@ pub fn run() {
             plc::connection_settings::test_plc_connection,
             plc::connection_settings::update_plc_connection_settings,
             plc::connection_settings::confirm_initial_plc_setup,
+            plc::register_access::get_plc_register_access,
+            plc::register_access::get_plc_register_ui_enabled,
+            plc::register_access::read_plc_register,
+            plc::register_access::write_plc_register,
             plc::worker::retry_as200_inbox,
             plc::worker::get_as200_retry_diagnostics,
             plc::worker::acknowledge_as200_buffer_gap
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn application_storage_does_not_import_or_replace_missing_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "golf-storage-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(check_plc_directory(&dir).is_ok());
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        assert!(plc::simulator_config::load(Some(&dir)).unwrap().is_none());
+        let runtime = dir.join("local-runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let journal = runtime.join("capture.json");
+        std::fs::write(&journal, b"preserve-history").unwrap();
+        assert!(check_plc_directory(&dir).is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), b"preserve-history");
+        assert!(!dir.join("as200_config.toml").exists());
+        std::fs::remove_file(journal).unwrap();
+        std::fs::remove_dir(runtime).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

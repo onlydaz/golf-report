@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <?if $(sys.BUILDARCH)="x86"?>
+    <?define RuntimeWin64="no"?>
+  <?else?>
+    <?define RuntimeWin64="yes"?>
+  <?endif?>
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="ApplicationRuntimePermissions" Guid="1A526918-769C-42D6-994C-2407619C76D2" Permanent="yes" Win64="$(var.RuntimeWin64)">
+        <CreateFolder>
+          <!-- Users: read/execute descendants; create files/folders at root only.
+               Creator owner: full control of newly created runtime/config objects.
+               Existing installed binaries are not made writable to Users. -->
+          <PermissionEx Id="ApplicationRuntimeAcl"
+            Sddl="D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;;0x6;;;BU)(A;OICIIO;FA;;;CO)" />
+        </CreateFolder>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

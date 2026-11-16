@@ -1,5 +1,4 @@
-//! AS200 v1: reader/decoder và ACK opt-in theo protocol Simulator hoặc AS200.
-#![allow(dead_code)] // API độc lập chờ xác nhận PLC thật trước khi tích hợp.
+//! AS200 Published Record: one read region and a durable, explicitly authorized ACK handshake.
 
 pub mod ack;
 pub mod decode;
@@ -31,8 +30,6 @@ pub enum As200Error {
     Transport(String),
     Timeout,
     Unstable,
-    SessionUnconfirmed,
-    AckDisabled,
 }
 impl fmt::Display for As200Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,24 +38,7 @@ impl fmt::Display for As200Error {
             Self::Transport(detail) => write!(f, "Lỗi Modbus TCP AS200: {detail}"),
             Self::Timeout => write!(f, "Hết thời gian kết nối/đọc AS200"),
             Self::Unstable => write!(f, "Buffer AS200 đang thay đổi; bỏ snapshot và thử lại"),
-            Self::SessionUnconfirmed => write!(
-                f,
-                "TotalCount giảm; cần xác nhận phiên/reset PLC trước khi tiếp tục"
-            ),
-            Self::AckDisabled => write!(f, "ACK đang bị vô hiệu hóa; không gửi FC06/FC16"),
         }
     }
 }
 impl std::error::Error for As200Error {}
-
-/// Interface chuẩn bị ACK; không cung cấp transport ghi và không tự gọi ACK.
-/// TODO: xác nhận thứ tự PC_ReadCount/PC_ReadDone và session với kỹ thuật viên trước khi hiện thực ghi.
-pub trait PlcAcknowledgement {
-    fn acknowledge(&mut self, total_count: i32) -> Result<(), As200Error>;
-}
-pub struct DisabledAcknowledgement;
-impl PlcAcknowledgement for DisabledAcknowledgement {
-    fn acknowledge(&mut self, _total_count: i32) -> Result<(), As200Error> {
-        Err(As200Error::AckDisabled)
-    }
-}

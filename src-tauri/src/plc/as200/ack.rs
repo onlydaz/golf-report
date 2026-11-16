@@ -1,9 +1,6 @@
 //! Whitelisted AS200 ACK transport with protocol-specific acceptance evidence.
 use super::As200Config;
-use super::{
-    WordOrder, map,
-    reader::{As200Reader, PollReport},
-};
+use super::{WordOrder, map, reader::PublishedRecordSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_modbus::{
@@ -20,148 +17,101 @@ enum Write {
     Multiple(u16, [u16; 2]),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AckProgress {
-    pub binding: String,
-    pub accepted: i32,
-    pub intent: Option<AckIntent>,
+/// Every write is preceded by a
+/// persisted uncertain phase; an uncertain write is observed, never replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublishedAckPhase {
+    Prepared,
+    CountWriteUncertain,
+    CountVerified,
+    DoneWriteUncertain,
+    AckConfirmed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AckIntent {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedAckIntent {
     pub target: i32,
-    pub records: Vec<(usize, Vec<u16>)>,
-    #[serde(default)]
-    pub submitted_at_ms: Option<i64>,
-    #[serde(default)]
+    pub inbox_id: i64,
+    pub raw_registers: Vec<u16>,
+    pub phase: PublishedAckPhase,
     pub observed_done_high: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AckPhase {
-    NotSent,
-    OutcomeUnknown,
-    DoneObserved,
-}
-impl AckIntent {
-    // Tương thích journal cũ: submitted không đồng nghĩa lệnh đã tới PLC.
-    pub fn phase(&self) -> AckPhase {
-        if self.observed_done_high && self.submitted_at_ms.is_some() {
-            AckPhase::DoneObserved
-        } else if self.submitted_at_ms.is_some() {
-            AckPhase::OutcomeUnknown
-        } else {
-            AckPhase::NotSent
-        }
+
+impl PublishedAckIntent {
+    pub fn same_published_record(&self, snapshot: &PublishedRecordSnapshot) -> bool {
+        snapshot.diagnostics.is_empty()
+            && snapshot.control.data_ready == 1
+            && snapshot.buffer.as_ref().is_some_and(|buffer| {
+                buffer.buffer_index == 0
+                    && buffer.raw_registers == self.raw_registers
+                    && buffer
+                        .record
+                        .as_ref()
+                        .is_some_and(|record| record.record_seq == self.target && record.complete())
+            })
     }
-}
 
-/// Excel: PLC xóa bit0 sau ACK. Chỉ nhận bằng chứng khi vẫn nhận diện được
-/// đúng raw đã lưu (mọi bit khác không đổi), không suy từ slot rỗng/ghi đè.
-fn exact_records_released(intent: &AckIntent, report: &PollReport) -> bool {
-    !intent.records.is_empty()
-        && intent.records.iter().all(|(index, raw)| {
-            raw.len() == map::RECORD_SIZE
-                && raw[map::record::STATUS] & 1 != 0
-                && report.buffers.iter().any(|b| {
-                    b.buffer_index == *index
-                        && b.raw_registers.len() == raw.len()
-                        && b.raw_registers[map::record::STATUS] & 1 == 0
-                        && raw
-                            .iter()
-                            .zip(&b.raw_registers)
-                            .enumerate()
-                            .all(|(i, (a, b))| {
-                                if i == map::record::STATUS {
-                                    a & !1 == b & !1
-                                } else {
-                                    a == b
-                                }
-                            })
+    pub fn check_before_write(
+        &self,
+        snapshot: &PublishedRecordSnapshot,
+        expected_count: i32,
+    ) -> Result<(), String> {
+        let c = &snapshot.control;
+        if c.total_count > self.target {
+            return Err(format!(
+                "TotalCount={} đi trước RecordSeq={}; chưa có bằng chứng cho phép checkpoint nhỏ hơn TotalCount, chặn ghi ACK.",
+                c.total_count, self.target
+            ));
+        }
+        if c.format_version != 1
+            || c.record_size != 240
+            || c.buffer_count != 2
+            || c.total_count != self.target
+            || c.pc_read_count != expected_count
+            || c.pc_read_done != 0
+            || !self.same_published_record(snapshot)
+        {
+            return Err(
+                "Snapshot Bản ghi 1/checkpoint thay đổi trước lệnh ghi; giữ intent, không ghi PLC."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Excel says PLC clears Done after processing. A read-back of Count alone,
+    /// DataReady=0, or a changed RecordSeq is never sufficient evidence.
+    pub fn confirmed_by(&self, snapshot: &PublishedRecordSnapshot) -> bool {
+        let c = &snapshot.control;
+        self.phase == PublishedAckPhase::DoneWriteUncertain
+            && self.observed_done_high
+            && snapshot.diagnostics.is_empty()
+            && c.format_version == 1
+            && c.record_size == 240
+            && c.buffer_count == 2
+            && c.total_count >= self.target
+            && c.pc_read_count == self.target
+            && c.pc_read_done == 0
+            && c.data_ready == i16::from(c.total_count > self.target)
+            && if c.data_ready == 0 {
+                snapshot.buffer.is_none()
+            } else {
+                snapshot.buffer.as_ref().is_some_and(|buffer| {
+                    buffer.buffer_index == 0
+                        && buffer.record.as_ref().is_some_and(|record| {
+                            record.complete()
+                                && self.target.checked_add(1) == Some(record.record_seq)
+                                && i64::from(record.record_seq) <= i64::from(c.total_count)
+                        })
                 })
-        })
-}
-pub fn same_records(intent: &AckIntent, report: &PollReport) -> bool {
-    intent.records.iter().all(|(index, raw)| {
-        report
-            .buffers
-            .iter()
-            .any(|b| b.buffer_index == *index && b.raw_registers == *raw)
-    })
-}
-pub fn accepted(intent: &AckIntent, report: &PollReport) -> bool {
-    let c = &report.control;
-    c.total_count >= intent.target
-        && c.pc_read_count == intent.target
-        && c.pc_read_done == 0
-        && c.data_ready == i16::from(c.total_count > intent.target)
-        // simulator-v1 khóa tạo record từ lúc nhận Count tới lúc chấp nhận Done.
-        // Total tăng sau target vì vậy cũng chứng minh lần ACK trước đã được xử lý.
-        && (c.total_count > intent.target || intent.records.iter().all(|(index,raw)| {
-            report.buffers.iter().any(|b| b.buffer_index==*index && b.raw_registers.len()==raw.len()
-                && raw.iter().zip(&b.raw_registers).enumerate().all(|(i,(a,b))|
-                    if i==map::record::STATUS { a & !1 == b & !1 } else { a==b }))
-        }))
-}
-
-pub fn accepted_as200(intent: &AckIntent, report: &PollReport) -> bool {
-    let c = &report.control;
-    // Không dùng write response làm evidence. Ngoài cạnh 1->0, Excel định nghĩa
-    // PLC xóa valid sau ACK: có thể phục hồi missed pulse nếu đúng raw còn nguyên.
-    intent.submitted_at_ms.is_some()
-        && (intent.observed_done_high
-            || (c.total_count == intent.target && exact_records_released(intent, report)))
-        && report.diagnostics.is_empty()
-        && c.pc_read_count == intent.target
-        && c.pc_read_done == 0
-        && c.total_count >= intent.target
-        && c.data_ready == i16::from(c.total_count > intent.target)
+            }
+    }
 }
 
 /// Chỉ constructor này cấp quyền ghi, dựa trên mode/protocol và opt-in rõ ràng.
 pub struct AckWriter {
     cfg: As200Config,
-}
-/// Capability riêng: chỉ FC06 D25010, không cấp quyền ACK.
-pub struct HeartbeatWriter {
-    cfg: As200Config,
-}
-impl HeartbeatWriter {
-    pub fn new(
-        cfg: As200Config,
-        mode: &str,
-        enabled: bool,
-        allow_connection: bool,
-        allow_write: bool,
-    ) -> Result<Self, String> {
-        let address: std::net::SocketAddr = cfg
-            .address
-            .parse()
-            .map_err(|_| "Heartbeat cần numeric IP:port")?;
-        if !enabled
-            || !(1..=247).contains(&cfg.unit_id)
-            || address.port() == 0
-            || !match mode {
-                "simulator" => address.ip().is_loopback(),
-                "plc" | "modbus" => allow_connection && allow_write,
-                _ => false,
-            }
-        {
-            return Err("PC_Heartbeat write capability disabled".into());
-        }
-        Ok(Self { cfg })
-    }
-    pub async fn write(&self, value: u16) -> Result<(), String> {
-        if value > 32767 {
-            return Err("PC_Heartbeat ngoài 0..32767".into());
-        }
-        let address = map::modbus_address(
-            map::CONTROL_BASE + map::control::PC_HEARTBEAT as u16,
-            self.cfg.modbus_address_offset,
-        )
-        .ok_or("Heartbeat address overflow")?;
-        // Dùng chung transport/timeout/echo checks, không gọi constructor hoặc API ACK.
-        send(&self.cfg, Write::Single(address, value), None).await
-    }
 }
 impl AckWriter {
     pub fn new(
@@ -175,13 +125,8 @@ impl AckWriter {
             .address
             .parse()
             .map_err(|_| "ACK requires numeric IP:port")?;
-        let permitted = match mode {
-            "simulator" => {
-                address.ip().is_loopback() && matches!(protocol, Some("simulator-v1" | "as200"))
-            }
-            "plc" | "modbus" => allow_plc_connection && protocol == Some("as200"),
-            _ => false,
-        };
+        let permitted =
+            matches!(mode, "plc" | "modbus") && allow_plc_connection && protocol == Some("as200");
         if !enabled || !permitted || address.port() == 0 {
             return Err("ACK write capability disabled".into());
         }
@@ -204,10 +149,6 @@ impl AckWriter {
         }
         send(&self.cfg, Write::Multiple(address, words), None).await
     }
-    pub async fn done(&self) -> Result<(), String> {
-        let stream = self.prepare_done().await?;
-        self.done_prepared(stream).await
-    }
     /// Mở socket chưa gửi byte nào: lỗi connect không làm intent thành "đã gửi".
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
         tokio::time::timeout(self.cfg.timeout, TcpStream::connect(&self.cfg.address))
@@ -222,17 +163,6 @@ impl AckWriter {
         )
         .ok_or("ACK address overflow")?;
         send(&self.cfg, Write::Single(address, 1), Some(stream)).await
-    }
-    pub async fn verify_snapshot(&self, intent: &AckIntent) -> Result<PollReport, String> {
-        let mut reader = As200Reader::new(self.cfg.clone());
-        let report = reader.poll().await.map_err(|e| e.to_string())?;
-        if !report.diagnostics.is_empty()
-            || !same_records(intent, &report)
-            || report.control.total_count < intent.target
-        {
-            return Err("ACK buffer/session changed".into());
-        }
-        Ok(report)
     }
 }
 
@@ -278,49 +208,15 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[tokio::test]
-    async fn heartbeat_capability_has_separate_opt_in_and_only_writes_d25010() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let cfg = As200Config {
-            address: listener.local_addr().unwrap().to_string(),
-            unit_id: 1,
-            modbus_address_offset: -1,
-            word_order: WordOrder::LowWordFirst,
-            timeout: Duration::from_millis(500),
-        };
-        for (mode, enabled, connection, allow) in [
-            ("plc", false, true, true),
-            ("plc", true, true, false),
-            ("plc", true, false, true),
-            ("simulator", false, false, false),
-        ] {
-            assert!(HeartbeatWriter::new(cfg.clone(), mode, enabled, connection, allow).is_err());
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), listener.accept())
-                .await
-                .is_err()
-        );
-        let writer = HeartbeatWriter::new(cfg, "plc", true, true, true).unwrap();
-        let server = tokio::spawn(async move {
-            for bytes in [[0x7f, 0xff], [0, 0]] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0u8; 12];
-                stream.read_exact(&mut request).await.unwrap();
-                assert_eq!(&request[7..10], &[6, 0x61, 0xb1]); // D25010 - 1, không phải Count/Done.
-                assert_eq!(&request[10..12], &bytes);
-                stream.write_all(&request).await.unwrap();
-            }
-        });
-        writer.write(32767).await.unwrap();
-        writer.write(0).await.unwrap();
-        assert!(writer.write(32768).await.is_err());
-        server.await.unwrap();
+
+    async fn send_done(writer: &AckWriter) -> Result<(), String> {
+        writer.done_prepared(writer.prepare_done().await?).await
     }
+
     #[tokio::test]
     async fn fc16_word_order_offset_and_fc06_echo_are_checked() {
         for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
-            for mode in ["simulator", "plc"] {
+            for mode in ["modbus", "plc"] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap().to_string();
                 let server = tokio::spawn(async move {
@@ -356,20 +252,9 @@ mod tests {
                 );
                 assert!(AckWriter::new(cfg.clone(), "plc", false, Some("as200"), true).is_err());
                 assert!(AckWriter::new(cfg.clone(), "plc", true, Some("as200"), false).is_err());
-                let writer = AckWriter::new(
-                    cfg,
-                    mode,
-                    true,
-                    Some(if mode == "plc" {
-                        "as200"
-                    } else {
-                        "simulator-v1"
-                    }),
-                    mode == "plc",
-                )
-                .unwrap();
+                let writer = AckWriter::new(cfg, mode, true, Some("as200"), true).unwrap();
                 writer.count(65538).await.unwrap();
-                writer.done().await.unwrap();
+                send_done(&writer).await.unwrap();
                 server.await.unwrap();
             }
         }
@@ -399,9 +284,8 @@ mod tests {
                 word_order: WordOrder::LowWordFirst,
                 timeout: Duration::from_millis(50),
             };
-            let writer =
-                AckWriter::new(cfg, "simulator", true, Some("simulator-v1"), false).unwrap();
-            assert!(writer.done().await.is_err());
+            let writer = AckWriter::new(cfg, "modbus", true, Some("as200"), true).unwrap();
+            assert!(send_done(&writer).await.is_err());
             server.await.unwrap();
         }
     }
@@ -466,20 +350,11 @@ mod tests {
                 r
             })
             .await;
-            let error = ack_writer(cfg).done().await.unwrap_err();
+            let error = send_done(&ack_writer(cfg)).await.unwrap_err();
             assert!(error.contains("malformed"), "{error}");
             let request = server.await.unwrap();
             assert_eq!(&request[7..], &[6, 97, 179, 0, 1]);
         }
-        // Heartbeat dùng chung kiểm tra echo.
-        let (cfg, server) = one_shot(12, |mut r| {
-            r[10] ^= 0x10;
-            r
-        })
-        .await;
-        let writer = HeartbeatWriter::new(cfg, "plc", true, true, true).unwrap();
-        assert!(writer.write(5).await.is_err());
-        assert_eq!(&server.await.unwrap()[7..], &[6, 0x61, 0xb1, 0, 5]);
     }
 
     #[tokio::test]
@@ -509,7 +384,7 @@ mod tests {
                 r
             })
             .await;
-            assert!(ack_writer(cfg).done().await.is_err(), "byte {index}");
+            assert!(send_done(&ack_writer(cfg)).await.is_err(), "byte {index}");
             server.await.unwrap();
         }
     }

@@ -7,7 +7,7 @@ use sqlx::{
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,10 +119,9 @@ impl DatabaseState {
 
     async fn connect_and_migrate(
         &self,
-        app: &AppHandle,
+        _app: &AppHandle,
     ) -> Result<PgPool, (DatabaseConnectionState, String)> {
-        let app_config_dir = app.path().app_config_dir().ok();
-        let config = load_config(app_config_dir)
+        let config = load_config()
             .map_err(|message| (DatabaseConnectionState::ConnectionFailed, message))?;
         let cloud = config.connection_string.is_some();
         let options = if let Some(connection_string) = config.connection_string.as_deref() {
@@ -208,9 +207,7 @@ mod health_tests {
         let target =
             std::env::var("AS200_READONLY_DATABASE").expect("Specify read-only audit database");
         assert_eq!(target, "golf_report");
-        let app_dir = std::env::var_os("APPDATA")
-            .map(|p| std::path::PathBuf::from(p).join("com.golf.report"));
-        let config = load_config(app_dir).unwrap();
+        let config = load_config().unwrap();
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(

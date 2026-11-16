@@ -18,9 +18,7 @@ async fn run() -> Result<(), String> {
     if apply && target.is_none() {
         return Err("--migrate bắt buộc chỉ định --database rõ ràng".into());
     }
-    let app_dir =
-        std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("com.golf.report"));
-    let settings = load_config(app_dir)?;
+    let settings = load_config()?;
     let name = target.as_deref().unwrap_or(&settings.database);
     let pool = PgPoolOptions::new()
         .max_connections(2)

@@ -1,14 +1,16 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn empty_new_snapshot() -> super::super::as200::reader::PollReport {
-    use super::super::as200::{decode, WordOrder, reader::{PollReport, BufferSnapshot}};
+fn empty_new_snapshot() -> super::super::as200::reader::PublishedRecordSnapshot {
+    use super::super::as200::{WordOrder, decode, reader::PublishedRecordSnapshot};
     let mut control = vec![0_u16; 20];
-    control[0] = 1; control[1] = 240; control[2] = 2;
-    PollReport {
+    control[0] = 1;
+    control[1] = 240;
+    control[2] = 2;
+    PublishedRecordSnapshot {
         control: decode::control(&control, WordOrder::LowWordFirst).unwrap(),
-        buffers: (0..2).map(|buffer_index| BufferSnapshot { buffer_index, raw_registers: vec![0;240], record: None }).collect(),
-        new_records: Vec::new(), diagnostics: Vec::new(),
+        buffer: None,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -23,7 +25,7 @@ fn controlled_new_source_requires_zero_counters_empty_slots_and_no_done() {
             1 => report.control.pc_read_count = 1,
             2 => report.control.pc_read_done = 1,
             3 => report.control.data_ready = 1,
-            _ => report.buffers[1].raw_registers[22] = 123,
+            _ => report.control.total_count = -1,
         }
         assert!(clean_new_baseline(&report).is_err());
     }
@@ -35,23 +37,62 @@ fn legacy_profile_is_resolved_from_later_backup_without_inventing_identity() {
     let file = dir.0.join("as200_config.toml");
     let first = dir.0.join("local-runtime/managed-sources/first");
     let second = dir.0.join("local-runtime/managed-sources/second");
-    std::fs::create_dir_all(&first).unwrap(); std::fs::create_dir_all(&second).unwrap();
-    let profile = |address: &str, source: &str, journal: &Path| format!("mode='modbus'\nenabled=true\ntechnical_setup_confirmed=true\naddress='{address}'\nunit_id=1\nword_order='LOW'\nmodbus_address_offset=0\nplc_heartbeat_timeout_ms=5000\nsource_key='{source}'\nconfirmed_session_id='{source}-session'\njournal_path='{}'\n", journal.display());
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let profile = |address: &str, source: &str, journal: &Path| {
+        format!(
+            "mode='modbus'\nenabled=true\ntechnical_setup_confirmed=true\naddress='{address}'\nunit_id=1\nword_order='LOW'\nmodbus_address_offset=0\nplc_heartbeat_timeout_ms=5000\nsource_key='{source}'\nconfirmed_session_id='{source}-session'\njournal_path='{}'\n",
+            journal.display()
+        )
+    };
     let a = profile("192.168.1.24:1504", "first", &first.join("capture.json"));
     let b = profile("127.0.0.1:1503", "second", &second.join("capture.json"));
     std::fs::write(&file, &b).unwrap();
     std::fs::write(second.join("previous-config.toml"), &a).unwrap();
-    let requested = Endpoint { ip: "192.168.1.24".into(), port: 1504, unit_id: 1 };
+    let requested = Endpoint {
+        ip: "192.168.1.24".into(),
+        port: 1504,
+        unit_id: 1,
+    };
     let historical = previous_endpoint(&file, &requested).unwrap().unwrap();
     assert_eq!(historical.config.source_key, "first");
-    assert_eq!(historical.config.confirmed_session_id.as_deref(), Some("first-session"));
-    assert_eq!(historical.config.journal_path.unwrap(), first.canonicalize().unwrap().join("capture.json"));
-    assert!(previous_endpoint(&file, &Endpoint { ip: "127.0.0.2".into(), port: 1504, unit_id: 1 }).unwrap().is_none());
+    assert_eq!(
+        historical.config.confirmed_session_id.as_deref(),
+        Some("first-session")
+    );
+    assert_eq!(
+        historical.config.journal_path.unwrap(),
+        first.canonicalize().unwrap().join("capture.json")
+    );
+    assert!(
+        previous_endpoint(
+            &file,
+            &Endpoint {
+                ip: "127.0.0.2".into(),
+                port: 1504,
+                unit_id: 1
+            }
+        )
+        .unwrap()
+        .is_none()
+    );
     retain_current_profile(&file, &b, &simulator_config::parse(&b).unwrap()).unwrap();
     std::fs::write(&file, &a).unwrap();
-    let returning = previous_endpoint(&file, &Endpoint { ip: "127.0.0.1".into(), port: 1503, unit_id: 1 }).unwrap().unwrap();
+    let returning = previous_endpoint(
+        &file,
+        &Endpoint {
+            ip: "127.0.0.1".into(),
+            port: 1503,
+            unit_id: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(returning.config.source_key, "second");
-    assert_eq!(std::fs::read_to_string(second.join("target-config.toml")).unwrap(), b);
+    assert_eq!(
+        std::fs::read_to_string(second.join("target-config.toml")).unwrap(),
+        b
+    );
     std::fs::write(&file, &b).unwrap();
     std::fs::remove_file(second.join("previous-config.toml")).unwrap();
     assert!(previous_endpoint(&file, &requested).is_err());
@@ -62,10 +103,18 @@ fn endpoint_links_revisit_three_profiles_and_never_guess_between_legacy_identiti
     let dir = Fixture::new();
     let file = dir.0.join("as200_config.toml");
     let mut profiles = Vec::new();
-    for (name, port) in [("one", 1505), ("two", 1506), ("three", 1507), ("legacy-one", 1505)] {
+    for (name, port) in [
+        ("one", 1505),
+        ("two", 1506),
+        ("three", 1507),
+        ("legacy-one", 1505),
+    ] {
         let folder = dir.0.join("local-runtime/managed-sources").join(name);
         std::fs::create_dir_all(&folder).unwrap();
-        let text = format!("mode='modbus'\nenabled=true\ntechnical_setup_confirmed=true\naddress='127.0.0.1:{port}'\nunit_id=1\nword_order='LOW'\nmodbus_address_offset=0\nplc_heartbeat_timeout_ms=5000\nsource_key='{name}'\nconfirmed_session_id='{name}-session'\njournal_path='{}'\n", folder.join("capture.json").display());
+        let text = format!(
+            "mode='modbus'\nenabled=true\ntechnical_setup_confirmed=true\naddress='127.0.0.1:{port}'\nunit_id=1\nword_order='LOW'\nmodbus_address_offset=0\nplc_heartbeat_timeout_ms=5000\nsource_key='{name}'\nconfirmed_session_id='{name}-session'\njournal_path='{}'\n",
+            folder.join("capture.json").display()
+        );
         std::fs::write(folder.join("target-config.toml"), &text).unwrap();
         profiles.push((text.clone(), simulator_config::parse(&text).unwrap()));
     }
@@ -73,14 +122,25 @@ fn endpoint_links_revisit_three_profiles_and_never_guess_between_legacy_identiti
         let (text, config) = &profiles[index];
         std::fs::write(&file, text).unwrap();
         remember_endpoint(&file, text, config).unwrap();
-        let selected = previous_endpoint(&file, &endpoint(config).unwrap()).unwrap().unwrap();
+        let selected = previous_endpoint(&file, &endpoint(config).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(selected.config.source_key, config.source_key);
-        assert_eq!(selected.config.confirmed_session_id, config.confirmed_session_id);
-        assert_eq!(selected.config.journal_path, Some(profile_journal(&file, config).unwrap()));
+        assert_eq!(
+            selected.config.confirmed_session_id,
+            config.confirmed_session_id
+        );
+        assert_eq!(
+            selected.config.journal_path,
+            Some(profile_journal(&file, config).unwrap())
+        );
     }
     let one = endpoint(&profiles[0].1).unwrap();
     std::fs::remove_file(endpoint_link(&file, &one).unwrap()).unwrap();
-    assert_eq!(previous_endpoint(&file, &one).err().unwrap(), "HISTORY_AMBIGUOUS");
+    assert_eq!(
+        previous_endpoint(&file, &one).err().unwrap(),
+        "HISTORY_AMBIGUOUS"
+    );
 }
 
 #[tokio::test]
@@ -90,22 +150,31 @@ async fn controlled_baseline_reads_full_snapshot_using_only_fc03() {
         let address = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            for _ in 0..11 {
-                let mut request = [0;12];
+            for _ in 0..if total == 0 { 9 } else { 1 } {
+                let mut request = [0; 12];
                 socket.read_exact(&mut request).await.unwrap();
                 assert_eq!(request[7], 3, "No Modbus write allowed during bootstrap");
                 let offset = u16::from_be_bytes([request[8], request[9]]) as usize - 25000;
                 let count = u16::from_be_bytes([request[10], request[11]]) as usize;
-                let mut words = vec![0_u16;500];
-                words[0] = 1; words[1] = 240; words[2] = 2; words[4] = total;
+                let mut words = vec![0_u16; 500];
+                words[0] = 1;
+                words[1] = 240;
+                words[2] = 2;
+                words[4] = total;
                 let mut response = request[..7].to_vec();
-                response[4..6].copy_from_slice(&((count*2+3) as u16).to_be_bytes());
-                response.push(3); response.push((count*2) as u8);
-                for word in &words[offset..offset+count] { response.extend_from_slice(&word.to_be_bytes()); }
+                response[4..6].copy_from_slice(&((count * 2 + 3) as u16).to_be_bytes());
+                response.push(3);
+                response.push((count * 2) as u8);
+                for word in &words[offset..offset + count] {
+                    response.extend_from_slice(&word.to_be_bytes());
+                }
                 socket.write_all(&response).await.unwrap();
             }
         });
-        let config = SimulatorConfig { address, ..Default::default() };
+        let config = SimulatorConfig {
+            address,
+            ..Default::default()
+        };
         let result = read_new_baseline(&config).await;
         assert_eq!(result.is_ok(), total == 0);
         server.await.unwrap();
@@ -116,18 +185,33 @@ async fn controlled_baseline_reads_full_snapshot_using_only_fc03() {
 async fn separate_journal_uses_engine_initialization_and_never_reuses_an_existing_path() {
     let dir = Fixture::new();
     let path = dir.0.join("new-source/capture.json");
-    let config = SimulatorConfig { enabled: true, mode: "modbus".into(), technical_setup_confirmed: true,
-        source_key: "controlled-new-source".into(), confirmed_session_id: Some("controlled-new-session".into()),
-        journal_path: Some(path.clone()), ..Default::default() };
-    WorkerState::initialize_separate_journal(config.clone(), path.clone()).await.unwrap();
+    let config = SimulatorConfig {
+        enabled: true,
+        mode: "modbus".into(),
+        technical_setup_confirmed: true,
+        source_key: "controlled-new-source".into(),
+        confirmed_session_id: Some("controlled-new-session".into()),
+        journal_path: Some(path.clone()),
+        ack_enabled: true,
+        ack_protocol: Some("as200".into()),
+        allow_plc_connection: true,
+        ..Default::default()
+    };
+    WorkerState::initialize_separate_journal(config.clone(), path.clone())
+        .await
+        .unwrap();
     let before = std::fs::read(&path).unwrap();
     let journal: serde_json::Value = serde_json::from_slice(&before).unwrap();
-    assert_eq!(journal["version"], 2);
+    assert_eq!(journal["version"], 4);
     assert_eq!(journal["source_key"], config.source_key);
-    assert!(journal["ack"]["intent"].is_null());
-    assert_eq!(journal["ack"]["accepted"], 0);
+    assert!(journal["published_ack"]["intent"].is_null());
+    assert_eq!(journal["published_ack"]["accepted"], 0);
     assert_eq!(journal["last_total"], 0);
-    assert!(WorkerState::initialize_separate_journal(config, path.clone()).await.is_err());
+    assert!(
+        WorkerState::initialize_separate_journal(config, path.clone())
+            .await
+            .is_err()
+    );
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
@@ -137,10 +221,25 @@ async fn interrupted_transition_blocks_autostart_and_legacy_endpoint_save() {
     let state = dir.state().await;
     let file = dir.0.join("as200_config.toml");
     std::fs::write(file.with_extension("connection-pending"), TEXT).unwrap();
-    state.clone().launch(Some(dir.0.clone()), crate::database::DatabaseState::default()).await;
+    state
+        .clone()
+        .launch(
+            Some(dir.0.clone()),
+            crate::database::DatabaseState::default(),
+        )
+        .await;
     assert_eq!(state.status.read().await.state, "STOPPED");
     assert!(!state.status.read().await.enabled);
-    let result = save(&state, Endpoint { ip: "127.0.0.1".into(), port: 1504, unit_id: 1 }, &revision(TEXT)).await;
+    let result = save(
+        &state,
+        Endpoint {
+            ip: "127.0.0.1".into(),
+            port: 1504,
+            unit_id: 1,
+        },
+        &revision(TEXT),
+    )
+    .await;
     assert!(result.err().unwrap().contains("chưa hoàn tất"));
     assert_eq!(std::fs::read_to_string(file).unwrap(), TEXT);
 }
@@ -168,7 +267,19 @@ impl Fixture {
         state
     }
     fn journal(&self, extra: serde_json::Value) {
-        let mut value = serde_json::json!({"version":2,"source_key":"settings-fixture","session_id":"confirmed-test-session","last_total":null,"pause":null,"warnings":[],"deliveries":[]});
+        let config = simulator_config::parse(TEXT).unwrap();
+        let binding = format!(
+            "published-ack-v1|{}|{}|{}|{}|{:?}|{}|{:?}|as200",
+            config.mode,
+            config.address,
+            config.unit_id,
+            config.source_key,
+            config.confirmed_session_id,
+            config.modbus_address_offset,
+            config.word_order
+        );
+        let mut value = serde_json::json!({"version":4,"source_key":"settings-fixture","session_id":"confirmed-test-session","last_total":null,"pause":null,"warnings":[],"deliveries":[],
+            "published_ack": {"binding": binding, "accepted": 0, "intent": null, "confirmed_receipt": null}});
         for (k, v) in extra.as_object().unwrap() {
             value[k] = v.clone();
         }
@@ -382,37 +493,56 @@ async fn missing_or_unconfirmed_journal_never_allows_endpoint_change() {
         std::fs::read_to_string(dir.0.join("as200_config.toml")).unwrap(),
         TEXT
     );
-    dir.journal(serde_json::json!({"version":1}));
-    let before = std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap();
-    save(&state, value(), &initial.revision).await.unwrap();
-    assert_eq!(
-        std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap(),
-        before
-    );
+    for version in [1, 2, 3] {
+        dir.journal(serde_json::json!({"version":version}));
+        let before = std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap();
+        assert_eq!(
+            save(&state, value(), &initial.revision)
+                .await
+                .err()
+                .expect("Legacy Journal must block endpoint changes"),
+            BUSY
+        );
+        assert_eq!(
+            std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("as200_config.toml")).unwrap(),
+            TEXT
+        );
+    }
 }
 
 #[tokio::test]
-async fn probe_is_single_fc03_validates_control_and_never_writes() {
+async fn probe_reads_stable_control_block_using_only_fc03_and_never_writes() {
     for valid in [true, false] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 12];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(request[6], 1);
-            assert_eq!(request[7], 3);
-            assert_eq!(u16::from_be_bytes([request[8], request[9]]), 24999);
-            assert_eq!(u16::from_be_bytes([request[10], request[11]]), 3);
-            let mut words = vec![0u16; 3];
-            words[0] = if valid { 1 } else { 99 };
-            words[1] = 240;
-            words[2] = 2;
-            let mut response = vec![request[0], request[1], 0, 0, 0, 9, 1, 3, 6];
-            for word in words {
-                response.extend(word.to_be_bytes());
+            // DataReady=0: a valid published snapshot reads the complete
+            // control block twice; a bad format is rejected on the first read.
+            for _ in 0..if valid { 2 } else { 1 } {
+                let mut request = [0; 12];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(request[6], 1);
+                assert_eq!(request[7], 3);
+                assert_eq!(u16::from_be_bytes([request[8], request[9]]), 24999);
+                assert_eq!(u16::from_be_bytes([request[10], request[11]]), 20);
+                let mut words = [0u16; 20];
+                words[0] = if valid { 1 } else { 99 };
+                words[1] = 240;
+                words[2] = 2;
+                // Remaining control fields, including Count/Ready/Done, are 0.
+                let mut response = request[..7].to_vec();
+                response[4..6].copy_from_slice(&43u16.to_be_bytes());
+                response.extend([3, 40]);
+                for word in words {
+                    response.extend(word.to_be_bytes());
+                }
+                stream.write_all(&response).await.unwrap();
             }
-            stream.write_all(&response).await.unwrap();
             let mut extra = [0u8; 12];
             assert_eq!(
                 tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut extra))
@@ -429,7 +559,16 @@ async fn probe_is_single_fc03_validates_control_and_never_writes() {
         });
         let mut cfg = simulator_config::parse(TEXT).unwrap();
         cfg.address = address.to_string();
-        assert_eq!(probe(cfg).await.is_ok(), valid);
+        let result = probe(cfg).await;
+        if valid {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("FormatVersion/RecordSize/BufferCount"),
+                "{error}"
+            );
+        }
         server.await.unwrap();
     }
 }
@@ -463,10 +602,7 @@ async fn first_installation_persists_only_endpoint_and_never_creates_identity_or
     let path = create_initial(&dir.0, &request).unwrap();
     let before = std::fs::read_to_string(&path).unwrap();
     let values: toml::Value = toml::from_str(&before).unwrap();
-    for key in [
-        "source_key",
-        "confirmed_session_id",
-    ] {
+    for key in ["source_key", "confirmed_session_id"] {
         assert!(values.get(key).is_none());
     }
     let cfg = simulator_config::parse(&before).unwrap();
@@ -499,7 +635,10 @@ async fn first_installation_persists_only_endpoint_and_never_creates_identity_or
 }
 
 /// Fake AS200 trả FC03 từ mảng register (D25000.., offset 0) cho đến khi client đóng socket.
-fn serve_registers(listener: tokio::net::TcpListener, words: Vec<u16>) -> tokio::task::JoinHandle<()> {
+fn serve_registers(
+    listener: tokio::net::TcpListener,
+    words: Vec<u16>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0u8; 12];
@@ -531,11 +670,19 @@ async fn test_connection_succeeds_when_registers_are_read_even_if_mapping_is_wro
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let server = serve_registers(listener, vec![0; 500]);
-    let warning = probe_link(probe_config(address.clone())).await.unwrap().unwrap();
-    assert!(warning.contains("đọc được = 0/0/0, cần 1/240/2"), "{warning}");
+    let warning = probe_link(probe_config(address.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        warning.contains("đọc được = 0/0/0, cần 1/240/2"),
+        "{warning}"
+    );
     server.await.unwrap();
     // Bật thu + ACK vẫn bắt buộc mapping đúng.
-    let listener = tokio::net::TcpListener::bind(address.as_str()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(address.as_str())
+        .await
+        .unwrap();
     let server = serve_registers(listener, vec![0; 500]);
     let error = probe(probe_config(address)).await.unwrap_err();
     assert!(error.starts_with("Đã kết nối và đọc được PLC"), "{error}");
@@ -547,7 +694,9 @@ async fn test_connection_without_warning_when_mapping_is_valid() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let mut words = vec![0u16; 500];
-    words[0] = 1; words[1] = 240; words[2] = 2;
+    words[0] = 1;
+    words[1] = 240;
+    words[2] = 2;
     let server = serve_registers(listener, words);
     assert_eq!(probe_link(probe_config(address)).await.unwrap(), None);
     server.await.unwrap();
