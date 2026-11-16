@@ -260,3 +260,73 @@
     justify-content: flex-start;
   }
 }
+.monitor-page { min-width: 0; }
+.monitor-top-grid { display: grid; grid-template-columns: minmax(0,1.25fr) minmax(0,1.25fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,.9fr) minmax(0,1.5fr); gap: 10px; margin-bottom: 16px; }
+.monitor-page .ant-card { min-width: 0; border-radius: 12px; }
+.monitor-top-grid > .ant-card > .ant-card-body { padding: 16px 14px; height: 100%; }
+.monitor-kicker { color: #486581; font-size: 17px; font-weight: 600; margin-bottom: 8px; letter-spacing: .03em; }
+.monitor-sku { order: 1; }
+.monitor-sku-value { display: block; font-size: 20px; color: #243b53; overflow-wrap: anywhere; line-height: 1.25; }
+.monitor-count small { font-size: 13px; line-height: 1.5; display: block; color: #627d98; margin: 7px 0 0; }
+.monitor-top-grid .add-measurement-plc-card { order: 2; margin-bottom: 0; }
+.monitor-count-ok { order: 3; background: #19764d; border-color: #19764d; }
+.monitor-count-ng { order: 4; background: #ba3938; border-color: #ba3938; }
+.monitor-count-total { order: 5; }
+.monitor-stations { order: 6; }
+.monitor-count > .ant-card-body > strong { display: block; font-size: clamp(30px, 2.7vw, 40px); font-variant-numeric: tabular-nums; line-height: 1.1; color: #243b53; overflow-wrap: anywhere; }
+.monitor-count-ok .monitor-kicker, .monitor-count-ng .monitor-kicker, .monitor-count-ok small, .monitor-count-ng small, .monitor-count-ok > .ant-card-body > strong, .monitor-count-ng > .ant-card-body > strong { color: white; }
+.monitor-station-columns { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+.monitor-station-columns b { font-size: 14px; }
+.monitor-station-counts { display: flex; gap: 4px; margin-top: 6px; }
+.monitor-station-counts span { flex: 1; padding: 6px 4px; font-size: 13px; background: #e8f5ed; color: #167451; border-radius: 5px; }
+.monitor-station-counts span:last-child { background: #fdebe9; color: #b43838; }
+.monitor-station-counts strong { display: block; font-size: 16px; overflow-wrap: anywhere; }
+.monitor-page .add-measurement-plc-main { flex-direction: column; align-items: stretch; gap: 8px; }
+.monitor-machine-state { display: block; font-size: 18px; color: #334e68; line-height: 1.3; }
+.monitor-machine-state-running { color: #19764d; font-weight: 700; }
+.monitor-page .add-measurement-plc-controls { justify-content: flex-start; gap: 6px; }
+.monitor-page .add-measurement-plc-controls .ant-tag { display: none; }
+.monitor-page .add-measurement-plc-controls .ant-btn { font-size: 14px; min-height: 34px; height: auto; padding: 6px 9px; white-space: normal; }
+.monitor-result-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); gap: 14px; margin-bottom: 16px; align-items: stretch; }
+.monitor-page .add-measurement-results { margin-bottom: 0; }
+.monitor-page .add-measurement-results > .ant-card-body, .monitor-bend > .ant-card-body, .monitor-recent > .ant-card-body { padding: 16px; }
+.monitor-current-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; }
+.monitor-current-heading h2 { font-size: 18px; font-weight: 600; margin: 0; color: #243b53; }
+.monitor-current-heading > span { font-size: 13px; color: #627d98; }
+.monitor-page .add-measurement-result-grid { gap: 8px; margin-bottom: 10px; }
+.monitor-page .add-measurement-result { min-height: 88px; padding: 10px; align-items: flex-start; text-align: left; border-radius: 8px; }
+.monitor-page .add-measurement-result span { font-size: 13px; }
+.monitor-page .add-measurement-result strong { font-size: 32px; }
+.monitor-page .add-measurement-result-overall.add-measurement-result-ng { background: #ba3938; }
+.monitor-page .add-measurement-result-overall.add-measurement-result-ok { background: #19764d; }
+.monitor-page .add-measurement-result-overall:not(.add-measurement-result-empty) span, .monitor-page .add-measurement-result-overall:not(.add-measurement-result-empty) strong { color: white; }
+.monitor-save-state { font-size: 13px; color: #627d98; margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.monitor-save-state .ant-tag { font-size: 13px; margin: 0; }
+.monitor-caption { font-size: 13px; color: #627d98; line-height: 1.6; margin: 10px 0 0; }
+.monitor-page .monitor-point-table .ant-table-cell { font-size: 14px; line-height: 1.5; padding: 10px 7px; overflow-wrap: anywhere; }
+.monitor-page .ant-tag { border-radius: 999px; }
+.monitor-point-table .ant-table-thead > tr > th, .monitor-recent .ant-table-thead > tr > th { font-weight: 600; white-space: normal; }
+.monitor-point-table .ant-tag, .monitor-recent .ant-tag { font-size: 13px; margin: 0; padding-inline: 7px; }
+.monitor-full-detail { margin-top: 12px; background: white; font-size: 13px; }
+.monitor-full-detail .measurement-details { display: flex; flex-direction: column; gap: 12px; }
+.monitor-page .ant-card-head { min-height: 46px; padding-inline: 16px; }
+.monitor-page .ant-card-head-title { font-size: 18px; font-weight: 600; white-space: normal; }
+.monitor-chart-settings { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; }
+.monitor-chart-settings > span { background: #eef3f7; border-radius: 6px; padding: 8px; font-size: 13px; color: #627d98; }
+.monitor-chart-settings b { display: block; color: #334e68; margin-top: 3px; }
+.monitor-chart-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 0; font-size: 13px; color: #627d98; }
+.monitor-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.monitor-chart-legend i { width: 14px; height: 3px; border-radius: 2px; }
+.monitor-chart-empty { display: flex; flex-direction: column; justify-content: center; min-height: 230px; padding: 24px 16px; margin-top: 12px; border-left: 1px solid #dce5ed; border-bottom: 1px solid #dce5ed; background: repeating-linear-gradient(to top, transparent 0, transparent 49px, #edf2f7 50px); }
+.monitor-chart-empty .monitor-caption { text-align: center; }
+.monitor-chart-axis { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 12px; font-size: 13px; color: #526b83; }
+.monitor-recent { margin: 16px 0 0; }
+.monitor-recent .ant-table-cell { font-size: 14px; line-height: 1.5; padding: 10px 8px; }
+.monitor-recent-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 4px; }
+.monitor-recent-actions .ant-btn { font-size: 13px; }
+@media (max-width: 1250px) {
+  .monitor-top-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
+}
+@media (max-width: 1000px) {
+  .monitor-result-grid { grid-template-columns: minmax(0,1fr); }
+}

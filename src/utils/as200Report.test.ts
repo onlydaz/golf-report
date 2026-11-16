@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
 
-import { buildReportTables, formatDecimal } from "./as200Report";
+import { buildReportTables, formatDecimal, isUnmeasuredPoint } from "./as200Report";
 import { createCsvBytes, createExcelBytes } from "./as200Export";
 import dayjs from "dayjs";
 import { formatReportTime, reportDateBoundary } from "./reportTime";
@@ -96,6 +96,18 @@ const record: MeasurementDetail = {
 };
 
 describe("AS200 display and export", () => {
+  it("distinguishes unused point padding from measured zero and conflicting point data", () => {
+    const unused = record.stations[0].points[1];
+    expect(isUnmeasuredPoint(unused)).toBe(true);
+    expect(isUnmeasuredPoint({ ...unused, position: "0" })).toBe(true);
+    expect(isUnmeasuredPoint({ ...unused, position: "12" })).toBe(false);
+    expect(isUnmeasuredPoint({ ...unused, attempts: record.stations[0].points[0].attempts })).toBe(false);
+    expect(isUnmeasuredPoint({ ...record.stations[0].points[0], position: "0" })).toBe(false);
+    const source = structuredClone(record);
+    source.stations[0].points[1].position = "0";
+    expect(buildReportTables([source]).points[1]["Position (mm)"]).toBe("");
+    expect(source.stations[0].points[1].position).toBe("0");
+  });
   it("uses an exclusive next-day boundary for single and multiple Vietnam days", () => {
     const start = reportDateBoundary(dayjs("2026-11-10"));
     const end = reportDateBoundary(dayjs("2026-11-10"), true);
@@ -224,5 +236,24 @@ describe("AS200 display and export", () => {
     expect(rows[0]["Mã sản phẩm"]).toBe(record.productCode);
     expect(rows[0]["Tải trọng TIP (g)"]).toBe(record.tipLoad);
     expect(rows[0]).not.toHaveProperty("PushDist (mm)");
+  });
+
+  it("exports CSV nested details without dropping unmeasured points, nulls, zero or decimal precision", () => {
+    const source = { ...record, productCode: "=unsafe" };
+    const bytes = createCsvBytes(buildReportTables([source]).measurements, [source]);
+    const rows = XLSX.utils.sheet_to_json<Record<string, string>>(
+      XLSX.read(bytes, { type: "array", raw: true }).Sheets.Sheet1, { defval: "" }
+    );
+    expect(rows).toHaveLength(3); // Two actual attempts and one point without attempts.
+    expect(rows[0]).toMatchObject({
+      "Mã sản phẩm": "'=unsafe", "Trạm đo": "TIP", "Tải trọng trạm (g)": record.tipLoad,
+      "Điểm đo": "1", "Lượt quyết định": "1", "PushDist (mm)": "0", "Bend (mm)": "-0.125",
+    });
+    expect(rows[1]).toMatchObject({ "Lượt đo": "2", "PushDist (mm)": "", "Bend (mm)": "1.234567890123456789" });
+    expect(rows[2]).toMatchObject({
+      "Điểm đo": "2", "Kết quả": "UNMEASURED", "Số lượt đo": "0",
+      "Lượt quyết định": "", "Vị trí đo (mm)": "", "Bend (mm)": "",
+    });
+    expect(source.productCode).toBe("=unsafe");
   });
 });

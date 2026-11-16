@@ -3,7 +3,7 @@ import ExcelJS from "exceljs";
 import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
-import { buildReportTables } from "./as200Report";
+import { buildReportTables, isUnmeasuredPoint } from "./as200Report";
 
 type ExportValue = string | number;
 type ExportRow = Record<string, ExportValue>;
@@ -35,6 +35,8 @@ const headerLabels: Record<string, string> = {
   "BUTT Result": "Kết quả BUTT",
   "BUTT Load (g)": "Tải trọng BUTT (g)",
   StationType: "Trạm đo",
+  "Station Load (g)": "Tải trọng trạm (g)",
+  "Station Result": "Kết quả trạm",
   PointNumber: "Điểm đo",
   "Position (mm)": "Vị trí đo (mm)",
   Result: "Kết quả",
@@ -61,10 +63,34 @@ const calculateColumnWidth = (
 };
 
 // Xuất CSV UTF-8 BOM
-export const createCsvBytes = (rows: ExportRow[]): Uint8Array => {
+export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[]): Uint8Array => {
+  const detailHeaders = ["StationType", "Station Load (g)", "Station Result", "PointNumber",
+    "Position (mm)", "Result", "AttemptCount", "DecideAttempt", "AttemptNumber", "PushDist (mm)", "Bend (mm)"];
+  // CSV is flat: repeat the measurement anchor for each actual point/attempt.
+  // Keep an empty detail row when a station/point has no samples; NULL stays blank.
+  if (details) {
+    const byId = new Map(buildReportTables(details).measurements.map(row => [row["Measurement ID"], row]));
+    rows = details.flatMap(item => {
+      const base = byId.get(item.id)!;
+      if (!item.stations.length) return [base];
+      return item.stations.flatMap(station => {
+        const stationRow = { ...base, StationType: station.stationType, "Station Load (g)": station.load, "Station Result": station.result };
+        if (!station.points.length) return [stationRow];
+        return station.points.flatMap(point => {
+          const pointRow = { ...stationRow, PointNumber: point.pointNumber, "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
+            Result: point.result, AttemptCount: point.attemptCount, DecideAttempt: point.decideAttempt ?? "" };
+          return point.attempts.length ? point.attempts.map(attempt => ({ ...pointRow,
+            AttemptNumber: attempt.attemptNumber, "PushDist (mm)": attempt.pushDist ?? "", "Bend (mm)": attempt.bend ?? "",
+          })) : [pointRow];
+        });
+      });
+    });
+  }
+  const headers = details ? [...exportHeaders, ...detailHeaders] : exportHeaders;
   // CSV has no text cell type. Prefix dangerous text with an apostrophe for Excel/WPS.
   // Only trusted numeric columns are exempt; never convert decimal strings to Number.
-  const numericColumns = new Set(["Measurement ID", "StickNo", "RecordSeq", "TotalCount", "TIP Load (g)", "BUTT Load (g)"]);
+  const numericColumns = new Set(["Measurement ID", "StickNo", "RecordSeq", "TotalCount", "TIP Load (g)", "BUTT Load (g)",
+    "Station Load (g)", "PointNumber", "Position (mm)", "AttemptCount", "DecideAttempt", "AttemptNumber", "PushDist (mm)", "Bend (mm)"]);
   const safeRows = rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [
     key,
     typeof value === "string" && !(numericColumns.has(key) && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) &&
@@ -72,12 +98,12 @@ export const createCsvBytes = (rows: ExportRow[]): Uint8Array => {
       ? `'${value}` : value,
   ])));
   const sheet = XLSX.utils.json_to_sheet(safeRows, {
-    header: exportHeaders,
+    header: headers,
   });
 
   XLSX.utils.sheet_add_aoa(
     sheet,
-    [exportHeaders.map(headerLabel)],
+    [headers.map(headerLabel)],
     { origin: "A1" }
   );
 

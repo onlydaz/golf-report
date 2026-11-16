@@ -1,16 +1,9 @@
-import {
-  BellOutlined,
-  DashboardOutlined,
-  FileTextOutlined,
-  HistoryOutlined,
-  PlusCircleOutlined,
-  SettingOutlined,
-} from "@ant-design/icons";
-
-import { Alert, Avatar, Button, Layout, Menu } from "antd";
-import { useEffect, useState } from "react";
+import { Alert, Button, Layout, Menu } from "antd";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, Outlet } from "react-router-dom";
 import type { MenuProps } from "antd";
+import { getAs200WorkerStatus, type As200Status } from "../services/as200Service";
+import { getPlcConnectionSettings, plcConnectionError, type PlcConnectionSettings } from "../services/plcConnectionService";
 
 import {
   getDatabaseStatus,
@@ -18,13 +11,13 @@ import {
   type DatabaseStatus,
 } from "../services/measurementService";
 
-const { Sider, Header, Content } = Layout;
+const { Sider, Content } = Layout;
 
 const menuItems: MenuProps["items"] = [
-  { key: "/dashboard", icon: <DashboardOutlined />, label: "Tổng quan" },
-  { key: "/measurements/add", icon: <PlusCircleOutlined />, label: "Ghi nhận kết quả đo" },
-  { key: "/measurements", icon: <HistoryOutlined />, label: "Lịch sử đo" },
-  { key: "/reports", icon: <FileTextOutlined />, label: "Báo cáo" },
+  { key: "/monitor", icon: <span className="sidebar-number">1</span>, label: "Giám sát" },
+  { key: "/measurements", icon: <span className="sidebar-number">2</span>, label: "Lịch sử" },
+  { key: "/reports", icon: <span className="sidebar-number">3</span>, label: "Báo cáo" },
+  { key: "/settings/connection", icon: <span className="sidebar-number">4</span>, label: "Kết nối PLC" },
 ];
 
 function MainLayout() {
@@ -37,10 +30,48 @@ function MainLayout() {
   });
 
   const [retrying, setRetrying] = useState(false);
+  const [status, setStatus] = useState<As200Status>();
+  const [settings, setSettings] = useState<PlcConnectionSettings>();
+  const [workerError, setWorkerError] = useState("");
+  const mounted = useRef(false);
+  const workerRequest = useRef(0);
+
+  const refreshWorker = useCallback(async () => {
+    const request = ++workerRequest.current;
+    try {
+      const next = await getAs200WorkerStatus();
+      if (mounted.current && request === workerRequest.current) {
+        setStatus(next);
+      }
+      const connection = await getPlcConnectionSettings();
+      if (mounted.current && request === workerRequest.current) {
+        setSettings(connection); setWorkerError("");
+      }
+      return next;
+    } catch (reason) {
+      if (mounted.current && request === workerRequest.current) {
+        setWorkerError(plcConnectionError(reason, "Không đọc được trạng thái hệ thống. Vui lòng thử lại."));
+      }
+      throw reason;
+    }
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try { await refreshWorker(); } catch { /* The shared error is rendered by consumers. */ }
+      if (active) timer = setTimeout(() => void poll(), 500);
+    };
+    void poll();
+    return () => {
+      active = false; mounted.current = false; ++workerRequest.current; clearTimeout(timer);
+    };
+  }, [refreshWorker]);
 
   const selectedKey =
-    location.pathname.startsWith("/measurements/") &&
-    location.pathname !== "/measurements/add"
+    location.pathname.startsWith("/measurements/")
       ? "/measurements"
       : location.pathname;
 
@@ -94,7 +125,7 @@ function MainLayout() {
 
   return (
     <Layout className="app-layout">
-      <Sider width={246} className="main-sider">
+      <Sider width={232} className="main-sider">
         <div className="brand">
           <div className="brand-mark">G</div>
 
@@ -116,70 +147,9 @@ function MainLayout() {
           onClick={({ key }) => navigate(key)}
         />
 
-        <div className="side-section">
-          HỆ THỐNG
-        </div>
-
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[selectedKey]}
-          onClick={({ key }) => navigate(key)}
-          items={[
-            {
-              key: "/settings/connection",
-              icon: <SettingOutlined />,
-              label: "Cài đặt kết nối",
-            },
-          ]}
-        />
       </Sider>
 
       <Layout>
-        <Header className="main-header">
-          <div className="header-context">
-            Quản lý và báo cáo kết quả đo
-          </div>
-
-          <div className="header-user">
-
-            {!databaseConnected &&
-              databaseStatus.state !== "CONNECTING" && (
-                <Button
-                  size="small"
-                  loading={retrying}
-                  onClick={retryConnection}
-                >
-                  Thử kết nối lại
-                </Button>
-              )}
-
-            <BellOutlined
-              style={{ color: "#627d98", fontSize: 17 }}
-            />
-
-            <Avatar
-              size={34}
-              style={{
-                background: "#d9eaf7",
-                color: "#1769aa",
-                fontWeight: 700,
-              }}
-            >
-              QA
-            </Avatar>
-
-            <div>
-              <div className="header-user-name">
-                Nhân viên QC
-              </div>
-              <div className="header-user-role">
-                Kiểm tra chất lượng
-              </div>
-            </div>
-          </div>
-        </Header>
-
         <Content className="main-content">
           {!databaseConnected && (
             <Alert
@@ -190,11 +160,12 @@ function MainLayout() {
               }
               showIcon
               message={databaseStatus.message}
+              action={databaseStatus.state !== "CONNECTING" ? <Button size="small" loading={retrying} onClick={() => void retryConnection()}>Thử kết nối lại</Button> : undefined}
               style={{ marginBottom: 20 }}
             />
           )}
 
-          <Outlet />
+          <Outlet context={{ status, settings, error: workerError, databaseConnected, refresh: refreshWorker }} />
         </Content>
       </Layout>
     </Layout>

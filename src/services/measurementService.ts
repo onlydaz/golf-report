@@ -126,6 +126,28 @@ export const retryDatabaseConnection = () =>
 export const getMeasurements = (request: MeasurementListRequest = {}) =>
   invoke<MeasurementListResponse>("get_measurements", { request });
 
+export interface MeasurementSkuSummary {
+  productCode: string;
+  firstMeasuredAt: string;
+  lastMeasuredAt: string;
+  total: number;
+  ok: number;
+  ng: number;
+  buttNg: number;
+  tipNg: number;
+}
+export interface MeasurementSkuPage { items: MeasurementSkuSummary[]; total: number; page: number; pageSize: number }
+export interface MeasurementHistoryItem extends BackendMeasurement {
+  decisionPoints: Array<{ measurementId: number; station: "BUTT" | "TIP"; pointNumber: number; bend: string | null }>;
+}
+export interface MeasurementHistoryPage { items: MeasurementHistoryItem[]; total: number; page: number; pageSize: number }
+export const getMeasurementSkus = (search = "", page = 1) =>
+  invoke<{ items: string[]; hasMore: boolean }>("get_measurement_skus", { search, page });
+export const getMeasurementSkuSummary = (request: MeasurementListRequest = {}) =>
+  invoke<MeasurementSkuPage>("get_measurement_sku_summary", { request });
+export const getMeasurementHistoryPage = (request: MeasurementListRequest = {}) =>
+  invoke<MeasurementHistoryPage>("get_measurement_history_page", { request });
+
 export const getMeasurementById = (id: number) =>
   invoke<MeasurementDetail>("get_measurement_by_id", { id });
 
@@ -133,6 +155,43 @@ export const getMeasurementStatistics = (
   request: MeasurementListRequest = {}
 ) =>
   invoke<MeasurementStatistics>("get_measurement_statistics", { request });
+
+export interface PointQualityStatistics {
+  productCode: string;
+  station: "BUTT" | "TIP";
+  pointNumber: number;
+  position: string | null;
+  measured: number;
+  ng: number;
+  retested: number;
+  loadAvg: string | null;
+  pushDistAvg: string | null;
+  bendCount: number;
+  bendMin: string | null;
+  bendAvg: string | null;
+  bendMax: string | null;
+  bendStddev: string | null;
+  histogram: Array<{ lower: string; upper: string; count: number }>;
+}
+export interface MeasurementQualityStatistics {
+  retestedClubs: number;
+  points: PointQualityStatistics[];
+  pointSummary: PointSummaryStatistics[];
+}
+export interface PointSummaryStatistics {
+  station: "BUTT" | "TIP";
+  pointNumber: number;
+  position: string | null;
+  loadAvg: string | null;
+  pushDistAvg: string | null;
+  bendMin: string | null;
+  bendAvg: string | null;
+  bendMax: string | null;
+  retested: number;
+  ng: number;
+}
+export const getMeasurementQualityStatistics = (request: MeasurementListRequest = {}) =>
+  invoke<MeasurementQualityStatistics>("get_measurement_quality_statistics", { request });
 
 export const getMeasurementReport = (
   request: MeasurementListRequest = {}

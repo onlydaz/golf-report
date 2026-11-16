@@ -7,7 +7,7 @@ import type {
   MeasurementResult,
 } from "../../services/measurementService";
 
-import { formatDecimal } from "../../utils/as200Report";
+import { formatDecimal, isUnmeasuredPoint } from "../../utils/as200Report";
 
 export function ResultTag({
   result,
@@ -142,7 +142,7 @@ export default function MeasurementDetails({
                   dataSource={[...station.points].sort(
                     (a, b) => a.pointNumber - b.pointNumber
                   )}
-                  scroll={{ x: 640 }}
+                  scroll={{ x: 1040 }}
                   columns={[
                     {
                       title: "Điểm",
@@ -153,14 +153,14 @@ export default function MeasurementDetails({
                     {
                       title: "Vị trí đo (mm)",
                       dataIndex: "position",
-                      render: formatDecimal,
+                      render: (value: string | null, point) => formatDecimal(isUnmeasuredPoint(point) ? null : value),
                       align: "right",
                       width: 160,
                     },
                     {
                       title: "Kết quả",
                       dataIndex: "result",
-                      render: (value: MeasurementResult) => (
+                      render: (value: MeasurementResult, point) => isUnmeasuredPoint(point) ? "—" : (
                         <ResultTag
                           result={value}
                           qcLabels={qcLabels}
@@ -172,6 +172,7 @@ export default function MeasurementDetails({
                     {
                       title: "Số lượt đo",
                       dataIndex: "attemptCount",
+                      render: (value: number, point) => isUnmeasuredPoint(point) ? "—" : value,
                       align: "center",
                       width: 115,
                     },
@@ -181,6 +182,28 @@ export default function MeasurementDetails({
                       render: (value: number | null) => value ?? "—",
                       align: "center",
                       width: 145,
+                    },
+                    {
+                      title: "Số lần đo lại",
+                      render: (_, point) => point.attemptCount > 0 ? point.attemptCount - 1 : "—",
+                      align: "center",
+                      width: 120,
+                    },
+                    {
+                      title: "PushDist quyết định (mm)",
+                      render: (_, point) => formatDecimal(point.attempts.find(
+                        attempt => attempt.attemptNumber === point.decideAttempt
+                      )?.pushDist),
+                      align: "right",
+                      width: 170,
+                    },
+                    {
+                      title: "Bend quyết định (mm)",
+                      render: (_, point) => formatDecimal(point.attempts.find(
+                        attempt => attempt.attemptNumber === point.decideAttempt
+                      )?.bend),
+                      align: "right",
+                      width: 160,
                     },
                   ]}
                   expandable={{

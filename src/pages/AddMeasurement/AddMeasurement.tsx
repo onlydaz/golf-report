@@ -1,14 +1,13 @@
 import { formatReportTime } from "../../utils/reportTime";
+import { formatDecimal } from "../../utils/as200Report";
 import {
   Alert,
   Button,
   Card,
-  Descriptions,
+  Collapse,
   Popconfirm,
   Space,
   Tag,
-  Spin,
-  Table,
   message,
   InputNumber,
 } from "antd";
@@ -16,27 +15,31 @@ import {
 import { useEffect, useState } from "react";
 import { useRef } from "react";
 import { PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
+import { getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
 import PageHeader from "../../components/PageHeader";
+import { BendComparison, CurrentPointTable, ProductionSummary, RecentMeasurements } from "./MonitorPanels";
 
 import {
-  getAs200WorkerStatus,
   acknowledgeAs200BufferGap,
   retryAs200Inbox,
-  type As200Status,
 } from "../../services/as200Service";
 
 import MeasurementDetails from "../../components/measurement/MeasurementDetails";
 import "./AddMeasurement.css";
-import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, stopPlcCollection, type PlcConnectionSettings } from "../../services/plcConnectionService";
+import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, stopPlcCollection } from "../../services/plcConnectionService";
 import { reconnectAs200Plc } from "../../services/as200Service";
 
 import {
   getMeasurementById,
+  getMeasurements,
+  getMeasurementStatistics,
+  type BackendMeasurement,
   type MeasurementDetail,
+  type MeasurementStatistics,
 } from "../../services/measurementService";
 
 function displayNotice(notice: string, fallback: string): string {
-  if (notice.startsWith("Chưa thiết lập kết nối")) return "Chưa thiết lập kết nối. Vào Cài đặt kết nối để nhập thông tin thiết bị đo.";
+  if (notice.startsWith("Chưa thiết lập kết nối")) return "Chưa thiết lập kết nối. Vào Kết nối PLC để nhập thông tin thiết bị đo.";
   if (/Cần kỹ thuật xác nhận thông số|Chưa xác nhận thiết lập kỹ thuật/.test(notice)) return "Chưa bật ghi nhận kết quả đo.";
   if (/SESSION_REQUEST_CANCELLED/.test(notice)) { return "Đã hủy yêu cầu đổi phiên và giữ nguyên dữ liệu, trạng thái xác nhận của phiên cũ."; }
   if (/Đã đối chiếu phiên mới/.test(notice)) { return "Đã đối chiếu và chấp nhận phiên kết nối mới. Dữ liệu phiên cũ vẫn được giữ nguyên."; }
@@ -175,9 +178,9 @@ function displayNotice(notice: string, fallback: string): string {
   return fallback;
 }
 
-const resultLabel = (value?: string) => value === "SKIPPED" ? "BỎ QUA"
+const resultLabel = (value?: string | null) => value === "SKIPPED" ? "BỎ QUA"
   : value === "UNMEASURED" ? "CHƯA ĐO" : value || "—";
-const resultTone = (value?: string) => value === "OK" ? "ok"
+const resultTone = (value?: string | null) => value === "OK" ? "ok"
   : value === "NG" ? "ng" : "empty";
 
 const states: Record<string, string> = {
@@ -198,53 +201,60 @@ const states: Record<string, string> = {
 };
 
 function AddMeasurement() {
-  const [status, setStatus] = useState<As200Status>();
-  const [settings, setSettings] = useState<PlcConnectionSettings>();
+  const { status, settings, error, databaseConnected, refresh: refreshWorker } = usePlcMonitor();
   const [collectionError, setCollectionError] = useState("");
   const [collectionAction, setCollectionAction] = useState<"stop" | "start" | "reconnect" | null>(null);
   const collectionInFlight = useRef(false);
-  const [error, setError] = useState("");
   const [retryId, setRetryId] = useState<number | null>(null);
   const [messageApi, holder] = message.useMessage();
+  const [recent, setRecent] = useState<BackendMeasurement[]>([]);
+  const [statistics, setStatistics] = useState<{ productCode: string; value: MeasurementStatistics }>();
+  const [monitorLoading, setMonitorLoading] = useState(false);
+  const [monitorError, setMonitorError] = useState("");
+  const [refreshIndex, setRefreshIndex] = useState(0);
+  const currentSku = status?.latest
+    && status.latest.sourceKey === status.sourceKey
+    && status.latest.sessionId === status.sessionId
+    && status.latest.productCode.trim()
+    ? status.latest.productCode : undefined;
+  const skuStatistics = databaseConnected && currentSku && statistics?.productCode === currentSku
+    ? statistics.value : undefined;
 
+  // Refresh stored data on the existing Worker's commit signal, not a second
+  // polling timer. Read-only API calls do not receive or process PLC deliveries.
   useEffect(() => {
     let active = true;
-    let timer: ReturnType<typeof setTimeout>;
-
-    const refresh = async () => {
+    setStatistics(undefined);
+    if (!databaseConnected) {
+      setMonitorLoading(false);
+      setMonitorError("Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
+      return;
+    }
+    setMonitorLoading(true); setMonitorError("");
+    void (async () => {
       try {
-        const next = await getAs200WorkerStatus();
-
-        if (active) {
-          setStatus(next);
-          setError("");
-          if (next.enabled && next.connection === "CONNECTED" && !next.pauseReason) {
-            setCollectionError("");
-          }
+        const response = await getMeasurements({ page: 1, pageSize: 12 });
+        if (!active) return;
+        setRecent(response.items);
+        if (currentSku) {
+          const stats = await getMeasurementStatistics({ productCode: currentSku });
+          if (active) setStatistics({ productCode: currentSku, value: stats });
         }
-        if (active) setSettings(await getPlcConnectionSettings());
       } catch {
-        if (active) {
-          setError(
-            "Không đọc được trạng thái hệ thống. Vui lòng thử lại."
-          );
-        }
-      } finally {
-        if (active) {
-          timer = setTimeout(() => void refresh(), 500);
-        }
-      }
-    };
+        if (active) setMonitorError("Không tải được dữ liệu giám sát đã lưu. Vui lòng thử làm mới.");
+      } finally { if (active) setMonitorLoading(false); }
+    })();
+    return () => { active = false; };
+  }, [databaseConnected, status?.lastSavedId, currentSku, refreshIndex]);
 
-    void refresh();
-
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, []);
+  useEffect(() => {
+    if (status?.enabled && status.connection === "CONNECTED" && !status.pauseReason) {
+      setCollectionError("");
+    }
+  }, [status]);
 
   const latest = status?.latest;
+  const displayed = latest ?? recent[0];
   const stoppedWithPendingData = status?.state === "STOPPED" && status.message.includes("dữ liệu chưa lưu");
   const safelyStopped = status?.state === "STOPPED" && !status.enabled && !stoppedWithPendingData;
   const collectionLabel = collectionAction ? collectionAction === "stop" ? "Đang dừng" : "Đang kết nối lại"
@@ -268,15 +278,13 @@ function AddMeasurement() {
         }
         await connectPlcCollection(current.endpoint, current.revision);
       }
-      const next = await getAs200WorkerStatus();
-      setStatus(next);
-      setSettings(await getPlcConnectionSettings());
+      const next = await refreshWorker();
       if (action === "reconnect" && (next.connection !== "CONNECTED" || next.pauseReason)) {
         throw "Chưa thể đọc lại PLC an toàn.";
       }
     } catch (reason) {
       console.error("PLC collection operation failed:", reason);
-      setStatus(await getAs200WorkerStatus().catch(() => undefined));
+      await refreshWorker().catch(() => undefined);
       setCollectionError(plcConnectionError(reason, action === "stop"
         ? "Chưa thể dừng thu dữ liệu an toàn. Vui lòng kiểm tra dữ liệu đang chờ."
         : "Chưa thể bắt đầu thu dữ liệu. Vui lòng kiểm tra kết nối và dữ liệu đang chờ."));
@@ -359,7 +367,7 @@ function AddMeasurement() {
     status.ackStatus !== "FAILED" && status.ackStatus !== "RECONCILIATION_REQUIRED" &&
     /Hết thời gian PostgreSQL|pool|database|inbox thất bại|Không lưu được journal|Journal lỗi/i.test(status.message) &&
     ["ERROR", "FAILED"].includes(status.state);
-  const committedId = latest?.measurementId;
+  const committedId = latest ? latest.measurementId : recent[0]?.id;
 
   const [detail, setDetail] = useState<MeasurementDetail>();
   const [detailError, setDetailError] = useState("");
@@ -370,9 +378,9 @@ function AddMeasurement() {
 
     setDetail(undefined);
     setDetailError("");
-    setDetailLoading(!!committedId);
+    setDetailLoading(!!committedId && databaseConnected);
 
-    if (committedId) {
+    if (committedId && databaseConnected) {
       void getMeasurementById(committedId)
         .then((value) => {
           if (active) {
@@ -396,7 +404,7 @@ function AddMeasurement() {
     return () => {
       active = false;
     };
-  }, [committedId]);
+  }, [committedId, databaseConnected]);
 
   const acknowledge = async () => {
     try {
@@ -412,30 +420,29 @@ function AddMeasurement() {
     }
   };
 
+  const displayStatus = getPlcDisplayStatus(status, error);
+  const activeDetail = detail && detail.id === committedId ? detail : undefined;
+  const receivedTime = latest?.receivedAt ?? recent[0]?.measuredAt;
+
   return (
-    <>
+    <div className="monitor-page">
       {holder}
 
-      <PageHeader
-        eyebrow="HỆ THỐNG ĐO TỰ ĐỘNG"
-        title="Ghi nhận kết quả đo"
-        description="Tự động tiếp nhận, hiển thị và lưu trữ kết quả đo từ hệ thống PLC."
-      />
+      <PageHeader eyebrow="GIÁM SÁT" title="1 · Giám sát" description="" />
 
+      <div className="monitor-top-grid">
+      <ProductionSummary productCode={currentSku}
+        statistics={skuStatistics} loading={monitorLoading} />
       <Card className="section-card add-measurement-plc-card">
         <div className="add-measurement-plc-main">
           <div className="add-measurement-plc-copy">
-            <div className="card-title">Thu dữ liệu PLC</div>
-            <div className="add-measurement-plc-detail">
-              {status?.address ? `${status.address} · Unit ID ${status.unitId}`
-                : settings?.endpoint ? `${settings.endpoint.ip}:${settings.endpoint.port} · Unit ID ${settings.endpoint.unitId}`
-                  : "Chưa xác định địa chỉ PLC"}
-            </div>
+            <div className="monitor-kicker">Trạng thái máy</div>
+            <strong className={`monitor-machine-state${!collectionAction && !stoppedWithPendingData && displayStatus.collectionLabel === "Đang thu dữ liệu" ? " monitor-machine-state-running" : ""}`}>{collectionAction || stoppedWithPendingData ? collectionLabel : displayStatus.collectionLabel}</strong>
           </div>
           <div className="add-measurement-plc-controls">
             <Tag color={collectionLabel === "Đang thu" ? "green" : collectionLabel === "Cần kiểm tra" || status?.connection === "DISCONNECTED" ? "red" : collectionLabel === "Đã dừng" ? "default" : "orange"}>{collectionLabel}</Tag>
             {status?.enabled && status.state !== "STOPPING" &&
-              <Button icon={<PauseCircleOutlined />} loading={collectionAction === "stop"} disabled={!!collectionAction} onClick={() => void changeCollection("stop")}>Dừng thu dữ liệu</Button>}
+              <Button danger icon={<PauseCircleOutlined />} loading={collectionAction === "stop"} disabled={!!collectionAction} onClick={() => void changeCollection("stop")}>Dừng thu dữ liệu</Button>}
             {status?.enabled && status.connection === "DISCONNECTED" && !status.pauseReason &&
               <Button icon={<WifiOutlined />} loading={collectionAction === "reconnect"} disabled={!!collectionAction} onClick={() => void changeCollection("reconnect")}>Kết nối lại PLC</Button>}
             {safelyStopped && settings?.configured && settings.endpoint && !settings.restartRequired &&
@@ -446,38 +453,39 @@ function AddMeasurement() {
         {resetConfirmationReady && <Alert className="add-measurement-plc-error" type="warning" showIcon message="Cần xác nhận phiên đo" description="Bộ đếm máy đo đã được đặt lại. Vui lòng xác nhận phiên đo mới để tiếp tục." />}
         {!collectionError && status?.enabled && status.connection === "DISCONNECTED" && status.pauseReason !== "RESET" && <Alert className="add-measurement-plc-error" type="error" showIcon message="Mất kết nối với máy đo. Đang thử kết nối lại..." />}
       </Card>
+      </div>
 
+      <div className="monitor-result-grid">
       <Card className="section-card add-measurement-results">
-        <div className="form-section-title">Kết quả đo gần nhất</div>
+        <div className="monitor-current-heading">
+          <h2>Gậy vừa kiểm tra · {displayed ? `#${displayed.clubNumber}` : "Chưa có dữ liệu"}</h2>
+          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Load Butt {formatDecimal(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} g / Tip {formatDecimal(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} g</span>
+        </div>
         <div className="add-measurement-result-grid">
-          {(["TIP", "BUTT", "OVERALL"] as const).map((station) => {
-            const value = station === "TIP" ? latest?.tipResult
-              : station === "BUTT" ? latest?.buttResult : latest?.overallResult;
+          {(["BUTT", "TIP", "OVERALL"] as const).map((station) => {
+            const value = station === "TIP" ? displayed?.tipResult
+              : station === "BUTT" ? displayed?.buttResult : displayed?.overallResult;
             return <div className={`add-measurement-result add-measurement-result-${resultTone(value)} ${station === "OVERALL" ? "add-measurement-result-overall" : ""}`} key={station}>
-              <span>{station === "OVERALL" ? "TỔNG THỂ" : station}</span>
+              <span>{station}</span>
               <strong>{resultLabel(value)}</strong>
             </div>;
           })}
         </div>
-        <Descriptions
-          className="add-measurement-summary"
-          column={{ xs: 1, sm: 2, lg: 3 }}
-          items={[
-            { key: "product", label: "Mã sản phẩm", children: latest?.productCode || "—" },
-            { key: "club", label: "Số gậy", children: latest?.clubNumber ?? "—" },
-            { key: "time", label: "Thời gian nhận", children: latest ? formatReportTime(latest.receivedAt) : "—" },
-            { key: "seq", label: "RecordSeq", children: latest?.recordSeq ?? "—" },
-            { key: "total", label: "Tổng số lượt đo", children: latest?.totalCount ?? "—" },
-            { key: "measurement", label: "Mã phép đo", children: latest?.measurementId ?? "—" },
-            { key: "save", label: "Trạng thái lưu dữ liệu", children: <Tag color={!latest ? "default" : latest.saveState === "PROCESSED" && latest.measurementId != null ? "green" : latest.saveState === "FAILED" ? "red" : "orange"}>
-              {!latest ? "Chưa có kết quả đo" : latest.inboxId && status?.blockedInboxIds.includes(latest.inboxId)
-                ? "Chờ kỹ thuật kiểm tra" : latest.saveState === "PROCESSED" && latest.measurementId != null ? "Đã lưu thành công"
-                  : latest.saveState === "PROCESSED" ? "Đang kiểm tra trạng thái lưu"
-                    : states[latest.saveState] ?? "Đang cập nhật trạng thái lưu"}
-            </Tag> },
-          ]}
-        />
+        {latest && (latest.saveState !== "PROCESSED" || latest.measurementId == null || !!latest.inboxId && status?.blockedInboxIds.includes(latest.inboxId)) && <div className="monitor-save-state">Trạng thái lưu dữ liệu <Tag color={latest.saveState === "FAILED" ? "red" : "orange"}>
+          {latest.inboxId && status?.blockedInboxIds.includes(latest.inboxId)
+            ? "Chờ kỹ thuật kiểm tra" : latest.saveState === "PROCESSED" ? "Đang kiểm tra trạng thái lưu"
+              : states[latest.saveState] ?? "Đang cập nhật trạng thái lưu"}
+        </Tag></div>}
+        {detailError && <Alert type="error" showIcon message={detailError} />}
+        <CurrentPointTable detail={activeDetail} loading={detailLoading} />
+        <p className="monitor-caption">Điểm NG được đo lại tối đa 4 lần; hiển thị lần đo quyết định.</p>
+        {activeDetail && <Collapse className="monitor-full-detail" items={[{ key: "attempts", label: "Xem tất cả lượt đo và thông tin bản ghi", children: <>
+          <p className="monitor-caption">SKU {displayed?.productCode} · RecordSeq {displayed?.recordSeq} · TotalCount {displayed?.totalCount ?? "—"} · Phép đo #{committedId}</p>
+          <MeasurementDetails data={activeDetail} qcLabels showGeneralInformation={false} />
+        </> }]} />}
       </Card>
+      <BendComparison />
+      </div>
 
       {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && !duplicateStorageNotice && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
         type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
@@ -557,60 +565,10 @@ function AddMeasurement() {
         </Card>
       )}
 
-      <Card className="section-card add-measurement-details-card">
-        <div className="form-section-title">
-          Chi tiết kết quả đo
-        </div>
+      <RecentMeasurements records={recent} detail={activeDetail} loading={monitorLoading} error={monitorError}
+        onRefresh={() => setRefreshIndex((value) => value + 1)} />
 
-        {detailLoading && <Spin />}
-        {detailError && (
-          <Alert
-            type="error"
-            showIcon
-            message={detailError}
-          />
-        )}
-        {detail && detail.id === committedId ? (
-          <MeasurementDetails
-            data={detail}
-            qcLabels
-            showGeneralInformation={false}
-          />
-        ) : (
-          <div className="measurement-details">
-            {(["TIP", "BUTT"] as const).map((station) => (
-              <Card className="section-card" title={`Trạm ${station}`} key={station}>
-                <Descriptions
-                  className="station-summary"
-                  column={{ xs: 1, sm: 2, lg: 4 }}
-                  items={[
-                    { key: "load", label: "Khối lượng đè (g)", children: "—" },
-                    { key: "result", label: "Kết quả", children: "—" },
-                    { key: "count", label: "Số điểm đo", children: "—" },
-                    { key: "ng", label: "Điểm NG", children: "—" },
-                  ]}
-                />
-                <Table
-                  className="measurement-point-table"
-                  size="small"
-                  rowKey="pointNumber"
-                  pagination={false}
-                  dataSource={[1, 2, 3, 4].map((pointNumber) => ({ pointNumber }))}
-                  scroll={{ x: 640 }}
-                  columns={[
-                    { title: "Điểm", dataIndex: "pointNumber", align: "center", width: 76 },
-                    { title: "Vị trí đo (mm)", render: () => "—", align: "right", width: 160 },
-                    { title: "Kết quả", render: () => "—", align: "center", width: 110 },
-                    { title: "Số lượt đo", render: () => "—", align: "center", width: 115 },
-                    { title: "Lượt quyết định", render: () => "—", align: "center", width: 145 },
-                  ]}
-                />
-              </Card>
-            ))}
-          </div>
-        )}
-      </Card>
-    </>
+    </div>
   );
 }
 

@@ -48,7 +48,13 @@ fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput
             } else {
                 Some(i32::from(point.decide_attempt))
             },
-            position: Some(real32_numeric(point.position)?),
+            // Workflow validation already proved unused slots contain no data.
+            // Keep all four point identities, but do not store padding zero as a measurement.
+            position: if index < value.point_count as usize && point.attempt_count > 0 {
+                Some(real32_numeric(point.position)?)
+            } else {
+                None
+            },
             attempts,
         });
     }

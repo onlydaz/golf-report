@@ -185,3 +185,103 @@ pub struct ResultDistribution {
     pub result: String,
     pub count: i64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementQualityStatistics {
+    pub retested_clubs: i64,
+    pub points: Vec<PointQualityStatistics>,
+    pub point_summary: Vec<PointSummaryStatistics>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointSummaryStatistics {
+    pub station: String,
+    pub point_number: i32,
+    pub position: Option<String>,
+    pub load_avg: Option<String>,
+    pub push_dist_avg: Option<String>,
+    pub bend_min: Option<String>,
+    pub bend_avg: Option<String>,
+    pub bend_max: Option<String>,
+    pub retested: i64,
+    pub ng: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointQualityStatistics {
+    pub product_code: String,
+    pub station: String,
+    pub point_number: i32,
+    pub position: Option<String>,
+    pub measured: i64,
+    pub ng: i64,
+    pub retested: i64,
+    pub load_avg: Option<String>,
+    pub push_dist_avg: Option<String>,
+    pub bend_count: i64,
+    pub bend_min: Option<String>,
+    pub bend_avg: Option<String>,
+    pub bend_max: Option<String>,
+    pub bend_stddev: Option<String>,
+    pub histogram: Vec<BendHistogramBin>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BendHistogramBin {
+    pub lower: String,
+    pub upper: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementSkuSummary {
+    pub product_code: String,
+    pub first_measured_at: DateTime<Utc>,
+    pub last_measured_at: DateTime<Utc>,
+    pub total: i64,
+    pub ok: i64,
+    pub ng: i64,
+    pub butt_ng: i64,
+    pub tip_ng: i64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementSkuPage {
+    pub items: Vec<MeasurementSkuSummary>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementSkuOptions {
+    pub items: Vec<String>,
+    pub has_more: bool,
+}
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryDecisionPoint {
+    pub measurement_id: i64,
+    pub station: String,
+    pub point_number: i32,
+    pub bend: Option<BigDecimal>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementHistoryItem {
+    #[serde(flatten)]
+    pub summary: MeasurementSummary,
+    pub decision_points: Vec<HistoryDecisionPoint>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementHistoryPage {
+    pub items: Vec<MeasurementHistoryItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}

@@ -122,10 +122,75 @@ fn unmeasured_is_preserved_and_unused_attempts_are_not_inserted() {
         for point in station.points {
             assert_eq!(point.result, MeasurementResult::Unmeasured);
             assert_eq!(point.decide_attempt, None);
+            assert_eq!(point.position, None);
             assert!(point.attempts.is_empty());
         }
     }
 }
+#[test]
+fn butt_point_count_preserves_one_or_four_points_and_rejects_conflicting_raw() {
+    let mut one = input(1, 1, Some("confirmed"), "butt-one");
+    one.raw_registers[24] = 2; // BUTT NG, stops at P1 after four attempts.
+    one.raw_registers[25] = 1;
+    one.raw_registers[26] = 1;
+    one.raw_registers[32] = 2;
+    one.raw_registers[54..120].fill(0); // Preserve the three unused slots as raw padding.
+    let inbox = row(one.clone());
+    let draft = draft_from_inbox(&inbox).unwrap();
+    let butt = draft
+        .stations
+        .iter()
+        .find(|s| s.station_type == StationType::Butt)
+        .unwrap();
+    assert_eq!(butt.point_count, 1);
+    assert_eq!(butt.points.len(), 4);
+    assert_eq!(butt.result, MeasurementResult::Ng);
+    assert_eq!(draft.overall_result, MeasurementResult::Ng);
+    assert_eq!(butt.points[0].attempts.len(), 4);
+    assert!(butt.points[0].position.is_some()); // A genuinely measured zero remains zero.
+    for point in &butt.points[1..] {
+        assert_eq!(point.result, MeasurementResult::Unmeasured);
+        assert_eq!(point.position, None);
+        assert_eq!(point.decide_attempt, None);
+        assert_eq!(point.attempt_count, 0);
+        assert!(point.attempts.is_empty());
+    }
+    assert_eq!(
+        inbox.raw_registers,
+        serde_json::to_value(&one.raw_registers).unwrap()
+    );
+
+    let mut four = input(1, 1, Some("confirmed"), "butt-four");
+    four.raw_registers[24] = 2;
+    four.raw_registers[26] = 4;
+    four.raw_registers[98] = 2; // P4 NG must never be truncated.
+    let draft = draft_from_inbox(&row(four)).unwrap();
+    let butt = draft
+        .stations
+        .iter()
+        .find(|s| s.station_type == StationType::Butt)
+        .unwrap();
+    assert_eq!(butt.point_count, 4);
+    assert_eq!(butt.points[3].result, MeasurementResult::Ng);
+    assert_eq!(butt.points[3].attempts.len(), 4);
+    assert_eq!(butt.points[3].decide_attempt, Some(4));
+    assert_eq!(butt.result, MeasurementResult::Ng);
+    assert_eq!(draft.overall_result, MeasurementResult::Ng);
+
+    let mut conflicting = one;
+    conflicting.raw_registers[54] = 1; // Data for P2 outside PointCount=1.
+    conflicting.raw_registers[55] = 1;
+    conflicting.raw_registers[56] = 1;
+    let inbox = row(conflicting);
+    let before = inbox.raw_registers.clone();
+    assert!(
+        draft_from_inbox(&inbox)
+            .unwrap_err()
+            .contains("AS200_WORKFLOW")
+    );
+    assert_eq!(inbox.raw_registers, before);
+}
+
 #[test]
 fn missing_or_control_character_product_code_never_becomes_a_draft() {
     for value in [0_u16, 9_u16] {

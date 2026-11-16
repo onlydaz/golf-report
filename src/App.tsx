@@ -4,7 +4,6 @@ import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import MainLayout from "./layouts/MainLayout";
 import AddMeasurement from "./pages/AddMeasurement/AddMeasurement";
-import Dashboard from "./pages/Dashboard/Dashboard";
 import ConnectionSettings from "./pages/ConnectionSettings/ConnectionSettings";
 import "./App.css";
 
@@ -35,9 +34,10 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route element={<MainLayout />}>
-            <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/measurements/add" element={<AddMeasurement />} />
+            <Route index element={<Navigate to="/monitor" replace />} />
+            <Route path="/monitor" element={<AddMeasurement />} />
+            <Route path="/dashboard" element={<Navigate to="/monitor" replace />} />
+            <Route path="/measurements/add" element={<Navigate to="/monitor" replace />} />
             <Route path="/measurements" element={
               <Suspense fallback={<Spin size="large" />}>
                 <MeasurementHistory />
@@ -54,6 +54,7 @@ function App() {
               </Suspense>
             } />
             <Route path="/settings/connection" element={<ConnectionSettings />} />
+            <Route path="*" element={<Navigate to="/monitor" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>

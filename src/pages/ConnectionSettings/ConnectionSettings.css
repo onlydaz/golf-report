@@ -1,7 +1,13 @@
 
 .plc-settings-page {
   width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
 }
+
+.plc-settings-page .page-heading { margin-bottom: 0; }
 
 .plc-settings-card {
   width: 100%;
@@ -16,8 +22,8 @@
 
 .plc-settings-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(300px, .85fr);
-  gap: 32px;
+  grid-template-columns: minmax(280px, .9fr) minmax(0, 1.1fr);
+  gap: 28px;
 }
 
 .plc-settings-panel {
@@ -154,6 +160,22 @@
   overflow-wrap: anywhere;
 }
 
+.plc-settings-status .ant-tag { white-space: normal; margin: 0; }
+.plc-status-subtitle { margin: 24px 0 14px; font-size: 14px; color: #334e68; }
+.plc-live-registers { gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.plc-live-registers > div { display: block; }
+.plc-live-registers dd { margin-top: 3px; font-size: 13px; }
+.plc-settings-note { margin: 14px 0 0; color: #627d98; font-size: 12px; line-height: 1.6; }
+.plc-status-error { margin-top: 16px; }
+.plc-technical-details { background: white; border-color: #e3ebf3; }
+.plc-memory-map { display: grid; gap: 10px; }
+.plc-memory-map > div { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 16px; padding: 12px; border-radius: 8px; background: #f5f8fb; }
+.plc-memory-map b { color: #1769aa; font-size: 13px; }
+.plc-memory-map span { color: #526b83; font-size: 13px; }
+.plc-technical-status { margin-top: 20px; }
+.plc-technical-status > div { grid-template-columns: minmax(180px, 32%) minmax(0, 1fr); }
+.plc-connection-events .ant-empty { margin: 4px 0; }
+
 .plc-settings-status small {
   display: block;
   color: #627d98;
@@ -165,7 +187,7 @@
   color: #b42318;
 }
 
-@media (max-width: 1150px) {
+@media (max-width: 1000px) {
   .plc-settings-grid {
     grid-template-columns: 1fr;
     gap: 22px;

@@ -1,0 +1,19 @@
+# Người phụ trách xác nhận đúng nguồn vật lý, PLC đã reset và không còn phép đo bị bỏ sót lúc 2026-11-16 12:03:57.419420600 UTC.
+ack_enabled = true
+ack_protocol = "as200"
+address = "127.0.0.1:1503"
+allow_plc_connection = true
+allow_plc_heartbeat_write = false
+confirmed_session_id = "qc-reset-1794830637266952100-7812"
+enabled = true
+journal_path = 'C:\Users\Daz\Desktop\TT\golf-report\local-runtime/managed-sources\qc-reset-1794830637266952100-7812\capture.json'
+modbus_address_offset = 0
+mode = "modbus"
+pc_heartbeat_enabled = false
+plc_heartbeat_timeout_ms = 5000
+poll_interval_ms = 500
+source_key = "as200-da8ebc3ca2dc09cb"
+technical_setup_confirmed = true
+timeout_ms = 2000
+unit_id = 1
+word_order = "LOW"

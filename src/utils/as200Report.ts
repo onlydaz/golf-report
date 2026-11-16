@@ -1,5 +1,13 @@
 import { formatReportTime } from "./reportTime";
-import type { MeasurementDetail } from "../services/measurementService";
+import type { MeasurementDetail, MeasurementPoint } from "../services/measurementService";
+
+// Old records may contain padding position=0. Only a wholly unused point is empty;
+// do not hide conflicting attempts or a nonzero position behind a display placeholder.
+export function isUnmeasuredPoint(point: MeasurementPoint): boolean {
+  return ["UNMEASURED", "SKIPPED"].includes(String(point.result))
+    && point.attemptCount === 0 && point.decideAttempt == null && point.attempts.length === 0
+    && (point.position == null || Number(point.position) === 0);
+}
 
 export function formatDecimal(value: string | null | undefined): string {
   if (value == null) return "—";
@@ -49,7 +57,7 @@ export function buildReportTables(records: MeasurementDetail[]) {
         "Measurement ID": item.id,
         StationType: station.stationType,
         PointNumber: point.pointNumber,
-        "Position (mm)": point.position ?? "",
+        "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
         Result: point.result,
         AttemptCount: point.attemptCount,
         DecideAttempt: point.decideAttempt ?? "",

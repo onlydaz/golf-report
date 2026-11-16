@@ -67,3 +67,49 @@ pub async fn get_measurement_report(
     let pool = state.pool().await?;
     crate::repositories::MeasurementRepository::report(&pool, &request.unwrap_or_default()).await
 }
+
+#[tauri::command]
+pub async fn get_measurement_quality_statistics(
+    state: State<'_, DatabaseState>,
+    request: Option<MeasurementListRequest>,
+) -> Result<crate::models::MeasurementQualityStatistics, String> {
+    let pool = state.pool().await?;
+    crate::repositories::MeasurementRepository::quality_statistics(
+        &pool,
+        &request.unwrap_or_default(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_measurement_skus(
+    state: State<'_, DatabaseState>,
+    search: Option<String>,
+    page: Option<i64>,
+) -> Result<crate::models::MeasurementSkuOptions, String> {
+    let pool = state.pool().await?;
+    crate::repositories::MeasurementRepository::sku_options(
+        &pool,
+        search.as_deref().unwrap_or(""),
+        page.unwrap_or(1),
+    )
+    .await
+}
+#[tauri::command]
+pub async fn get_measurement_sku_summary(
+    state: State<'_, DatabaseState>,
+    request: Option<MeasurementListRequest>,
+) -> Result<crate::models::MeasurementSkuPage, String> {
+    let pool = state.pool().await?;
+    crate::repositories::MeasurementRepository::sku_summary(&pool, &request.unwrap_or_default())
+        .await
+}
+#[tauri::command]
+pub async fn get_measurement_history_page(
+    state: State<'_, DatabaseState>,
+    request: Option<MeasurementListRequest>,
+) -> Result<crate::models::MeasurementHistoryPage, String> {
+    let pool = state.pool().await?;
+    crate::repositories::MeasurementRepository::history_page(&pool, &request.unwrap_or_default())
+        .await
+}

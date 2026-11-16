@@ -22,7 +22,7 @@ body,
 
 body {
   margin: 0;
-  min-width: 1024px;
+  min-width: 760px;
   background: #f4f7fa;
 }
 
@@ -41,12 +41,15 @@ select {
 .app-layout > .ant-layout {
   height: 100%;
   min-height: 0;
+  min-width: 0;
+  margin-left: 232px;
 }
 
 .main-sider {
-  position: sticky;
-  top: 0;
-  height: 100vh;
+  position: fixed;
+  inset: 0 auto 0 0;
+  height: 100%;
+  z-index: 10;
   overflow-y: auto;
   border-right: 1px solid rgba(255,255,255,0.06);
 }
@@ -101,58 +104,24 @@ select {
 }
 
 .main-sider .ant-menu-item {
+  font-size: 16px;
   margin-block: 4px;
   height: 44px;
   line-height: 44px;
 }
 
-.main-header {
-  flex: 0 0 72px;
-  min-width: 0;
-  height: 72px;
-  padding: 0 34px;
-  border-bottom: 1px solid #e6edf3;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.header-context {
-  min-width: 0;
-  overflow: hidden;
-  color: #829ab1;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.header-user {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 12px;
-  white-space: nowrap;
-}
-
-.header-user-name {
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 18px;
-  color: #243b53;
-}
-
-.header-user-role {
-  color: #829ab1;
-  font-size: 11px;
-  line-height: 16px;
-}
+.main-sider .ant-layout-sider-children { display: flex; flex-direction: column; min-height: 100%; }
+.main-sider .ant-menu { flex: 0 0 auto; }
+.main-sider .sidebar-number { display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px; border-radius: 6px; background: rgba(255,255,255,.1); color: #d9e8f4; font-weight: 700; }
+.main-sider .ant-menu-item-selected { background: #2367a4; font-weight: 600; }
+.main-sider .ant-menu-item-selected .sidebar-number { background: white; color: #1769aa; }
 
 .main-content {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 30px 34px 42px;
+  padding: 22px 28px 32px;
   max-width: 1600px;
   width: 100%;
   margin: 0 auto;
@@ -161,9 +130,41 @@ select {
 .page-heading {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 26px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-bottom: 16px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid #dce5ed;
 }
+
+.page-heading > div {
+  min-width: 0;
+}
+
+.page-header-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.page-status {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+  max-width: 100%;
+}
+
+.page-status-pill { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 11px; border-radius: 999px; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.page-status-pill i { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.page-status-connected { background: #e5f4eb; color: #187849; }
+.page-status-recording, .page-status-error { background: #fdece9; color: #bc3a32; }
+.page-status-unverified { background: #edf1f5; color: #526b83; }
+.page-heading .page-title { font-size: 26px; font-weight: 700; }
 
 .eyebrow {
   color: #2f80c1;
@@ -174,9 +175,9 @@ select {
 }
 
 .page-title {
-  margin: 5px 0 0;
+  margin: 0;
   font-family: "Space Grotesk";
-  font-size: 28px;
+  font-size: 25px;
   line-height: 1.2;
   color: #102a43;
   letter-spacing: -0.7px;
@@ -487,27 +488,6 @@ select {
 @media (max-width: 1150px) {
   .tip-form-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 1150px) {
-  .main-header {
-    padding-inline: 20px;
-    gap: 16px;
-  }
-
-  .header-context {
-    flex: 1 1 auto;
-  }
-}
-
-@media (max-width: 900px) {
-  .header-context {
-    display: none;
-  }
-
-  .main-header {
-    justify-content: flex-end;
   }
 }
 
