@@ -15,12 +15,11 @@ import {
 import { useEffect, useState } from "react";
 import { useRef } from "react";
 import { EditOutlined, LoadingOutlined, PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
-import { getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
+import { getMeasurementAvailabilityNotice, getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
 import PageHeader from "../../components/PageHeader";
 import { BendComparison, CurrentPointTable, ProductionSummary, RecentMeasurements } from "./MonitorPanels";
 
 import {
-  acknowledgeAs200BufferGap,
   retryAs200Inbox,
 } from "../../services/as200Service";
 
@@ -38,10 +37,10 @@ import {
 } from "../../services/measurementService";
 
 function displayNotice(notice: string, fallback: string): string {
-  if (/^(?:PUBLISHED_DATA:\s*)?Bản ghi PLC chưa hoàn chỉnh hoặc lỗi giải mã:/.test(notice)) {
-    return notice.replace(/^PUBLISHED_DATA:\s*/, "");
+  if (/\braw\b|RAW_|240\s*WORD|D25020|D25259|\binbox\b|RecordSeq|TotalCount/i.test(notice)) {
+    return plcConnectionError(notice, fallback);
   }
-  if (/raw chưa giải mã|raw chính thức|RAW_UNDECODED/i.test(notice)) {
+  if (/^(?:PUBLISHED_DATA:\s*)?Bản ghi PLC chưa hoàn chỉnh hoặc lỗi giải mã:/.test(notice)) {
     return notice.replace(/^PUBLISHED_DATA:\s*/, "");
   }
   if (notice.startsWith("Chưa thiết lập kết nối")) return "Chưa thiết lập kết nối. Vào Kết nối PLC để nhập thông tin thiết bị đo.";
@@ -369,7 +368,8 @@ function AddMeasurement() {
       setCollectionAction(null);
     }
   };
-  const showSystemNotice = !!error || !!status && (
+  const measurementAvailabilityNotice = getMeasurementAvailabilityNotice(status);
+  const showSystemNotice = !!measurementAvailabilityNotice || !!error || !!status && (
     !status.enabled || ["STOPPING", "ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || !!status.pauseReason ||
     status.connection === "DISCONNECTED" ||
     status.enabled && status.plcHealth !== "RUNNING" ||
@@ -378,7 +378,7 @@ function AddMeasurement() {
   );
   const resetNeedsReview = !error && status?.pauseReason === "RESET";
   const hasIndependentDataRisk = !!status && (
-    status.volatileCount > 0 || status.blockedInboxCount > 0 || latest?.saveState === "FAILED" ||
+    status.blockedInboxCount > 0 || latest?.saveState === "FAILED" ||
     status.ackStatus === "FAILED" || status.ackStatus === "RECONCILIATION_REQUIRED" ||
     status.warnings.some((warning) => /BUFFER GAP|OVERFLOW|QUEUE_FULL|CONFLICT|LOCAL_HISTORY_MISSING|DIAGNOSTIC_FULL|INBOX_RETRY_BLOCKED/.test(warning))
   );
@@ -398,7 +398,7 @@ function AddMeasurement() {
     } else if (status.ackStatus === "FAILED") {
       systemNotice = "Chưa nhận được xác nhận đã đọc từ PLC. Vui lòng liên hệ kỹ thuật nếu cảnh báo kéo dài.";
     } else if (status.state === "RAW_UNDECODED") {
-      systemNotice = status.message;
+      systemNotice = measurementAvailabilityNotice!;
     } else if (["ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || status.pauseReason) {
       systemNotice = displayNotice(status.message, states[status.state] ?? "Có lỗi cần kiểm tra.");
     } else if (latest?.saveState === "FAILED") {
@@ -416,7 +416,7 @@ function AddMeasurement() {
     } else if (status.plcHealth === "UNCONFIGURED") {
       systemNotice = "Chưa cấu hình giám sát hoạt động PLC. Vui lòng liên hệ kỹ thuật.";
     } else if (status.plcHealth === "INVALID_DATA") {
-      systemNotice = `Đã kết nối PLC nhưng dữ liệu không khớp register map AS200: ${status.message}`;
+      systemNotice = "Đã kết nối PLC nhưng dữ liệu chưa hợp lệ. Vui lòng liên hệ kỹ thuật kiểm tra cấu hình máy đo.";
     } else if (status.plcHealth === "DISCONNECTED") {
       systemNotice = "Không kiểm tra được tín hiệu hoạt động PLC. Đang thử kết nối lại.";
     } else {
@@ -436,15 +436,6 @@ function AddMeasurement() {
   ) && visibleWarnings.some((warning) => warning.severity === "error");
   const resetActionError = resetNeedsReview && collectionError !== "RESET_CONFIRMATION_REQUIRED" &&
     /reset|counter|phiên|ACK|Journal|quarantine/i.test(collectionError);
-  const pendingStorageFailure = !!status?.volatileCount && (
-    ["ERROR", "FAILED", "PAUSED", "STOPPING", "STOPPED"].includes(status.state) ||
-    status.connection === "DISCONNECTED" || !!status.pauseReason
-  );
-  const journalWriteFailure = !!status?.volatileCount && /Không lưu được journal|Journal lỗi|Không thể đọc hoặc lưu dữ liệu chờ/i.test(status.message);
-  const duplicateStorageNotice = !error && !!status?.volatileCount &&
-    status.ackStatus !== "FAILED" && status.ackStatus !== "RECONCILIATION_REQUIRED" &&
-    /Hết thời gian PostgreSQL|pool|database|inbox thất bại|Không lưu được journal|Journal lỗi/i.test(status.message) &&
-    ["ERROR", "FAILED"].includes(status.state);
   const committedId = latest ? latest.measurementId : storedLatest?.id;
 
   const [detail, setDetail] = useState<MeasurementDetail>();
@@ -483,20 +474,6 @@ function AddMeasurement() {
       active = false;
     };
   }, [committedId, databaseConnected]);
-
-  const acknowledge = async () => {
-    try {
-      await acknowledgeAs200BufferGap();
-
-      messageApi.info(
-        "Đã gửi xác nhận kiểm tra dữ liệu. Cảnh báo vẫn được lưu trong nhật ký."
-      );
-    } catch {
-      messageApi.error(
-        "Không thể tiếp tục tiếp nhận kết quả đo. Vui lòng kiểm tra cảnh báo."
-      );
-    }
-  };
 
   const displayStatus = getPlcDisplayStatus(status, error);
   const activeDetail = detail && detail.id === committedId ? detail : undefined;
@@ -573,25 +550,15 @@ function AddMeasurement() {
           && !!activeDetail && activeDetail.productCode === currentSku ? activeDetail.sourceId : undefined} />
       </div>
 
-      {status?.rawCapture && <Alert
-        className="add-measurement-plc-error" type={status.ackStatus === "ACKNOWLEDGED" ? "info" : "warning"} showIcon
-        message={`Đã lưu raw 240 WORD vào Inbox #${status.rawCapture.inboxId}; chưa tạo measurement. ${status.ackStatus === "ACKNOWLEDGED" ? "PLC đã xác nhận ACK." : status.ackStatus === "DISABLED" ? "ACK đã tắt." : "ACK đang chờ hoặc cần đối chiếu."}`}
-        description={<span title={status.rawCapture.rawRegisters.join(", ")}>D25020–D25259: {status.rawCapture.rawRegisters.join(", ")}. Raw chính thức được giữ để đối chiếu; không đi vào thống kê OK/NG khi chưa đủ cấu trúc.</span>}
-      />}
-      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && !duplicateStorageNotice && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
+      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
         type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
         showIcon
         className="add-measurement-alert"
         message={systemNotice}
-        description={resetNeedsReview && systemNotice === "Cần kiểm tra kết nối máy đo" ? "Dữ liệu từ PLC chưa được xác nhận đầy đủ. Vui lòng liên hệ kỹ thuật trước khi tiếp tục thu." : undefined}
+        description={measurementAvailabilityNotice && systemNotice !== measurementAvailabilityNotice ? measurementAvailabilityNotice
+          : resetNeedsReview && systemNotice === "Cần kiểm tra kết nối máy đo" ? "Dữ liệu từ PLC chưa được xác nhận đầy đủ. Vui lòng liên hệ kỹ thuật trước khi tiếp tục thu." : undefined}
       />}
 
-      {(status?.manualRetryResults?.length ?? 0) > 0 && (
-        <Alert type="info" showIcon message="Yêu cầu thử lại kết quả đo"
-          description={status?.manualRetryResults.map((r) => (
-            <div key={r.inboxId}>Mã tiếp nhận {r.inboxId}: {{ PENDING: "Đang chờ", WAITING: "Chờ kết nối để thử lại", APPLIED: "Đã chuyển lịch xử lý (chưa xác nhận lưu phép đo)", REJECTED: "Yêu cầu bị từ chối" }[r.state]}{r.error ? ` — ${r.error}` : ""}</div>
-          ))} />
-      )}
       {(status?.blockedInboxCount ?? 0) > 0 && (
         <Alert className="add-measurement-retry-alert" type="warning" showIcon style={{ marginBottom: 16 }}
           message={`${status?.blockedInboxCount} kết quả chờ kỹ thuật kiểm tra trước khi thử lại.`}
@@ -602,18 +569,6 @@ function AddMeasurement() {
               <Button disabled={!retryId}>Yêu cầu thử lại</Button>
             </Popconfirm>
           </Space>} />
-      )}
-
-      {(status?.volatileCount ?? 0) > 0 && (pendingStorageFailure || journalWriteFailure) && (
-        <Alert
-          type="error"
-          showIcon
-          style={{ marginBottom: 16 }}
-          message={`${status?.volatileCount} kết quả đo chưa lưu được vào PostgreSQL.`}
-          description={journalWriteFailure
-            ? "Chưa xác nhận được dữ liệu chờ đã lưu an toàn vào Journal. Vui lòng liên hệ kỹ thuật; không đóng ứng dụng."
-            : "Dữ liệu đang chờ trong Journal trên máy, chưa được xác nhận lưu vào PostgreSQL. Vui lòng kiểm tra nguyên nhân trước khi tiếp tục."}
-        />
       )}
 
       {(visibleWarnings.length > 0 || (status?.pauseReason && status.pauseReason !== "RESET")) && (
@@ -628,24 +583,7 @@ function AddMeasurement() {
               />
             ))}
 
-            {(status?.pauseReason === "OVERFLOW" ||
-              status?.pauseReason === "QUEUE_FULL") && (
-              <Popconfirm
-                title="Đã kiểm tra nguy cơ mất kết quả đo?"
-                description="Tiếp tục không khôi phục được các kết quả đo đã bị ghi đè. Cảnh báo vẫn được lưu."
-                okText="Đã kiểm tra, tiếp tục"
-                cancelText="Hủy"
-                onConfirm={() => void acknowledge()}
-              >
-                <Button>
-                  Tiếp tục sau khi kiểm tra dữ liệu
-                </Button>
-              </Popconfirm>
-            )}
-
-            {status?.pauseReason && status.pauseReason !== "RESET" &&
-              status.pauseReason !== "OVERFLOW" &&
-              status.pauseReason !== "QUEUE_FULL" && (
+            {status?.pauseReason && status.pauseReason !== "RESET" && (
                 <p>
                   {status.pauseReason === "DIAGNOSTIC_FULL"
                     ? "Vui lòng liên hệ kỹ thuật để kiểm tra vùng lưu chẩn đoán. Giữ nguyên dữ liệu chờ."

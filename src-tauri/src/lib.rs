@@ -75,10 +75,8 @@ pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
                 inspect(&entry.map_err(|_| "Không đọc được runtime PLC.")?.path())?;
             }
         } else if path.file_name().is_some_and(|name| name == "capture.json") {
-            OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|_| "Không có quyền ghi Journal PLC; chưa bật thu hoặc ACK.")?;
+            fs::File::open(path)
+                .map_err(|_| "Không đọc được bằng chứng Journal PLC cũ để đối chiếu.")?;
         }
         Ok(())
     }
@@ -133,7 +131,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(database::DatabaseState::default())
         .manage(plc::worker::WorkerState::default())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
@@ -147,7 +144,7 @@ pub fn run() {
                 Ok(dir)
             });
             tauri::async_runtime::spawn(async move {
-                // verify_open needs the migrated pool; do not race database startup.
+                // Acquisition needs the migrated pool; do not race database startup.
                 database_state.initialize(&app_handle).await;
                 match config_dir {
                     Ok(config_dir) => worker.launch(Some(config_dir), worker_database).await,
@@ -157,7 +154,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::measurement_command::check_database_connection,
             commands::measurement_command::get_database_status,
             commands::measurement_command::retry_database_connection,
             commands::measurement_command::get_measurements,
@@ -167,25 +163,17 @@ pub fn run() {
             commands::measurement_command::get_measurement_skus,
             commands::measurement_command::get_measurement_sku_summary,
             commands::measurement_command::get_measurement_history_page,
-            commands::measurement_command::get_plc_raw_snapshots,
             commands::measurement_command::get_measurement_report,
             plc::worker::get_as200_worker_status,
             plc::worker::reconnect_as200_plc,
             plc::connection_settings::get_plc_connection_settings,
-            plc::connection_settings::save_plc_poll_interval,
             plc::connection_settings::save_plc_connection_options,
             plc::connection_settings::save_operator_sku,
             plc::connection_settings::stop_plc_collection,
             plc::connection_settings::clear_plc_connection_log,
             plc::connection_settings::connect_plc_collection,
             plc::connection_settings::test_plc_connection,
-            plc::connection_settings::read_plc_register_words,
-            plc::register_access::get_plc_register_access,
-            plc::register_access::get_plc_register_ui_enabled,
-            plc::register_access::read_plc_register,
-            plc::register_access::write_plc_register,
             plc::worker::retry_as200_inbox,
-            plc::worker::acknowledge_as200_buffer_gap
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -13,6 +13,12 @@ export interface PlcMonitorContext {
 // MainLayout owns the existing status polling loop. Pages and headings share it.
 export const usePlcMonitor = () => useOutletContext<PlcMonitorContext>();
 
+export function getMeasurementAvailabilityNotice(status: As200Status | undefined): string | undefined {
+  return status?.state === "RAW_UNDECODED"
+    ? "Đã lưu dữ liệu từ máy đo nhưng chưa đủ thông tin để xác định phép đo hoàn tất. Chưa có kết quả mới trong Lịch sử. Vui lòng nhờ kỹ thuật kiểm tra thông tin công bố phép đo trên PLC; số đo bằng 0 vẫn được chấp nhận."
+    : undefined;
+}
+
 // Shared labels use backend evidence only; TCP and heartbeat never prove ACK.
 export function getPlcDisplayStatus(status: As200Status | undefined, error: string) {
   const invalid = status?.plcHealth === "INVALID_DATA" || status?.state === "ERROR" || !!status?.pauseReason;
@@ -28,7 +34,7 @@ export function getPlcDisplayStatus(status: As200Status | undefined, error: stri
     || status.pcHeartbeatStatus === "FAILED" || status.latest?.saveState === "FAILED" || status.blockedInboxCount > 0
     || status.enabled && (disconnected || status.plcHealth === "STALE" || status.plcHealth === "INVALID_DATA")
   );
-  const collectionLabel = failed ? "Có lỗi" : status?.state === "RAW_UNDECODED" ? "Đã nhận raw, chờ giải mã" : !status ? "Chưa xác định" : status.state === "STOPPING" ? "Đang dừng"
+  const collectionLabel = failed ? "Có lỗi" : status?.state === "RAW_UNDECODED" ? "Chưa có kết quả đo hợp lệ" : !status ? "Chưa xác định" : status.state === "STOPPING" ? "Đang dừng"
     : !status?.enabled ? "Đã dừng" : verified ? "Đang thu dữ liệu" : "Chờ xác minh / kết nối";
   return { verified, failed, plcLabel, collectionLabel,
     plcColor: verified ? "green" : error || disconnected || invalid ? "red" : "default",

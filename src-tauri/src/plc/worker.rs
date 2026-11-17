@@ -1,16 +1,11 @@
 use super::as200;
 use super::{
-    as200::{
-        As200Error,
-        ack::{PublishedAckIntent, PublishedAckPhase},
-        decode,
-        reader::PublishedRecordSnapshot,
-    },
+    as200::{As200Error, decode, reader::PublishedRecordSnapshot},
     simulator_config::{self, SimulatorConfig},
 };
 use crate::{
     database::DatabaseState,
-    models::{InboxInput, InboxRecord},
+    models::InboxRecord,
     repositories::{InboxRepository, SourceRepository},
     services::InboxService,
 };
@@ -28,43 +23,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
-mod ack;
+mod acquisition;
 mod connection_log;
-mod capture;
-mod delivery;
-mod journal;
-mod recovery;
-mod retry;
-pub use journal::ManualRetryRequest;
-use journal::{Delivery, Journal, QuarantinedRecord};
-
-fn processed_receipt_matches(row: &InboxRecord, input: &InboxInput) -> bool {
-    row.session_id == input.confirmed_session_id
-        && row.record_seq == input.record_seq
-        && row.total_count == input.total_count
-        && row.ingest_key == input.ingest_key
-        && row.word_order == input.word_order.as_str()
-        && row.buffer_index == input.buffer_index
-        && row.received_at.timestamp_micros() == input.received_at.timestamp_micros()
-        && serde_json::to_value(&input.raw_registers).is_ok_and(|raw| raw == row.raw_registers)
-        && row.processing_status == "PROCESSED"
-        && row.measurement_id.is_some()
-        && row.processed_at.is_some()
-}
-
-fn latest_replaces(current: Option<&LatestRecord>, incoming: &LatestRecord) -> bool {
-    current.is_none_or(|current| {
-        if incoming.session_id.is_some()
-            && incoming.source_key == current.source_key
-            && incoming.session_id == current.session_id
-        {
-            incoming.record_seq >= current.record_seq
-        } else {
-            // A different session is never ordered by its counter. Caller validates active session.
-            incoming.session_id != current.session_id || incoming.received_at >= current.received_at
-        }
-    })
-}
+mod legacy;
+mod store;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,8 +71,7 @@ pub struct RawCaptureStatus {
     pub inbox_id: i64,
     pub received_at: DateTime<Utc>,
     pub total_count: i32,
-    pub kind: &'static str,
-    pub raw_registers: Vec<u16>,
+    pub ack_status: &'static str,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,7 +79,6 @@ pub struct WorkerStatus {
     pub raw_capture: Option<RawCaptureStatus>,
     pub read_telemetry: Option<ReadTelemetry>,
     pub control_snapshot: Option<as200::model::PlcControl>,
-    pub published_record_seq: Option<i32>,
     pub connected_at: Option<DateTime<Utc>>,
     pub connection_ended_at: Option<DateTime<Utc>>,
     pub last_read_at: Option<DateTime<Utc>>,
@@ -126,8 +86,6 @@ pub struct WorkerStatus {
     pub last_error: Option<String>,
     pub connection_events: Vec<ConnectionEvent>,
     pub connection_log_error: Option<String>,
-    pub manual_retry_results: Vec<ManualRetryRequest>,
-    pub retry_diagnostics: Vec<String>,
     pub blocked_inbox_ids: Vec<i64>,
     pub blocked_inbox_count: usize,
     pub retry_waiting_count: usize,
@@ -144,7 +102,6 @@ pub struct WorkerStatus {
     pub message: String,
     pub pause_reason: Option<String>,
     pub warnings: Vec<String>,
-    pub volatile_count: usize,
     pub latest: Option<LatestRecord>,
     pub last_saved_id: Option<i64>,
 }
@@ -154,7 +111,6 @@ impl Default for WorkerStatus {
             raw_capture: None,
             read_telemetry: None,
             control_snapshot: None,
-            published_record_seq: None,
             connected_at: None,
             connection_ended_at: None,
             last_read_at: None,
@@ -162,9 +118,7 @@ impl Default for WorkerStatus {
             last_error: None,
             connection_events: Vec::new(),
             connection_log_error: None,
-            manual_retry_results: Vec::new(),
             blocked_inbox_ids: Vec::new(),
-            retry_diagnostics: Vec::new(),
             blocked_inbox_count: 0,
             retry_waiting_count: 0,
             plc_health: "UNCONFIGURED".into(),
@@ -181,7 +135,6 @@ impl Default for WorkerStatus {
                 .into(),
             pause_reason: None,
             warnings: Vec::new(),
-            volatile_count: 0,
             latest: None,
             last_saved_id: None,
         }
@@ -253,7 +206,11 @@ pub struct WorkerState {
 }
 impl WorkerState {
     pub(super) async fn engine_for_diagnostic_read(&self) -> Option<Arc<Engine>> {
-        self.engine.lock().await.as_ref().and_then(|engine| engine.upgrade())
+        self.engine
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|engine| engine.upgrade())
     }
 
     pub(super) async fn require_startup_environment(
@@ -321,12 +278,6 @@ impl WorkerState {
             .await
             .clone()
             .ok_or("Chưa có cấu hình kết nối.")?;
-        let engine = self
-            .engine
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|engine| engine.upgrade());
         let marker = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -337,6 +288,7 @@ impl WorkerState {
             .sync_all()
             .map_err(|_| "Không thể lưu yêu cầu dừng.")?;
         self.stopping.store(true, Ordering::SeqCst);
+        self.reconnect_now.notify_one();
         {
             let mut status = self.status.write().await;
             status.state = "STOPPING".into();
@@ -353,25 +305,10 @@ impl WorkerState {
             }
             tasks.remove(0);
         }
-        tasks.clear();
         for waiter in std::mem::take(&mut *self.reconnect_waiters.lock().await) {
             let _ = waiter.send(Err("Đã dừng thu dữ liệu; không tự kết nối lại.".into()));
         }
-        let flush_result =
-            if let (Some(engine), Some(database)) = (engine, self.database.lock().await.clone()) {
-                match tokio::time::timeout(Duration::from_secs(8), async {
-                    let pool = database.pool().await?;
-                    engine.flush(&pool).await
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err("Hết thời gian lưu dữ liệu đang chờ vào PostgreSQL.".into()),
-                }
-            } else {
-                Ok(())
-            };
-        let stop_result = task_error.map_or(flush_result, Err);
+        let stop_result = task_error.map_or(Ok(()), Err);
         *self.engine.lock().await = None;
         let mut status = self.status.write().await;
         status.enabled = false;
@@ -380,7 +317,7 @@ impl WorkerState {
         status.message = if stop_result.is_ok() {
             "Đã dừng thu dữ liệu.".into()
         } else {
-            "Đã dừng thu; dữ liệu chưa lưu vẫn được giữ trong journal để phục hồi.".into()
+            "Đã dừng thu; raw đã commit và ACK đang chờ vẫn nằm trong PostgreSQL.".into()
         };
         let endpoint = status.address.clone();
         drop(status);
@@ -407,68 +344,32 @@ impl WorkerState {
 }
 pub(super) struct Engine {
     config: SimulatorConfig,
-    path: PathBuf,
-    journal: Mutex<Journal>,
+    source_id: i64,
+    projection_due: Mutex<std::time::Instant>,
+    projection_cursors: Mutex<(i64, i64)>,
     state: WorkerState,
     _lock: File,
     published_gate: Mutex<()>,
 }
 impl Engine {
-    pub(super) fn try_diagnostic_read_lock(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
-        self.published_gate.try_lock().map_err(|_| "Worker đang xử lý một chu kỳ PLC; chưa đọc chẩn đoán. Vui lòng thử lại.".into())
+    pub(super) fn try_diagnostic_read_lock(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        self.published_gate.try_lock().map_err(|_| {
+            "Worker đang xử lý một chu kỳ PLC; chưa đọc chẩn đoán. Vui lòng thử lại.".into()
+        })
     }
 
-    async fn publish_journal(&self) -> Result<(), String> {
-        let journal = self.journal.lock().await;
-        let mut status = self.state.status.write().await;
-        status.volatile_count = journal
-            .deliveries
-            .iter()
-            .filter(|d| d.inbox_id.is_none())
-            .count();
-        status.warnings = journal.warnings.clone();
-        status.manual_retry_results = journal.manual_retries.clone();
-        status.blocked_inbox_count = journal
-            .retries
-            .iter()
-            .filter(|r| r.blocked || r.attempts >= self.config.retry_max_attempts)
-            .count();
-        status.blocked_inbox_ids = journal
-            .retries
-            .iter()
-            .filter(|r| r.blocked || r.attempts >= self.config.retry_max_attempts)
-            .map(|r| r.inbox_id)
-            .collect();
-        status.retry_waiting_count = journal.retries.len() - status.blocked_inbox_count;
-        status.retry_diagnostics = journal
-            .retries
-            .iter()
-            .map(|r| {
-                format!(
-                    "inbox={}, source={}, session={:?}, attempts={}, blocked={}, next={}, error={}",
-                    r.inbox_id,
-                    r.source_id,
-                    r.session_id,
-                    r.attempts,
-                    r.blocked || r.attempts >= self.config.retry_max_attempts,
-                    r.next_attempt_at,
-                    r.error
-                )
-            })
-            .collect();
-        status.session_id = journal.session_id.clone();
-        status.pause_reason = journal.pause.clone();
-        if journal.pause.is_some() {
-            status.state = "PAUSED".into();
-            status.message="Worker đã tạm dừng tiếp nhận; cần kiểm tra cảnh báo. Dữ liệu đã chụp vẫn được retry vào inbox.".into();
-        }
-        self.persist(&journal)
-    }
     async fn error(&self, message: String) {
         let mut status = self.state.status.write().await;
         if status.last_error.as_deref() != Some(message.as_str()) {
-            eprintln!("PLC_WORKER state=ERROR endpoint={} pause={:?} ack={} control={:?} reason={message}",
-                self.config.address, status.pause_reason, status.ack_status, status.control_snapshot);
+            eprintln!(
+                "PLC_WORKER state=ERROR endpoint={} pause={:?} ack={} control={:?} reason={message}",
+                self.config.address,
+                status.pause_reason,
+                status.ack_status,
+                status.control_snapshot
+            );
         }
         status.state = if status.pause_reason.is_some() {
             "PAUSED"
@@ -482,10 +383,7 @@ impl Engine {
 
     async fn read_snapshot(&self) -> Result<PublishedRecordSnapshot, String> {
         let started = std::time::Instant::now();
-        match self.config.plc_reader()
-            .poll_published_record()
-            .await
-        {
+        match self.config.plc_reader().poll_published_record().await {
             Ok(snapshot) => {
                 let health = self
                     .state
@@ -518,11 +416,6 @@ impl Engine {
                     None
                 };
                 status.control_snapshot = Some(snapshot.control.clone());
-                status.published_record_seq = snapshot
-                    .buffer
-                    .as_ref()
-                    .and_then(|b| b.record.as_ref())
-                    .map(|r| r.record_seq);
                 status.last_read_at = Some(Utc::now());
                 status.last_read_ms = Some(started.elapsed().as_millis() as u64);
                 status.connection = "CONNECTED".into();
@@ -530,7 +423,9 @@ impl Engine {
                 drop(status);
                 if !self.state.stopping.load(Ordering::SeqCst) {
                     if let Some(kind) = connection_event {
-                        self.state.record_connection(kind, &self.config.address).await;
+                        self.state
+                            .record_connection(kind, &self.config.address)
+                            .await;
                     }
                 }
                 Ok(snapshot)
@@ -560,111 +455,13 @@ impl Engine {
                     } else {
                         "FAILED"
                     };
-                    self.state.record_connection(kind, &self.config.address).await;
+                    self.state
+                        .record_connection(kind, &self.config.address)
+                        .await;
                 }
                 Err(error.to_string())
             }
         }
-    }
-
-    pub(super) async fn poll_and_ack_published(&self, pool: &PgPool) -> Result<(), String> {
-        let _gate = self.published_gate.lock().await;
-        let result: Result<(), String> = async {
-            let source_id = self.persist_receipts(pool).await?;
-            self.verify_published_history(pool).await?;
-            self.flush_unmapped_captures(pool).await?;
-            // A protective pause still permits read-only raw diagnostics. It never
-            // authorizes capture of a production delivery, writes or clearing pause.
-            let snapshot = self.read_snapshot().await?;
-            self.try_resume_initial_raw_pause(&snapshot, pool).await?;
-            if !snapshot.diagnostics.is_empty() && snapshot.buffer.is_some()
-                && (self.config.read_only || self.journal.lock().await.pause.is_some()) {
-                return self.capture_invalid_snapshot(&snapshot, pool).await;
-            }
-            if let Some(pause) = &self.journal.lock().await.pause {
-                return Err(format!("Journal v4 đang dừng bảo vệ dữ liệu: {pause}."));
-            }
-            if self.config.read_only {
-                self.capture_published_snapshot(snapshot).await?;
-                self.flush(pool).await?;
-                self.state.status.write().await.ack_status = "DISABLED";
-                return Ok(());
-            }
-            self.published_ack_step(snapshot, pool).await?;
-            self.apply_retry_requests(pool, source_id).await?;
-            if let Err(error) = self.process_pending(pool, source_id).await {
-                // Raw is already committed. Optional measurement processing must
-                // not block the persisted ACK state machine or resend a write.
-                let mut journal = self.journal.lock().await;
-                Self::warn(&mut journal, format!("INBOX_PROCESSING: {error}"));
-                self.persist(&journal)?;
-            }
-            let mut journal = self.journal.lock().await;
-            let progress = journal
-                .published_ack
-                .as_ref()
-                .ok_or("Thiếu checkpoint v4.")?;
-            if journal.pause.is_none()
-                && !journal.pending_ack()
-                && journal.last_total == Some(progress.accepted)
-            {
-                // This iteration proved the DB prefix and matching idle PLC
-                // checkpoint. Only resolved transient diagnostics may disappear.
-                let before = journal.warnings.len();
-                journal
-                    .warnings
-                    .retain(|w| !w.starts_with("PUBLISHED_ACK:") && !w.starts_with("PUBLISHED_DATA:"));
-                if before != journal.warnings.len() {
-                    self.persist(&journal)?;
-                }
-                let mut status = self.state.status.write().await;
-                status.warnings = journal.warnings.clone();
-                if status.raw_capture.is_none() && status
-                    .latest
-                    .as_ref()
-                    .is_none_or(|r| r.save_state == "PROCESSED")
-                {
-                    status.state = if status.latest.is_some() {
-                        "PROCESSED"
-                    } else {
-                        "WAITING"
-                    }
-                    .into();
-                    status.message = "Đã kết nối máy đo, đang chờ kết quả mới.".into();
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = &result {
-            // Uncertain does not mean failed. Keep observing on a later explicit
-            // iteration; do not replay an uncertain Count or Done.
-            let mut journal = self.journal.lock().await;
-            let progress = journal.published_ack.as_ref();
-            let uncertain = progress.and_then(|p| p.intent.as_ref()).is_some_and(|intent| matches!(intent.phase,
-                PublishedAckPhase::CountWriteUncertain | PublishedAckPhase::CountVerified | PublishedAckPhase::DoneWriteUncertain));
-            let reconciliation = uncertain || journal.pause.as_deref() == Some("PUBLISHED_ACK_RECONCILIATION");
-            let prepared = progress.and_then(|p| p.intent.as_ref()).is_some_and(|i| i.phase == PublishedAckPhase::Prepared);
-            Self::warn(&mut journal, format!("{}: {error}", if reconciliation { "PUBLISHED_ACK" } else { "PUBLISHED_DATA" }));
-            if let Err(persist_error) = self.persist(&journal) {
-                journal.pause = Some("JOURNAL_WRITE_FAILED".into());
-                drop(journal);
-                self.error(persist_error.clone()).await;
-                return Err(format!("{error}; {persist_error}"));
-            }
-            drop(journal);
-            self.state.status.write().await.ack_status = if self.config.read_only {
-                "DISABLED"
-            } else if reconciliation {
-                "RECONCILIATION_REQUIRED"
-            } else if prepared {
-                "PENDING"
-            } else {
-                "BLOCKED_INVALID_RECORD"
-            };
-            self.error(error.clone()).await;
-        }
-        result
     }
 
     async fn collection_loop(self: Arc<Self>, database: DatabaseState) {
@@ -683,11 +480,47 @@ impl Engine {
                 }
                 continue;
             }
-            let result = tokio::time::timeout(Duration::from_millis(self.config.timeout_ms.saturating_mul(12).saturating_add(8000)), async {
+            // Up to six ready snapshots (9 FC03 each), plus prepared sockets
+            // and two writes. Projection has an independent timeout below.
+            let result = tokio::time::timeout(Duration::from_millis(self.config.timeout_ms.saturating_mul(64).saturating_add(8000)), async {
                 let pool = database.pool().await?;
                 self.poll_and_ack_published(&pool).await
             }).await.unwrap_or_else(|_| Err("Hết thời gian đọc/lưu; giữ receipt và ACK intent để phục hồi, không phát lại lệnh chưa rõ kết quả.".into()));
+            if !self.state.stopping.load(Ordering::SeqCst) {
+                let projection = tokio::time::timeout(
+                    Duration::from_millis(
+                        self.config
+                            .timeout_ms
+                            .saturating_mul(12)
+                            .saturating_add(8000),
+                    ),
+                    async {
+                        let pool = database.pool().await?;
+                        self.project_pending(&pool).await
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| Err("Hết thời gian projection; retry cùng Inbox ID.".into()));
+                if let Err(error) = projection {
+                    let mut status = self.state.status.write().await;
+                    status.warnings.retain(|w| !w.starts_with("MEASUREMENT:"));
+                    status.warnings.push(format!("MEASUREMENT: {error}"));
+                }
+            }
             if let Err(error) = &result {
+                if let Ok(pool) = database.pool().await {
+                    if let Ok(Some(p)) = store::progress(&pool, self.source_id).await {
+                        let mut status = self.state.status.write().await;
+                        if p.ack_attempted || p.blocked_reason.is_some() {
+                            status.ack_status = "RECONCILIATION_REQUIRED";
+                        } else if !matches!(
+                            status.ack_status,
+                            "DISABLED" | "PENDING" | "RECONCILIATION_REQUIRED"
+                        ) {
+                            status.ack_status = "FAILED";
+                        }
+                    }
+                }
                 self.error(error.clone()).await;
             }
             let reconnect = if result.is_ok()
@@ -753,17 +586,12 @@ impl WorkerState {
         {
             let mut status = self.status.write().await;
             status.state = "STOPPED".into();
-            status.message = "Đã dừng thu dữ liệu. Nhấn Kết nối để tiếp tục với cấu hình đã nạp.".into();
+            status.message =
+                "Đã dừng thu dữ liệu. Nhấn Kết nối để tiếp tục với cấu hình đã nạp.".into();
             return;
         }
         if let Err(error) = super::connection_settings::validate_config(&config.0) {
             self.error_status(error).await;
-            return;
-        }
-        if let Err(error) = Self::require_sku_or_recovery(&config.0, &config.1) {
-            let mut status = self.status.write().await;
-            status.state = "SETUP_REQUIRED".into();
-            status.message = error;
             return;
         }
         if !config.0.enabled {
@@ -793,14 +621,13 @@ impl WorkerState {
             "AS200 mode={} address={} unit={} ack_enabled={} read_only={} pid={} ack_config_reason={}",
             config.0.mode, config.0.address, config.0.unit_id, config.0.ack_enabled,
             config.0.read_only, std::process::id(),
-            config.0.ack_config_block_reason().unwrap_or("Đã cấp quyền trong cấu hình; chờ các guard Journal/Session, receipt, snapshot và heartbeat, chưa xác nhận ACK thành công")
+            config.0.ack_config_block_reason().unwrap_or("Đã cấp quyền trong cấu hình; chờ receipt PostgreSQL, publication identity, snapshot và heartbeat")
         );
         {
             *self.heartbeat.lock().unwrap() = None;
             let mut status = self.status.write().await;
             status.control_snapshot = None;
             status.raw_capture = None;
-            status.published_record_seq = None;
             status.connected_at = None;
             status.connection_ended_at = None;
             status.last_read_at = None;
@@ -809,7 +636,7 @@ impl WorkerState {
             status.address = config.0.address.clone();
             status.unit_id = config.0.unit_id;
             status.source_key = config.0.source_key.clone();
-            status.session_id = None; // Only publish the session accepted by the journal.
+            status.session_id = None; // Published after verifying PostgreSQL binding.
             status.ack_status = if config.0.ack_enabled {
                 "WAITING"
             } else {
@@ -820,44 +647,20 @@ impl WorkerState {
             status.plc_health = "OBSERVING".into();
             status.message = "Đang khởi động hệ thống tiếp nhận AS200...".into();
         }
-        let preparation = async {
+        let opened = async {
             let pool = database.pool().await?;
-            super::connection_settings::prepare_collection(
-                app_dir
-                    .as_deref()
-                    .ok_or("Chưa xác định thư mục runtime PLC.")?,
-                &config.0,
-                &pool,
-            )
-            .await
+            Engine::open(config.0, config.1, self.clone(), &pool).await
         }
         .await;
-        if let Err(error) = preparation {
-            self.error_status(error).await;
-            return;
-        }
-        match Engine::open(config.0, config.1, self.clone()) {
+        match opened {
             Ok(engine) => {
-                let result = async {
-                    let pool = database.pool().await?;
-                    engine.verify_open(&pool).await
-                }
-                .await;
-                if let Err(error) = result {
-                    engine.error(error).await;
-                    self.status.write().await.enabled = false;
-                    return;
-                }
                 *self.engine.lock().await = Some(Arc::downgrade(&engine));
                 self.tasks.lock().await.push(tauri::async_runtime::spawn(
                     engine.collection_loop(database),
                 ));
             }
             Err(error) => {
-                let mut status = self.status.write().await;
-                status.enabled = false;
-                status.state = "ERROR".into();
-                status.message = error;
+                self.error_status(error).await;
             }
         }
     }
@@ -877,9 +680,21 @@ pub async fn retry_as200_inbox(
         .await
         .as_ref()
         .and_then(|e| e.upgrade())
-        .ok_or("Worker journal is not available")?;
-    engine.queue_retry(inbox_id).await?;
-    engine.publish_journal().await
+        .ok_or("Worker chưa sẵn sàng")?;
+    let _gate = engine.published_gate.lock().await;
+    let database = state
+        .database
+        .lock()
+        .await
+        .clone()
+        .ok_or("Database chưa sẵn sàng")?;
+    let pool = database.pool().await?;
+    let row = InboxRepository::find(&pool, inbox_id).await?;
+    if row.source_id != engine.source_id {
+        return Err("Inbox không thuộc nguồn đang chạy".into());
+    }
+    InboxService::process(&pool, inbox_id).await?;
+    engine.refresh_display(&pool).await
 }
 
 #[tauri::command]
@@ -932,13 +747,6 @@ pub async fn reconnect_as200_plc(state: tauri::State<'_, WorkerState>) -> Result
             "Chưa đọc lại được PLC trong thời gian chờ; Worker vẫn tự thử lại.".to_string()
         })?
         .map_err(|_| "Worker đã dừng trước khi hoàn tất kiểm tra PLC.".to_string())?
-}
-
-#[tauri::command]
-pub async fn acknowledge_as200_buffer_gap(
-    _state: tauri::State<'_, WorkerState>,
-) -> Result<(), String> {
-    Err("Published Record không cho phép bỏ qua sequence gap; cần kỹ thuật đối chiếu dữ liệu và ACK intent.".into())
 }
 
 #[cfg(test)]

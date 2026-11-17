@@ -39,6 +39,7 @@ pub struct SimulatorConfig {
     pub plc_heartbeat_timeout_ms: Option<u64>,
     pub pc_heartbeat_enabled: bool,
     pub allow_plc_heartbeat_write: bool,
+    // Parsed only for compatibility with existing TOML; no Journal retry queue.
     pub retry_max_attempts: u32,
     pub retry_max_delay_ms: u64,
     pub enabled: bool,
@@ -56,6 +57,7 @@ pub struct SimulatorConfig {
     pub timeout_ms: u64,
     pub poll_interval_ms: u64,
     pub retry_interval_ms: u64,
+    // Legacy TOML option; acquisition has one pending PostgreSQL receipt.
     pub max_queue: usize,
     pub journal_path: Option<PathBuf>,
     pub operator_sku: Option<String>,
@@ -100,21 +102,29 @@ impl SimulatorConfig {
     /// Diagnostic only: passing configuration checks does not prove receipt/PLC ACK success.
     pub(super) fn ack_config_block_reason(&self) -> Option<&'static str> {
         if !self.ack_enabled {
-            Some("ack_enabled=false trong cấu hình đã nạp; sửa TOML không cập nhật Worker đang chạy, cần dừng thu và khởi động lại ứng dụng")
+            Some(
+                "ack_enabled=false trong cấu hình đã nạp; sửa TOML không cập nhật Worker đang chạy, cần dừng thu và khởi động lại ứng dụng",
+            )
         } else if self.read_only {
             Some("read_only=true không cho phép ghi ACK")
         } else if !self.technical_setup_confirmed {
             Some("technical_setup_confirmed=false; chưa xác nhận thiết lập kỹ thuật")
         } else if !self.allow_plc_connection {
             Some("allow_plc_connection=false; chưa cấp quyền kết nối/ghi")
-        } else if self.confirmed_session_id.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        } else if self
+            .confirmed_session_id
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
             Some("confirmed_session_id chưa được cấu hình hợp lệ")
         } else if self.pc_heartbeat_enabled || self.allow_plc_heartbeat_write {
             Some("Published Record yêu cầu tắt mọi quyền ghi PC Heartbeat")
         } else if self.ack_protocol.as_deref() != Some("as200") {
             Some("ack_protocol chưa được xác nhận là as200")
         } else if !ack_scope_allows(self) {
-            Some("ACK scope không phù hợp: cần mode=modbus, profile as200-published-v1, LOW, offset=0, D25000, 240 WORD và 2 buffer do PLC quản lý")
+            Some(
+                "ACK scope không phù hợp: cần mode=modbus, profile as200-published-v1, LOW, offset=0, D25000, 240 WORD và 2 buffer do PLC quản lý",
+            )
         } else {
             None
         }
@@ -144,7 +154,8 @@ impl SimulatorConfig {
             && self.allow_plc_heartbeat_write == other.allow_plc_heartbeat_write
     }
 
-    /// Resolve runtime state relative to its owning configuration, including legacy defaults.
+    /// Resolve the retained legacy evidence/Worker lock path. Acquisition no
+    /// longer writes a JSON Journal; the configured path stays stable for cutover.
     pub(super) fn journal_file(&self, configuration: &Path) -> PathBuf {
         let journal = self
             .journal_path
@@ -228,11 +239,8 @@ impl SimulatorConfig {
         if self
             .plc_heartbeat_timeout_ms
             .is_some_and(|v| !(2000..=3600000).contains(&v))
-            || !(1..=100).contains(&self.retry_max_attempts)
-            || self.retry_max_delay_ms < self.retry_interval_ms
-            || self.retry_max_delay_ms > 3600000
         {
-            return Err("Heartbeat/retry policy ngoài phạm vi cấu hình".into());
+            return Err("Heartbeat timeout ngoài phạm vi cấu hình".into());
         }
         if matches!(self.mode.as_str(), "plc" | "modbus")
             && self.pc_heartbeat_enabled
@@ -279,9 +287,8 @@ impl SimulatorConfig {
         }
         if !(50..=60000).contains(&self.poll_interval_ms)
             || !(100..=60000).contains(&self.retry_interval_ms)
-            || !(2..=1024).contains(&self.max_queue)
         {
-            return Err("Poll/retry/max_queue ngoài phạm vi cấu hình".into());
+            return Err("Chu kỳ polling/xử lý Measurement ngoài phạm vi cấu hình".into());
         }
         Ok(())
     }
@@ -340,7 +347,11 @@ pub fn load(app_directory: Option<&Path>) -> Result<Option<(SimulatorConfig, Pat
     };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("Đọc cấu hình AS200: {e}"))?;
     let config = parse(&text).map_err(|error| {
-        eprintln!("AS200_CONFIG_REJECTED pid={} path={} reason={error}", std::process::id(), path.display());
+        eprintln!(
+            "AS200_CONFIG_REJECTED pid={} path={} reason={error}",
+            std::process::id(),
+            path.display()
+        );
         error
     })?;
     let journal = config.journal_file(&path);
@@ -350,7 +361,7 @@ pub fn load(app_directory: Option<&Path>) -> Result<Option<(SimulatorConfig, Pat
         std::process::id(), resolved_path.display(), config.address, config.unit_id,
         config.ack_enabled, config.read_only, config.technical_setup_confirmed,
         config.allow_plc_connection, config.source_key, config.confirmed_session_id,
-        journal.display(), config.ack_config_block_reason().unwrap_or("Cấu hình ACK đủ điều kiện; vẫn phải xác minh Journal/Session, RESET, snapshot, heartbeat và receipt PROCESSED trước khi ghi")
+        journal.display(), config.ack_config_block_reason().unwrap_or("Cấu hình ACK đủ điều kiện; vẫn phải xác minh binding/Session, RESET, snapshot, heartbeat và raw receipt PostgreSQL đã commit trước khi ghi")
     );
     Ok(Some((config, journal)))
 }

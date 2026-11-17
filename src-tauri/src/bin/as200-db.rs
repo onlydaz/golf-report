@@ -42,14 +42,52 @@ async fn run() -> Result<(), String> {
     } else {
         options
     };
+    // The URL can supply the database while settings.database remains empty.
+    // Report the connected server identity, never the URL or credentials.
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect_with(options)
         .await
         .map_err(|e| e.to_string())?;
+    let (database, schema, search_path, read_only, create_public):
+        (String, Option<String>, String, String, bool) = sqlx::query_as(
+        "SELECT current_database()::text, current_schema()::text, current_setting('search_path'), \
+         current_setting('transaction_read_only'), has_schema_privilege(current_user,'public','CREATE')",
+    ).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+    println!(
+        "Connected database={database}, schema={schema:?}, search_path={search_path}, read_only={read_only}, can_create_public={create_public}"
+    );
+    let schema_tables: Vec<(String, String)> = sqlx::query_as(
+        "SELECT schemaname::text,tablename::text FROM pg_tables \
+         WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY 1,2",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    println!("Tables by schema: {schema_tables:?}");
+    let tracking_columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text,data_type::text,is_nullable::text FROM information_schema.columns \
+         WHERE table_schema=current_schema() AND table_name='_sqlx_migrations' ORDER BY ordinal_position",
+    ).fetch_all(&pool).await.map_err(|e| e.to_string())?;
+    println!("Migration tracking columns: {tracking_columns:?}");
+    let advisory_locks: Vec<(bool, i64)> = sqlx::query_as(
+        "SELECT l.granted,count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+         WHERE a.datname=current_database() AND l.locktype='advisory' GROUP BY l.granted",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    println!("Advisory locks (granted, count): {advisory_locks:?}");
+    println!(
+        "Embedded migrations: {:?}",
+        migrations::MIGRATOR
+            .iter()
+            .map(|m| m.version)
+            .collect::<Vec<_>>()
+    );
     let (tables, history) = migrations::audit(&pool).await?;
-    println!("Database={name}, Tables={tables:?}, History={history:?}");
+    println!("Database={database}, Tables={tables:?}, History={history:?}");
     if apply {
         migrations::migrate(&pool).await?;
         println!(
@@ -62,16 +100,6 @@ async fn run() -> Result<(), String> {
         let counts:Vec<(String,i64)>=sqlx::query_as("SELECT 'plc_sources'::text,count(*) FROM plc_sources UNION ALL SELECT 'plc_inbox',count(*) FROM plc_inbox UNION ALL SELECT 'measurements',count(*) FROM measurements UNION ALL SELECT 'measurement_stations',count(*) FROM measurement_stations UNION ALL SELECT 'measurement_points',count(*) FROM measurement_points UNION ALL SELECT 'measurement_attempts',count(*) FROM measurement_attempts")
             .fetch_all(&pool).await.map_err(|e|e.to_string())?;
         println!("Business row counts: {counts:?}");
-        let registry: (i64, i64, i64) = sqlx::query_as(
-            "SELECT count(*), count(DISTINCT session_id), count(*) FILTER (WHERE ack_write_approved) FROM plc_source_registry",
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        println!(
-            "Source registry: rows={}, sessions={}, ack_approved={}",
-            registry.0, registry.1, registry.2
-        );
     }
     Ok(())
 }

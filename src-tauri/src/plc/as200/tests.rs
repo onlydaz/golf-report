@@ -319,7 +319,7 @@ async fn published_record_rejects_changing_raw_control_and_short_reads() {
 }
 
 #[tokio::test]
-async fn published_record_preserves_invalid_raw_and_existing_validation() {
+async fn published_record_preserves_raw_without_enforcing_projection_validation() {
     let order = WordOrder::LowWordFirst;
     // Status thiếu valid, workflow sai, metadata vượt TotalCount, REAL NaN.
     for (offset, value) in [(21, 0), (45, 3), (42, 3), (49, 0x7fc0)] {
@@ -328,126 +328,13 @@ async fn published_record_preserves_invalid_raw_and_existing_validation() {
         let expected_raw = memory.words[20..260].to_vec();
         let mut reader = As200Reader::with_transport(config(order), memory);
         let snapshot = reader.poll_published_record().await.unwrap();
-        assert!(!snapshot.diagnostics.is_empty());
-        assert_eq!(snapshot.buffer.unwrap().raw_registers, expected_raw);
+        let buffer = snapshot.buffer.unwrap();
+        assert_eq!(buffer.raw_registers, expected_raw);
+        // Workflow and identity are validated by projection/acquisition, not FC03.
+        if offset == 21 || offset == 49 {
+            assert!(!snapshot.diagnostics.is_empty());
+        }
     }
-}
-
-#[test]
-fn published_ack_requires_durable_done_high_then_matching_low_checkpoint() {
-    use super::ack::{PublishedAckIntent, PublishedAckPhase};
-    let order = WordOrder::LowWordFirst;
-    let mut control = decode::control(&control(1, order), order).unwrap();
-    control.pc_read_count = 1;
-    control.pc_read_done = 0;
-    control.data_ready = 0;
-    let mut snapshot = PublishedRecordSnapshot {
-        control,
-        buffer: None,
-        diagnostics: Vec::new(),
-    };
-    let mut intent = PublishedAckIntent {
-        target: 1,
-        inbox_id: 42,
-        raw_registers: record(1, order),
-        phase: PublishedAckPhase::DoneWriteUncertain,
-        observed_done_high: false,
-    };
-    assert!(!intent.confirmed_by(&snapshot)); // Count and Ready=0 do not prove a missed Done.
-    intent.observed_done_high = true;
-    assert!(intent.confirmed_by(&snapshot));
-    for phase in [
-        PublishedAckPhase::Prepared,
-        PublishedAckPhase::CountWriteUncertain,
-        PublishedAckPhase::CountVerified,
-        PublishedAckPhase::AckConfirmed,
-    ] {
-        intent.phase = phase;
-        assert!(!intent.confirmed_by(&snapshot));
-    }
-    intent.phase = PublishedAckPhase::DoneWriteUncertain;
-    snapshot.control.pc_read_count = 0;
-    assert!(!intent.confirmed_by(&snapshot));
-    snapshot.control.pc_read_count = 1;
-    snapshot.control.pc_read_done = 1;
-    assert!(!intent.confirmed_by(&snapshot));
-    snapshot.control.pc_read_done = 0;
-    snapshot.control.total_count = 0;
-    assert!(!intent.confirmed_by(&snapshot));
-}
-
-#[test]
-fn published_ack_blocks_count_ahead_and_revalidates_raw_before_each_write() {
-    use super::ack::{PublishedAckIntent, PublishedAckPhase};
-    let order = WordOrder::LowWordFirst;
-    let raw = record(11, order);
-    let mut c = decode::control(&control(12, order), order).unwrap();
-    c.pc_read_count = 10;
-    let mut snapshot = PublishedRecordSnapshot {
-        control: c,
-        buffer: Some(BufferSnapshot {
-            buffer_index: 0,
-            record: Some(decode::record(&raw, 0, order).unwrap()),
-            raw_registers: raw.clone(),
-        }),
-        diagnostics: Vec::new(),
-    };
-    let intent = PublishedAckIntent {
-        target: 11,
-        inbox_id: 42,
-        raw_registers: raw,
-        phase: PublishedAckPhase::Prepared,
-        observed_done_high: false,
-    };
-    assert!(
-        intent
-            .check_before_write(&snapshot, 10)
-            .unwrap_err()
-            .contains("TotalCount")
-    );
-    snapshot.control.total_count = 11;
-    assert!(intent.check_before_write(&snapshot, 10).is_ok());
-    snapshot.control.pc_read_done = 1;
-    assert!(intent.check_before_write(&snapshot, 10).is_err());
-    snapshot.control.pc_read_done = 0;
-    snapshot.buffer.as_mut().unwrap().raw_registers[28] ^= 1;
-    assert!(intent.check_before_write(&snapshot, 10).is_err());
-}
-
-#[test]
-fn published_ack_next_record_with_ready_held_high_is_not_independent_evidence() {
-    use super::ack::{PublishedAckIntent, PublishedAckPhase};
-    let order = WordOrder::LowWordFirst;
-    let raw = record(2, order);
-    let mut control = decode::control(&control(2, order), order).unwrap();
-    control.pc_read_count = 1;
-    let mut snapshot = PublishedRecordSnapshot {
-        control,
-        buffer: Some(BufferSnapshot {
-            buffer_index: 0,
-            record: Some(decode::record(&raw, 0, order).unwrap()),
-            raw_registers: raw,
-        }),
-        diagnostics: Vec::new(),
-    };
-    let mut intent = PublishedAckIntent {
-        target: 1,
-        inbox_id: 42,
-        raw_registers: record(1, order),
-        phase: PublishedAckPhase::DoneWriteUncertain,
-        observed_done_high: false,
-    };
-    assert!(!intent.confirmed_by(&snapshot));
-    intent.observed_done_high = true;
-    assert!(intent.confirmed_by(&snapshot));
-    snapshot.control.total_count = 3;
-    let raw = record(3, order);
-    snapshot.buffer = Some(BufferSnapshot {
-        buffer_index: 0,
-        record: Some(decode::record(&raw, 0, order).unwrap()),
-        raw_registers: raw,
-    });
-    assert!(!intent.confirmed_by(&snapshot)); // A skipped publication is not accepted silently.
 }
 
 // ---- Transport tokio-modbus qua TCP loopback thật (không cần PLC) ----
@@ -668,4 +555,117 @@ async fn unsupported_profile_is_rejected_before_reading_registers() {
         assert!(reader.poll_published_record().await.is_err());
         assert!(reader.transport.calls.is_empty());
     }
+}
+
+#[tokio::test]
+async fn arbitrary_raw_total_zero_then_one_keeps_all_words_and_plc_identity() {
+    let order = WordOrder::LowWordFirst;
+    for single in [false, true] {
+        let mut memory = MemoryReader::new(order, 0);
+        memory.words[11] = 1;
+        memory.words[20..260].fill(0);
+        if single {
+            memory.words[200] = 12;
+        }
+        let expected = memory.words[20..260].to_vec();
+        let mut reader = As200Reader::with_transport(config(order), memory);
+        let zero = reader.poll_published_record().await.unwrap();
+        assert_eq!(zero.control.total_count, 0);
+        let raw = zero.buffer.unwrap();
+        assert_eq!(raw.raw_registers, expected);
+        assert!(raw.record.is_none());
+        put32(&mut reader.transport.words, 4, 1, order);
+        let one = reader.poll_published_record().await.unwrap();
+        assert_eq!(one.control.total_count, 1);
+        assert_eq!(one.buffer.unwrap().raw_registers, expected);
+    }
+}
+#[tokio::test]
+async fn repeated_identical_payloads_have_distinct_control_counters_for_one_two_five_ten_reads() {
+    let order = WordOrder::LowWordFirst;
+    let mut memory = MemoryReader::new(order, 1);
+    memory.words[20..260].fill(0);
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    let mut seen = Vec::new();
+    for total in 1..=10 {
+        put32(&mut reader.transport.words, 4, total as u32, order);
+        let snap = reader.poll_published_record().await.unwrap();
+        seen.push(snap.control.total_count);
+        assert_eq!(snap.buffer.unwrap().raw_registers, vec![0; 240]);
+        if [1, 2, 5, 10].contains(&total) {
+            assert_eq!(seen, (1..=total).collect::<Vec<_>>());
+        }
+    }
+}
+#[tokio::test]
+async fn read_failure_recovers_and_counter_change_mid_snapshot_is_unstable() {
+    let order = WordOrder::LowWordFirst;
+    let mut memory = MemoryReader::new(order, 1);
+    memory.fail_on_call = Some(2);
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    assert!(matches!(
+        reader.poll_published_record().await,
+        Err(As200Error::Transport(_))
+    ));
+    reader.transport.fail_on_call = None;
+    assert_eq!(
+        reader
+            .poll_published_record()
+            .await
+            .unwrap()
+            .control
+            .total_count,
+        1
+    );
+    let mut memory = MemoryReader::new(order, 1);
+    memory.mutate_on_call = Some(5);
+    memory.mutation_offset = 4;
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    assert_eq!(
+        reader.poll_published_record().await.unwrap_err(),
+        As200Error::Unstable
+    );
+}
+#[tokio::test]
+async fn fc03_response_timeout_is_not_a_measurement_or_successful_snapshot() {
+    let mut cfg = config(WordOrder::LowWordFirst);
+    cfg.timeout = Duration::from_millis(40);
+    let listener = loopback(&mut cfg).await;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 12];
+        stream.read_exact(&mut request).await.unwrap();
+        let _ = stop_rx.await;
+    });
+    let mut reader = As200Reader::new(cfg);
+    assert_eq!(
+        reader.poll_published_record().await.unwrap_err(),
+        As200Error::Timeout
+    );
+    let _ = stop_tx.send(());
+    server.await.unwrap();
+}
+#[tokio::test]
+async fn count_response_lost_returns_error_and_transport_does_not_replay_request() {
+    use tokio::io::AsyncReadExt;
+    let mut cfg = config(WordOrder::LowWordFirst);
+    let listener = loopback(&mut cfg).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 17];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request[7..], &[16, 97, 176, 0, 2, 4, 0, 0, 0, 1]); // 65536 LOW: [0,1]
+        drop(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let writer = super::ack::AckWriter::new(cfg, "modbus", true, Some("as200"), true).unwrap();
+    let prepared = writer.prepare_count().await.unwrap();
+    assert!(writer.count_prepared(65536, prepared).await.is_err());
+    server.await.unwrap();
 }

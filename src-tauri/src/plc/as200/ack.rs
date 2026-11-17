@@ -1,7 +1,6 @@
-//! Whitelisted AS200 ACK transport with protocol-specific acceptance evidence.
+//! Whitelisted AS200 Count/Done transport; acquisition owns durable ACK evidence.
 use super::As200Config;
-use super::{WordOrder, map, reader::PublishedRecordSnapshot};
-use serde::{Deserialize, Serialize};
+use super::{WordOrder, map};
 use tokio::net::TcpStream;
 use tokio_modbus::{
     Request, Response, Slave,
@@ -15,91 +14,6 @@ enum Write {
     Single(u16, u16),
     /// FC16: địa chỉ, đúng 2 WORD (DINT32).
     Multiple(u16, [u16; 2]),
-}
-
-/// Every write is preceded by a
-/// persisted uncertain phase; an uncertain write is observed, never replayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PublishedAckPhase {
-    Prepared,
-    CountWriteUncertain,
-    CountVerified,
-    DoneWriteUncertain,
-    AckConfirmed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishedAckIntent {
-    pub target: i32,
-    pub inbox_id: i64,
-    pub raw_registers: Vec<u16>,
-    pub phase: PublishedAckPhase,
-    pub observed_done_high: bool,
-}
-
-impl PublishedAckIntent {
-    pub fn same_published_record(&self, snapshot: &PublishedRecordSnapshot) -> bool {
-        snapshot.control.data_ready == 1
-            && snapshot.control.total_count == self.target
-            && self.raw_registers.len() == map::RECORD_SIZE
-            && snapshot.buffer.as_ref().is_some_and(|buffer| {
-                buffer.buffer_index == 0
-                    && buffer.raw_registers == self.raw_registers
-            })
-    }
-
-    pub fn check_before_write(
-        &self,
-        snapshot: &PublishedRecordSnapshot,
-        expected_count: i32,
-    ) -> Result<(), String> {
-        let c = &snapshot.control;
-        if c.total_count > self.target {
-            return Err(format!(
-                "TotalCount={} đi trước bản ghi đã lưu={}; chưa đủ bằng chứng ACK bản ghi mới, chặn ghi.",
-                c.total_count, self.target
-            ));
-        }
-        if c.format_version != 1
-            || c.record_size != 240
-            || c.buffer_count != 2
-            || c.total_count != self.target
-            || c.pc_read_count != expected_count
-            || c.pc_read_done != 0
-            || !self.same_published_record(snapshot)
-        {
-            return Err(
-                "Snapshot Bản ghi 1/checkpoint thay đổi trước lệnh ghi; giữ intent, không ghi PLC."
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Excel says PLC clears Done after processing. A read-back of Count alone,
-    /// DataReady=0, or a changed RecordSeq is never sufficient evidence.
-    pub fn confirmed_by(&self, snapshot: &PublishedRecordSnapshot) -> bool {
-        let c = &snapshot.control;
-        self.phase == PublishedAckPhase::DoneWriteUncertain
-            && self.observed_done_high
-            && c.format_version == 1
-            && c.record_size == 240
-            && c.buffer_count == 2
-            && c.total_count >= self.target
-            && c.pc_read_count == self.target
-            && c.pc_read_done == 0
-            && c.data_ready == i16::from(c.total_count > self.target)
-            && if c.data_ready == 0 {
-                snapshot.buffer.is_none()
-            } else {
-                snapshot.buffer.as_ref().is_some_and(|buffer| {
-                    buffer.buffer_index == 0
-                        && buffer.raw_registers.len() == map::RECORD_SIZE
-                        && self.target.checked_add(1) == Some(c.total_count)
-                })
-            }
-    }
 }
 
 /// Chỉ constructor này cấp quyền ghi, dựa trên mode/protocol và opt-in rõ ràng.
@@ -135,14 +49,31 @@ impl AckWriter {
         if !enabled || !permitted || address.port() == 0 {
             return Err("ACK write capability disabled".into());
         }
-        Ok(Self { cfg, local_ip: None })
+        Ok(Self {
+            cfg,
+            local_ip: None,
+        })
     }
     pub fn with_local_ip(mut self, local_ip: Option<std::net::IpAddr>) -> Self {
         self.local_ip = local_ip;
         self
     }
     // Không có API địa chỉ tùy ý: FC16 chỉ D25008..09, FC06 chỉ D25012=1.
-    pub async fn count(&self, count: i32) -> Result<(), String> {
+    #[cfg(test)]
+    async fn count(&self, count: i32) -> Result<(), String> {
+        if count <= 0 {
+            return Err("ACK invalid count".into());
+        }
+        self.count_prepared(count, self.prepare_count().await?)
+            .await
+    }
+    /// Connect without sending a Modbus request, before the durable Count marker.
+    pub async fn prepare_count(&self) -> Result<TcpStream, String> {
+        super::connect_tcp(&self.cfg.address, self.local_ip, self.cfg.timeout)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    pub async fn count_prepared(&self, count: i32, stream: TcpStream) -> Result<(), String> {
         if count <= 0 {
             return Err("ACK invalid count".into());
         }
@@ -156,12 +87,19 @@ impl AckWriter {
         if matches!(self.cfg.word_order, WordOrder::LowWordFirst) {
             words.reverse();
         }
-        send(&self.cfg, self.local_ip, Write::Multiple(address, words), None).await
+        send(
+            &self.cfg,
+            self.local_ip,
+            Write::Multiple(address, words),
+            stream,
+        )
+        .await
     }
     /// Mở socket chưa gửi byte nào: lỗi connect không làm intent thành "đã gửi".
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
         super::connect_tcp(&self.cfg.address, self.local_ip, self.cfg.timeout)
-            .await.map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
@@ -169,20 +107,20 @@ impl AckWriter {
             self.cfg.modbus_address_offset,
         )
         .ok_or("ACK address overflow")?;
-        send(&self.cfg, self.local_ip, Write::Single(address, 1), Some(stream)).await
+        send(&self.cfg, self.local_ip, Write::Single(address, 1), stream).await
     }
 }
 
 /// Gửi một lệnh ghi qua `tokio-modbus` và chỉ coi là thành công khi PLC echo
 /// đúng địa chỉ/giá trị (FC06) hoặc địa chỉ/số lượng (FC16). Exception, sai
 /// header (transaction/unit), sai function code, mất kết nối hay timeout đều là lỗi.
-async fn send(cfg: &As200Config, local_ip: Option<std::net::IpAddr>, write: Write, prepared: Option<TcpStream>) -> Result<(), String> {
+async fn send(
+    cfg: &As200Config,
+    local_ip: Option<std::net::IpAddr>,
+    write: Write,
+    stream: TcpStream,
+) -> Result<(), String> {
     let operation = async {
-        let stream = match prepared {
-            Some(stream) => stream,
-            None => super::connect_tcp(&cfg.address, local_ip, cfg.timeout)
-                .await.map_err(|e| e.to_string())?,
-        };
         let mut ctx = tcp::attach_slave(stream, Slave(cfg.unit_id));
         let (request, expected) = match write {
             Write::Single(address, value) => (

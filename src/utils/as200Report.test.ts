@@ -80,9 +80,21 @@ const record: MeasurementDetail = {
             },
           ],
         },
+      ],
+    },
+    {
+      id: 2,
+      measurementId: 18,
+      stationType: "BUTT",
+      result: "UNMEASURED",
+      pointCount: 0,
+      ngPoint: 0,
+      load: "0",
+      createdAt: "",
+      points: [
         {
           id: 5,
-          stationId: 1,
+          stationId: 2,
           pointNumber: 2,
           result: "UNMEASURED",
           attemptCount: 0,
@@ -96,17 +108,28 @@ const record: MeasurementDetail = {
 };
 
 describe("AS200 display and export", () => {
+  it("excludes unused TIP P2-P4 padding while retaining legitimate BUTT unmeasured points", () => {
+    const source = structuredClone(record);
+    for (const pointNumber of [2, 3, 4]) {
+      source.stations[0].points.push({ ...source.stations[1].points[0], stationId: 1, pointNumber });
+    }
+    const tables = buildReportTables([source]);
+    expect(tables.points.filter(p => p.StationType === "TIP").map(p => p.PointNumber)).toEqual([1]);
+    expect(tables.points.filter(p => p.StationType === "BUTT")).toHaveLength(1);
+    expect(source.stations[0].points).toHaveLength(4);
+  });
+
   it("distinguishes unused point padding from measured zero and conflicting point data", () => {
-    const unused = record.stations[0].points[1];
+    const unused = record.stations[1].points[0];
     expect(isUnmeasuredPoint(unused)).toBe(true);
     expect(isUnmeasuredPoint({ ...unused, position: "0" })).toBe(true);
     expect(isUnmeasuredPoint({ ...unused, position: "12" })).toBe(false);
     expect(isUnmeasuredPoint({ ...unused, attempts: record.stations[0].points[0].attempts })).toBe(false);
     expect(isUnmeasuredPoint({ ...record.stations[0].points[0], position: "0" })).toBe(false);
     const source = structuredClone(record);
-    source.stations[0].points[1].position = "0";
+    source.stations[1].points[0].position = "0";
     expect(buildReportTables([source]).points[1]["Position (mm)"]).toBe("");
-    expect(source.stations[0].points[1].position).toBe("0");
+    expect(source.stations[1].points[0].position).toBe("0");
   });
   it("uses an exclusive next-day boundary for single and multiple Vietnam days", () => {
     const start = reportDateBoundary(dayjs("2026-11-10"));
@@ -251,7 +274,7 @@ describe("AS200 display and export", () => {
     });
     expect(rows[1]).toMatchObject({ "Lượt đo": "2", "PushDist (mm)": "", "Bend (mm)": "1.234567890123456789" });
     expect(rows[2]).toMatchObject({
-      "Điểm đo": "2", "Kết quả": "UNMEASURED", "Số lượt đo": "0",
+      "Trạm đo": "BUTT", "Điểm đo": "2", "Kết quả": "UNMEASURED", "Số lượt đo": "0",
       "Lượt quyết định": "", "Vị trí đo (mm)": "", "Bend (mm)": "",
     });
     expect(source.productCode).toBe("=unsafe");

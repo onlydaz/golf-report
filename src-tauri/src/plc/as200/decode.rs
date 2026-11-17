@@ -192,6 +192,11 @@ pub fn record(
     }
     let version = int16(words, r::VERSION)?;
     if version != map::FORMAT_VERSION {
+        if words.iter().all(|word| *word == 0) {
+            return Err(invalid(
+                "Bản ghi toàn 0 chưa xác định phép đo hoàn tất: Version=0 (cần 1), Status bit0=0, ProductCode trống, OverallResult/TIP_Result/BUTT_Result=0 (chưa đo), PointCount/AttemptCount/DecideAttempt=0. Số đo REAL bằng 0 hợp lệ khi có metadata và kết quả PLC đầy đủ.",
+            ));
+        }
         return Err(invalid(format!("Record Version không hỗ trợ: {version}")));
     }
     let status = uint16(words, r::STATUS)?;

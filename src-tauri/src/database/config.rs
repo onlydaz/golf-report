@@ -23,6 +23,8 @@ pub fn load_config() -> Result<DatabaseConfig, String> {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/database_config.toml");
     #[cfg(not(debug_assertions))]
     let config_path = crate::application_directory()?.join("resources/database_config.toml");
+    // Log only the selected path, never config contents or the connection URL.
+    eprintln!("DATABASE_CONFIG path={}", config_path.display());
     read_config(&config_path)
 }
 

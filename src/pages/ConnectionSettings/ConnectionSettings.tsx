@@ -1,18 +1,17 @@
 import { ApiOutlined, CheckCircleOutlined, SaveOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, Form, Input, InputNumber, Popconfirm, Table } from "antd";
+import { Alert, Button, Card, Form, Input, InputNumber, Popconfirm } from "antd";
 import { useEffect, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
 import { getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
 import { formatReportTime } from "../../utils/reportTime";
-import { clearPlcConnectionLog, connectPlcCollection, getPlcRegisterUiEnabled, isPlcIp, plcConnectionError, readPlcRegisterWords, savePlcConnectionOptions, stopPlcCollection, testPlcConnection,
-  type PlcEndpoint, type PlcInspectionReport, type PlcRegisterWordsReport } from "../../services/plcConnectionService";
-import PlcRegisterCard from "./PlcRegisterCard";
+import { clearPlcConnectionLog, connectPlcCollection, isPlcIp, plcConnectionError, savePlcConnectionOptions, stopPlcCollection, testPlcConnection,
+  type PlcEndpoint, type PlcInspectionReport } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
 
 export default function ConnectionSettings() {
   const [form] = Form.useForm<PlcEndpoint>();
   const { status: worker, settings, error: monitorError, refresh } = usePlcMonitor();
-  const [busy, setBusy] = useState<"test" | "connect" | "stop" | "save" | "read" | null>(null);
+  const [busy, setBusy] = useState<"test" | "connect" | "stop" | "save" | null>(null);
   const [technicalMode, setTechnicalMode] = useState(false);
   const [pollInterval, setPollInterval] = useState<number | null>(null);
   const [localIp, setLocalIp] = useState("");
@@ -23,16 +22,6 @@ export default function ConnectionSettings() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [inspection, setInspection] = useState<PlcInspectionReport>();
-  const [readStart, setReadStart] = useState<number | null>(25000);
-  const [readCount, setReadCount] = useState<number | null>(20);
-  const [readError, setReadError] = useState("");
-  const [readResult, setReadResult] = useState<PlcRegisterWordsReport>();
-  const readRangeValid = readStart !== null && readCount !== null
-    && Number.isInteger(readStart) && Number.isInteger(readCount)
-    && readStart >= 0 && readCount >= 1 && readCount <= 100 && readStart + readCount <= 65536;
-  const productionReadBlocked = worker?.state === "STOPPING" || (!!worker?.enabled && !worker.pauseReason);
-  const [registerUiEnabled, setRegisterUiEnabled] = useState(false);
-  const [registerBusy, setRegisterBusy] = useState(false);
   const [clearingLog, setClearingLog] = useState(false);
   const [logError, setLogError] = useState("");
   const [clock, setClock] = useState(Date.now);
@@ -54,19 +43,10 @@ export default function ConnectionSettings() {
   const pollIntervalValid = pollInterval !== null && Number.isInteger(pollInterval) && pollInterval >= 50 && pollInterval <= 60000;
   useEffect(() => {
     mounted.current = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const enabled = await getPlcRegisterUiEnabled();
-        if (mounted.current) { setRegisterUiEnabled(enabled); if (!enabled) setRegisterBusy(false); }
-      } catch { if (mounted.current) { setRegisterUiEnabled(false); setRegisterBusy(false); } }
-      finally { if (mounted.current) timer = setTimeout(() => void poll(), 2000); }
-    };
-    void poll();
-    return () => { mounted.current = false; clearTimeout(timer); };
+    return () => { mounted.current = false; };
   }, []);
   const act = async (action: "test" | "connect" | "stop" | "save") => {
-    if (inFlight.current || registerBusy) return;
+    if (inFlight.current) return;
     if (action === "save" && !pollIntervalValid) {
       setError("Chu kỳ đọc phải là số nguyên từ 50 đến 60000 ms.");
       return;
@@ -102,24 +82,10 @@ export default function ConnectionSettings() {
       await refresh().catch(() => undefined);
     } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
   };
-  const readRegisters = async () => {
-    if (inFlight.current || registerBusy) return;
-    if (!readRangeValid || readStart === null || readCount === null) {
-      setReadError("Nhập địa chỉ D hợp lệ và 1–100 WORD, không vượt D65535.");
-      return;
-    }
-    inFlight.current = true; setBusy("read"); setReadError(""); setReadResult(undefined);
-    try {
-      const result = await readPlcRegisterWords(readStart, readCount);
-      if (mounted.current) setReadResult(result);
-    } catch (reason) {
-      if (mounted.current) setReadError(plcConnectionError(reason, "Không đọc được thanh ghi PLC. Kiểm tra mạng và cấu hình kết nối."));
-    } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
-  };
   const display = getPlcDisplayStatus(worker, monitorError);
   const workerHasError = !!worker && (!!worker.pauseReason || ["ERROR", "FAILED", "PAUSED"].includes(worker.state));
   const currentError = monitorError || (workerHasError ? plcConnectionError(worker?.message, "Bộ thu có lỗi; cần đối chiếu.") : "");
-  const hasLiveSnapshot = !!worker?.enabled && worker.connection === "CONNECTED" && !monitorError && !workerHasError && worker.plcHealth !== "INVALID_DATA";
+  const hasLiveSnapshot = !!worker?.enabled && worker.connection === "CONNECTED" && !monitorError && worker.plcHealth !== "INVALID_DATA";
   const snapshot = hasLiveSnapshot ? worker.controlSnapshot : undefined;
   const memory = settings?.parameters;
   const memoryFields = [
@@ -144,7 +110,6 @@ export default function ConnectionSettings() {
       return `${pad(Math.floor(seconds / 3600))} giờ ${pad(Math.floor(seconds / 60) % 60)} phút ${pad(seconds % 60)} giây`;
     })()],
     ["Heartbeat PLC", snapshot?.heartbeat], ["Độ trễ đọc", hasLiveSnapshot && worker.lastReadMs != null ? `${worker.lastReadMs} ms` : null],
-    ["TotalCount", snapshot?.total_count], ["RecordSeq", hasLiveSnapshot ? worker.publishedRecordSeq : null],
     ["DataReady", snapshot?.data_ready], ["PC_ReadDone", snapshot?.pc_read_done], ["PC_ReadCount", snapshot?.pc_read_count],
     ["Lỗi đọc hôm nay", worker?.readTelemetry?.readErrors], ["Mất kết nối hôm nay", worker?.readTelemetry?.disconnects],
   ] as const;
@@ -166,7 +131,7 @@ export default function ConnectionSettings() {
     <PageHeader eyebrow="HỆ THỐNG" title="4 · Kết nối PLC" description="Theo dõi kết nối và thu dữ liệu từ PLC." />
     <div className="plc-settings-grid">
       <Card className="plc-settings-card" title={technicalMode ? "Thiết lập kỹ thuật" : "Cài đặt kết nối"}
-        extra={<Button size="small" disabled={!!busy || registerBusy} onClick={() => setTechnicalMode(value => !value)}>
+        extra={<Button size="small" disabled={!!busy} onClick={() => setTechnicalMode(value => !value)}>
           {technicalMode ? "Về kết nối QC" : "Thiết lập kỹ thuật"}
         </Button>}>
         <Form form={form} layout="vertical" requiredMark={false}>
@@ -185,7 +150,7 @@ export default function ConnectionSettings() {
           {technicalMode && <>
             <Form.Item label="IP nguồn kết nối PLC (Ethernet)" validateStatus={!localIpValid ? "error" : undefined}
               help={!localIpValid ? "Nhập địa chỉ IP hợp lệ." : "Để trống: hệ điều hành tự chọn. Chọn IP Ethernet của laptop; cần ngắt kết nối trước khi đổi và lưu. Bind IP nguồn không bảo đảm chọn đúng tuyến mạng Windows."}>
-              <Input value={localIp} placeholder="Tự động" disabled={!!busy || !settings || registerBusy || !!worker?.enabled || worker?.state === "STOPPING"}
+              <Input value={localIp} placeholder="Tự động" disabled={!!busy || !settings || !!worker?.enabled || worker?.state === "STOPPING"}
                 onChange={event => { setLocalIp(event.target.value); setNotice(""); setError(""); }} />
             </Form.Item>
             <h3 className="plc-config-group">Vùng nhớ giao tiếp</h3>
@@ -194,7 +159,7 @@ export default function ConnectionSettings() {
                 ? <Form.Item key={key} label={label} validateStatus={settings && !pollIntervalValid ? "error" : undefined}
                     help={settings && !pollIntervalValid ? "Nhập số nguyên từ 50 đến 60000 ms." : undefined}>
                     <InputNumber<number> value={pollInterval} min={50} max={60000} precision={0}
-                      disabled={!!busy || !settings || registerBusy}
+                      disabled={!!busy || !settings}
                       onChange={value => { setPollInterval(value); setNotice(""); setError(""); }} />
                   </Form.Item>
                 : <Form.Item key={key} label={label}><Input readOnly value={value ?? ""} placeholder="—" /></Form.Item>)}
@@ -203,59 +168,23 @@ export default function ConnectionSettings() {
         </Form>
         <div className="plc-settings-actions">
           {technicalMode && <Button type="primary" icon={<SaveOutlined />} loading={busy === "save"}
-            disabled={!!busy || !settings || registerBusy || !pollIntervalValid || !localIpValid || (!localIpChanged && pollInterval === savedPollInterval)}
+            disabled={!!busy || !settings || !pollIntervalValid || !localIpValid || (!localIpChanged && pollInterval === savedPollInterval)}
             onClick={() => void act("save")}>Lưu cài đặt</Button>}
-          <Button className="plc-button-outline" icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings || registerBusy} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
+          <Button className="plc-button-outline" icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
           <Button className={worker?.enabled ? undefined : "plc-button-connect"} danger={worker?.enabled}
-            loading={busy === "connect" || busy === "stop"} disabled={!!busy || (!settings && !worker?.enabled) || registerBusy || worker?.state === "STOPPING"}
+            loading={busy === "connect" || busy === "stop"} disabled={!!busy || (!settings && !worker?.enabled) || worker?.state === "STOPPING"}
             onClick={() => void act(worker?.enabled ? "stop" : "connect")}>{worker?.enabled ? "Ngắt kết nối" : "Kết nối"}</Button>
         </div>
         <div className="plc-settings-feedback" aria-live="polite">
           {error && <Alert type="error" showIcon title={error} />}
-          {inspection && <Alert showIcon type={inspection.as200Valid ? "success" : "warning"} title={inspection.message} description={inspection.mappingWarning} />}
+          {inspection && <Alert showIcon type={inspection.as200Valid ? "success" : "warning"} title={plcConnectionError(inspection.message, "Chưa thể xác minh kết nối PLC.")} description={inspection.mappingWarning ? plcConnectionError(inspection.mappingWarning, "Cần kỹ thuật kiểm tra cấu hình PLC.") : undefined} />}
           {notice && <p className="plc-settings-saved"><CheckCircleOutlined /> {notice}</p>}
         </div>
-        {technicalMode && <section className="plc-register-read" aria-label="Đọc thanh ghi PLC">
-          <h3 className="plc-config-group">Đọc thanh ghi PLC</h3>
-          <div className="plc-register-read-inputs">
-            <label>Địa chỉ D bắt đầu
-              <InputNumber<number> aria-label="Địa chỉ D bắt đầu" value={readStart} min={0} max={65535} precision={0}
-                disabled={!!busy || registerBusy}
-                onChange={value => { setReadStart(value); setReadError(""); setReadResult(undefined); }} />
-            </label>
-            <label>Số WORD
-              <InputNumber<number> aria-label="Số WORD cần đọc" value={readCount} min={1} max={100} precision={0}
-                disabled={!!busy || registerBusy}
-                onChange={value => { setReadCount(value); setReadError(""); setReadResult(undefined); }} />
-            </label>
-            <Button icon={<ApiOutlined />} loading={busy === "read"}
-              disabled={!!busy || registerBusy || !readRangeValid || productionReadBlocked}
-              onClick={() => void readRegisters()}>Đọc thanh ghi</Button>
-          </div>
-          <p className="plc-register-read-hint">FC03 · tối đa 100 WORD/lần. Bản ghi 1: D25020/100, D25120/100, D25220/40.</p>
-          {productionReadBlocked && <p className="plc-register-read-hint">Worker đang hoạt động; chưa đọc chẩn đoán để tránh ảnh hưởng thu dữ liệu. Có thể đọc khi đã dừng hoặc Worker đang pause.</p>}
-          {readError && <Alert type="error" showIcon title={readError} />}
-          {readResult && <>
-            <p className="plc-register-read-hint" role="status">
-              Đã đọc {readResult.words.length} WORD · {readResult.endpoint.ip}:{readResult.endpoint.port} · Unit ID {readResult.endpoint.unitId} · {formatReportTime(readResult.readAt)}
-            </p>
-            <Table size="small" rowKey="address" pagination={false} scroll={{ y: 280 }}
-              dataSource={readResult.words.map((value, index) => ({ address: readResult.startD + index, value, hex: `0x${value.toString(16).toUpperCase().padStart(4, "0")}` }))}
-              columns={[
-                { title: "Địa chỉ D", dataIndex: "address", align: "center", render: (value: number) => `D${value}` },
-                { title: "UINT16", dataIndex: "value", align: "center" },
-                { title: "Hex", dataIndex: "hex", align: "center" },
-              ]} />
-          </>}
-        </section>}
       </Card>
       <div className="plc-settings-right">
         <Card className="plc-settings-card plc-status-card" title="Trạng thái kết nối"
           extra={<span className={`page-status-pill ${display.verified ? "page-status-connected" : display.failed ? "page-status-error" : "page-status-unverified"}`}><i aria-hidden="true" />{display.plcLabel}</span>}>
           {currentError && <Alert type="error" showIcon title={currentError} />}
-          {worker?.rawCapture && <Alert type="warning" showIcon
-            title={`Đã lưu raw 240 WORD chưa giải mã · Inbox #${worker.rawCapture.inboxId}`}
-            description={<span title={worker.rawCapture.rawRegisters.join(", ")}>D25020–D25259: {worker.rawCapture.rawRegisters.join(", ")}. Raw được lưu chính thức để đối chiếu; chưa tạo measurement, không tính OK/NG và chưa gửi ACK khi chưa chứng minh được định danh/receipt.</span>} />}
           {ackUncertain && <Alert type="error" showIcon title="ACK chưa được đối chiếu" description="Giữ dữ liệu và yêu cầu đang chờ; không tự gửi lại ACK." />}
           <div className="plc-mini-kpis" aria-live="polite">{kpis.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value ?? "—"}</strong></div>)}</div>
         </Card>
@@ -270,12 +199,11 @@ export default function ConnectionSettings() {
             const failed = event.kind === "DISCONNECTED" || event.kind === "FAILED";
             return <div key={logKey(event)} className={successful ? "plc-log-success" : failed ? "plc-log-error" : "plc-log-neutral"}>
               <span aria-hidden="true">{successful ? "🟢" : failed ? "🔴" : "⚪"} </span>
-              <time dateTime={event.at}>{formatReportTime(event.at)}</time><span> — {event.message}</span>
+              <time dateTime={event.at}>{formatReportTime(event.at)}</time><span> — {plcConnectionError(event.message, "Đã cập nhật trạng thái kết nối PLC.")}</span>
             </div>;
           }) : <span className="plc-log-empty">Chưa có sự kiện kết nối.</span>}</div>
         </Card>
       </div>
     </div>
-    {registerUiEnabled && <PlcRegisterCard form={form} worker={worker} disabled={!!busy || !settings} onBusyChange={setRegisterBusy} onStopped={async () => { await refresh(); }} />}
   </div>;
 }

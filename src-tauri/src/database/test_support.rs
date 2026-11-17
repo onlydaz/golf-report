@@ -1,162 +1,231 @@
-//! Explicitly opt-in integration infrastructure. Never connects to the application database.
+//! Explicit opt-in Neon integration tests. No provisioning, migration or automatic cleanup.
 use sqlx::{
     PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions},
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
 };
+use std::str::FromStr;
 
-pub(crate) fn options() -> PgConnectOptions {
-    assert_eq!(
-        std::env::var("AS200_TEST_DATABASE").as_deref(),
-        Ok("golf_report_test")
-    );
-    let settings = super::config::load_config().unwrap();
+pub(crate) fn run_id() -> String {
+    let run = std::env::var("GOLF_NEON_TEST_RUN").expect("Set unique GOLF_NEON_TEST_RUN");
     assert!(
-        matches!(settings.host.as_str(), "localhost" | "127.0.0.1" | "::1"),
-        "Only the explicitly authorized local PostgreSQL test server is allowed"
+        run.starts_with("grit-")
+            && run.len() <= 32
+            && run.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     );
-    println!(
-        "TEST endpoint={}:{} target=golf_report_test role={} (password redacted)",
-        settings.host, settings.port, settings.username
-    );
-    PgConnectOptions::new()
-        .host(&settings.host)
-        .port(settings.port)
-        .username(&settings.username)
-        .password(&settings.password)
-        .database("golf_report_test")
-        .application_name("golf-report-prompt13-test")
+    run
 }
-pub(crate) async fn verify(pool: &PgPool) {
-    let (database, host, port, role, writable):(String,String,i32,String,bool)=sqlx::query_as(
-        "SELECT current_database()::text,host(inet_server_addr()),inet_server_port(),current_user::text,NOT current_setting('transaction_read_only')::boolean")
-        .fetch_one(pool).await.unwrap();
-    println!("VERIFIED database={database} server={host}:{port} role={role} writable={writable}");
-    assert_eq!(database, "golf_report_test");
-    assert!(writable);
-    assert!(matches!(
-        host.as_str(),
-        "127.0.0.1" | "::1" | "::ffff:127.0.0.1"
-    ));
+pub(crate) fn session() -> String {
+    format!("{}-session", run_id())
+}
+pub(crate) fn sku() -> String {
+    format!("IT-{}", run_id())
+}
+pub(crate) fn source_key(label: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!(
+        "{}-{label}-{}",
+        run_id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    assert!(key.len() <= 100);
+    println!("TEST_SOURCE key={key} session={}", session());
+    key
 }
 pub(crate) async fn pool(max: u32) -> PgPool {
+    verified_pool(max, false).await
+}
+pub(crate) async fn readonly_pool(max: u32) -> PgPool {
+    verified_pool(max, true).await
+}
+async fn verified_pool(max: u32, readonly: bool) -> PgPool {
+    assert_eq!(
+        std::env::var("GOLF_NEON_INTEGRATION").as_deref(),
+        Ok("I_ACCEPT_golf_report")
+    );
+    let config = super::config::load_config().expect("Cannot load configured database file");
+    let url = config
+        .connection_string
+        .as_deref()
+        .expect("Neon URL required");
+    let options =
+        PgConnectOptions::from_str(url).unwrap_or_else(|_| panic!("Invalid DB URL (redacted)"));
+    assert_eq!(
+        options.get_host(),
+        "ep-long-shape-azaeb4rd.c-3.ap-southeast-1.aws.neon.tech"
+    );
+    assert_eq!(options.get_database(), Some("golf_report"));
+    assert_eq!(options.get_port(), 5432);
+    let options = options
+        .ssl_mode(PgSslMode::VerifyFull)
+        .application_name("golf-report-neon-integration")
+        .options([
+            ("search_path", "public"),
+            ("statement_timeout", "15000"),
+            ("lock_timeout", "5000"),
+        ]);
+    let options = if readonly {
+        options.options([("default_transaction_read_only", "on")])
+    } else {
+        options
+    };
     let pool = PgPoolOptions::new()
         .max_connections(max)
-        .connect_with(options())
+        .acquire_timeout(std::time::Duration::from_secs(20))
+        .connect_with(options)
         .await
-        .unwrap();
-    verify(&pool).await;
-    let allowed:bool=sqlx::query_scalar("SELECT bool_and(has_table_privilege(current_user,tablename,'SELECT,INSERT,UPDATE')) FROM pg_tables WHERE schemaname='public' AND tablename <> '_sqlx_migrations'")
+        .unwrap_or_else(|_| panic!("Cannot connect verified Neon target (credentials omitted)"));
+    let (db,schema,ro):(String,String,String)=sqlx::query_as("SELECT current_database()::text,current_schema()::text,current_setting('transaction_read_only')")
         .fetch_one(&pool).await.unwrap();
-    assert!(allowed, "Integration role lacks table permissions");
+    assert_eq!(db, "golf_report");
+    assert_eq!(schema, "public");
+    assert_eq!(ro, if readonly { "on" } else { "off" });
+    let (tables, history) = super::migrations::audit(&pool).await.unwrap();
+    super::migrations::validate_history(&tables, &history).unwrap();
+    assert_eq!(history.len(), super::migrations::MIGRATOR.iter().count());
+    assert!(history.iter().all(|m| m.success));
+    for m in super::migrations::MIGRATOR.iter() {
+        assert!(history.iter().any(|h| h.version == m.version));
+    }
+    verify_untouched(&pool).await;
+    println!(
+        "TEST_TARGET database={db} schema={schema} readonly={readonly} run={}",
+        run_id()
+    );
+    let inventory:serde_json::Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(jsonb_build_object('id',s.id,'sourceKey',s.source_key,'session',(SELECT session_id FROM plc_acquisition WHERE source_id=s.id),'inbox',(SELECT count(*) FROM plc_inbox WHERE source_id=s.id),'measurements',(SELECT count(*) FROM measurements WHERE source_id=s.id)) ORDER BY s.id),'[]'::jsonb) FROM plc_sources s WHERE starts_with(s.source_key,$1)")
+        .bind(format!("{}-",run_id())).fetch_one(&pool).await.unwrap();
+    println!("TEST_INVENTORY {inventory}");
+    let counts:serde_json::Value=sqlx::query_scalar("WITH s AS (SELECT id FROM plc_sources WHERE starts_with(source_key,$1)),m AS (SELECT id FROM measurements WHERE source_id IN(SELECT id FROM s)),st AS (SELECT id FROM measurement_stations WHERE measurement_id IN(SELECT id FROM m)),p AS (SELECT id FROM measurement_points WHERE station_id IN(SELECT id FROM st)) SELECT jsonb_build_object('plc_sources',(SELECT count(*) FROM s),'plc_inbox',(SELECT count(*) FROM plc_inbox WHERE source_id IN(SELECT id FROM s)),'plc_acquisition',(SELECT count(*) FROM plc_acquisition WHERE source_id IN(SELECT id FROM s)),'measurements',(SELECT count(*) FROM m),'measurement_stations',(SELECT count(*) FROM st),'measurement_points',(SELECT count(*) FROM p),'measurement_attempts',(SELECT count(*) FROM measurement_attempts WHERE point_id IN(SELECT id FROM p)))")
+        .bind(format!("{}-",run_id())).fetch_one(&pool).await.unwrap();println!("TEST_TABLE_COUNTS {counts}");
+
     pool
 }
-
-#[tokio::test]
-#[ignore = "Explicit AS200_TEST_DATABASE=golf_report_test only; creates test DB if absent, migrates without reset"]
-async fn prepare_postgres_integration_database() {
-    let maintenance = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options().database("postgres"))
-        .await
-        .unwrap();
-    let maintenance_name: String = sqlx::query_scalar("SELECT current_database()::text")
-        .fetch_one(&maintenance)
-        .await
-        .unwrap();
-    assert_eq!(maintenance_name, "postgres");
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname='golf_report_test')",
-    )
-    .fetch_one(&maintenance)
-    .await
-    .unwrap();
-    if !exists {
-        let can_create: bool = sqlx::query_scalar(
-            "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname=current_user",
-        )
-        .fetch_one(&maintenance)
-        .await
-        .unwrap();
-        assert!(
-            can_create,
-            "No permission to create isolated test database; do not use another database"
+async fn verify_untouched(pool: &PgPool) {
+    let mut snapshot = serde_json::Map::new();
+    // Hash every pre-existing source's rows and tracking. No payload/credential is printed.
+    for (table, joins, key) in [
+        ("plc_sources", "", "t.id"),
+        (
+            "plc_acquisition",
+            " JOIN plc_sources s ON s.id=t.source_id",
+            "t.source_id",
+        ),
+        (
+            "plc_inbox",
+            " JOIN plc_sources s ON s.id=t.source_id",
+            "t.id",
+        ),
+        (
+            "measurements",
+            " JOIN plc_sources s ON s.id=t.source_id",
+            "t.id",
+        ),
+        (
+            "measurement_stations",
+            " JOIN measurements m ON m.id=t.measurement_id JOIN plc_sources s ON s.id=m.source_id",
+            "t.id",
+        ),
+        (
+            "measurement_points",
+            " JOIN measurement_stations st ON st.id=t.station_id JOIN measurements m ON m.id=st.measurement_id JOIN plc_sources s ON s.id=m.source_id",
+            "t.id",
+        ),
+        (
+            "measurement_attempts",
+            " JOIN measurement_points p ON p.id=t.point_id JOIN measurement_stations st ON st.id=p.station_id JOIN measurements m ON m.id=st.measurement_id JOIN plc_sources s ON s.id=m.source_id",
+            "t.id",
+        ),
+    ] {
+        let source = if table == "plc_sources" { "t" } else { "s" };
+        let sql = format!(
+            "SELECT jsonb_build_object('count',count(*),'hash',md5(coalesce(string_agg(row_to_json(t)::text,'' ORDER BY {key}),''))) FROM public.{table} t{joins} WHERE NOT starts_with({source}.source_key,$1)"
         );
-        sqlx::query("CREATE DATABASE golf_report_test")
-            .execute(&maintenance)
+        let value: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(format!("{}-", run_id()))
+            .fetch_one(pool)
             .await
             .unwrap();
-        println!("CREATED golf_report_test; no production data copied");
-    } else {
-        println!("EXISTING golf_report_test: preserving all existing objects and data");
+        snapshot.insert(table.into(), value);
     }
-    maintenance.close().await;
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options())
-        .await
-        .unwrap();
-    verify(&pool).await;
-    let (tables, history) = super::migrations::audit(&pool).await.unwrap();
-    println!("BEFORE migration tables={tables:?} history={history:?}");
-    super::migrations::migrate(&pool).await.unwrap();
-    let (tables, history) = super::migrations::audit(&pool).await.unwrap();
-    assert_eq!(tables.len(), 7);
-    assert_eq!(history.len(), 1);
-    assert!(history[0].success);
-    let constraints:Vec<String>=sqlx::query_scalar("SELECT conname::text FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conname").fetch_all(&pool).await.unwrap();
-    let indexes: Vec<String> = sqlx::query_scalar(
-        "SELECT indexname::text FROM pg_indexes WHERE schemaname='public' ORDER BY indexname",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert!(indexes.iter().any(|n| n == "inbox_confirmed_sequence"));
-    assert!(
-        indexes
-            .iter()
-            .any(|n| n == "measurements_confirmed_sequence")
-    );
-    assert!(constraints.len() > 20);
-    let version: String = sqlx::query_scalar("SHOW server_version")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let counts:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM plc_sources),(SELECT count(*) FROM plc_inbox),(SELECT count(*) FROM measurements)").fetch_one(&pool).await.unwrap();
-    println!(
-        "SCHEMA PostgreSQL={version} tables={tables:?} history={history:?} counts(source,inbox,measurement)={counts:?}\nCONSTRAINTS={constraints:?}\nINDEXES={indexes:?}"
-    );
-    pool.close().await;
+    let value:serde_json::Value=sqlx::query_scalar("SELECT jsonb_build_object('count',count(*),'hash',md5(coalesce(string_agg(row_to_json(t)::text,'' ORDER BY version),''))) FROM public._sqlx_migrations t").fetch_one(pool).await.unwrap();
+    snapshot.insert("_sqlx_migrations".into(), value);
+    let path = std::env::temp_dir().join(format!("{}-baseline.json", run_id()));
+    let snapshot = serde_json::Value::Object(snapshot);
+    if path.exists() {
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            snapshot, before,
+            "Rows outside this run changed; investigate concurrent activity, never overwrite production"
+        );
+    } else {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec_pretty(&snapshot).unwrap())
+            .unwrap();
+    }
+    println!("PRODUCTION_SNAPSHOT_UNCHANGED {snapshot}");
 }
 
-#[tokio::test]
-#[ignore = "SELECT audit on verified golf_report_test after DML; no cleanup or reset"]
-async fn postgres_prompt13_final_database_audit() {
-    let pool = pool(1).await;
-    let counts:(i64,i64,i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM plc_sources),(SELECT count(*) FROM plc_inbox),(SELECT count(*) FROM measurements),(SELECT count(*) FROM measurement_stations),(SELECT count(*) FROM measurement_points),(SELECT count(*) FROM measurement_attempts)").fetch_one(&pool).await.unwrap();
-    let states:Vec<(String,i64)>=sqlx::query_as("SELECT processing_status::text,count(*) FROM plc_inbox GROUP BY processing_status ORDER BY processing_status").fetch_all(&pool).await.unwrap();
-    let fixtures:Vec<(String,i64,i64)>=sqlx::query_as("SELECT s.source_key::text,(SELECT count(*) FROM plc_inbox i WHERE i.source_id=s.id),(SELECT count(*) FROM measurements m WHERE m.source_id=s.id) FROM plc_sources s ORDER BY s.id").fetch_all(&pool).await.unwrap();
-    let duplicates:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM (SELECT source_id,session_id,record_seq FROM measurements WHERE session_id IS NOT NULL GROUP BY 1,2,3 HAVING count(*)>1) x)+(SELECT count(*) FROM (SELECT source_id,session_id,record_seq FROM plc_inbox WHERE session_id IS NOT NULL GROUP BY 1,2,3 HAVING count(*)>1) y)").fetch_one(&pool).await.unwrap();
-    let invalid_links:i64=sqlx::query_scalar("SELECT count(*) FROM plc_inbox i LEFT JOIN measurements m ON m.id=i.measurement_id WHERE i.processing_status='PROCESSED' AND (m.id IS NULL OR i.source_id<>m.source_id OR i.session_id IS DISTINCT FROM m.session_id OR i.record_seq<>m.record_seq)").fetch_one(&pool).await.unwrap();
-    let partial:i64=sqlx::query_scalar("SELECT count(*) FROM measurements m WHERE (SELECT count(*) FROM measurement_stations s WHERE s.measurement_id=m.id)<>2 OR (SELECT count(*) FROM measurement_points p JOIN measurement_stations s ON s.id=p.station_id WHERE s.measurement_id=m.id)<>8").fetch_one(&pool).await.unwrap();
-    let invalid_attempts:i64=sqlx::query_scalar("SELECT count(*) FROM measurement_points p WHERE (SELECT count(*) FROM measurement_attempts a WHERE a.point_id=p.id)<>p.attempt_count").fetch_one(&pool).await.unwrap();
-    let stray_triggers: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname='as200_test_failure'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        (
-            duplicates,
-            invalid_links,
-            partial,
-            invalid_attempts,
-            stray_triggers
-        ),
-        (0, 0, 0, 0, 0)
-    );
-    println!(
-        "FINAL counts sources/inbox/measurements/stations/points/attempts={counts:?}\nSTATES={states:?}\nFIXTURES={fixtures:?}\nDUPLICATES={duplicates} INVALID_LINKS={invalid_links} PARTIAL_TREES={partial} INVALID_ATTEMPT_COUNTS={invalid_attempts} LEFTOVER_TRIGGERS={stray_triggers}"
-    );
-    pool.close().await;
+/// Valid completed NG at TIP P1, BUTT P1-P4 OK; unused TIP slots stay zero.
+pub(crate) fn registers(seq: i32) -> Vec<u16> {
+    let mut raw = vec![0; 240];
+    raw[0] = 1;
+    raw[1] = 1;
+    raw[2] = 42;
+    raw[4] = 0x4241;
+    raw[20] = 2;
+    raw[22] = seq as u16;
+    raw[23] = (seq as u32 >> 16) as u16;
+    for (header, base, count, load) in [(24, 32, 4, 125.5_f32), (120, 128, 1, 165.25_f32)] {
+        raw[header] = if header == 120 { 2 } else { 1 };
+        raw[header + 1] = count;
+        raw[header + 2] = if header == 120 { 1 } else { 0 };
+        let bits = load.to_bits();
+        raw[header + 4] = bits as u16;
+        raw[header + 5] = (bits >> 16) as u16;
+        for point in 0..usize::from(count) {
+            let p = base + point * 22;
+            raw[p] = if header == 120 { 2 } else { 1 };
+            raw[p + 1] = 4;
+            raw[p + 2] = 4;
+            for a in 0..4 {
+                for (offset, value) in [
+                    (6 + a * 4, 1.25_f32 + a as f32),
+                    (8 + a * 4, -0.5_f32 - a as f32),
+                ] {
+                    let bits = value.to_bits();
+                    raw[p + offset] = bits as u16;
+                    raw[p + offset + 1] = (bits >> 16) as u16;
+                }
+            }
+        }
+    }
+    raw
+}
+
+pub(crate) fn receipt(seq: i32) -> crate::models::InboxRecord {
+    crate::models::InboxRecord {
+        publication_session: Some("test-session".into()),
+        publication_count: Some(seq),
+        assigned_sku: Some("SKU-FROZEN".into()),
+        decode_error: None,
+        id: i64::from(seq) + 1,
+        source_id: 1,
+        session_id: None,
+        ingest_key: format!("publication-v1:12:test-session:{seq}"),
+        record_seq: seq,
+        total_count: Some(i64::from(seq)),
+        buffer_index: 0,
+        raw_registers: serde_json::to_value(registers(seq)).unwrap(),
+        word_order: "LOW".into(),
+        received_at: chrono::Utc::now(),
+        processing_status: "SESSION_UNCONFIRMED".into(),
+        measurement_id: None,
+        error_message: None,
+        processed_at: None,
+    }
 }

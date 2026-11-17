@@ -19,10 +19,8 @@ export interface As200Latest {
 }
 
 export interface As200Status {
-  rawCapture?: { inboxId: number; receivedAt: string; totalCount: number; kind: "ZERO" | "UNDECODED"; rawRegisters: number[] } | null;
   readTelemetry?: { date: string; observedSince: string; readErrors: number; disconnects: number } | null;
   controlSnapshot?: { heartbeat: number; total_count: number; data_ready: number; pc_read_count: number; pc_read_done: number } | null;
-  publishedRecordSeq?: number | null;
   connectedAt?: string | null;
   connectionEndedAt?: string | null;
   lastReadAt?: string | null;
@@ -30,11 +28,9 @@ export interface As200Status {
   lastError?: string | null;
   connectionEvents?: { at: string; kind: "CONNECTED" | "RECONNECTED" | "DISCONNECTED" | "FAILED" | "MANUAL_STOP"; endpoint: string; message: string }[];
   connectionLogError?: string | null;
-  manualRetryResults: { inboxId: number; state: "PENDING" | "WAITING" | "APPLIED" | "REJECTED"; error: string | null }[];
   blockedInboxCount: number;
   blockedInboxIds: number[];
   retryWaitingCount: number;
-  retryDiagnostics: string[];
   plcHealth: "UNCONFIGURED" | "OBSERVING" | "RUNNING" | "STALE" | "DISCONNECTED" | "INVALID_DATA";
   pcHeartbeatStatus: string;
   ackStatus:
@@ -57,7 +53,6 @@ export interface As200Status {
   message: string;
   pauseReason: string | null;
   warnings: string[];
-  volatileCount: number;
   latest: As200Latest | null;
   lastSavedId: number | null;
 }
@@ -66,8 +61,5 @@ export const getAs200WorkerStatus = () =>
   invoke<As200Status>("get_as200_worker_status");
 
 export const reconnectAs200Plc = () => invoke<void>("reconnect_as200_plc");
-
-export const acknowledgeAs200BufferGap = () =>
-  invoke<void>("acknowledge_as200_buffer_gap");
 
 export const retryAs200Inbox = (inboxId: number) => invoke<void>("retry_as200_inbox", { inboxId });

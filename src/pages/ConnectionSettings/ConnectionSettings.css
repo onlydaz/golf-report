@@ -29,12 +29,6 @@
 .plc-settings-actions .ant-btn-primary:not(:disabled) { background: #1769aa; border-color: #1769aa; }
 .plc-settings-actions .ant-btn-primary:not(:disabled):hover { background: #12558c; border-color: #12558c; }
 .plc-settings-saved { margin: 0; color: #267347; font-size: 13px; line-height: 1.6; }
-.plc-register-read { margin-top: 18px; padding-top: 16px; border-top: 1px solid #e3ebf3; min-width: 0; }
-.plc-register-read-inputs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
-.plc-register-read-inputs label { display: flex; flex: 1 1 110px; flex-direction: column; gap: 5px; color: #102a43; font-size: 14px; font-weight: 600; }
-.plc-register-read-inputs .ant-btn { min-height: 36px; }
-.plc-register-read-hint { margin: 10px 0; color: #526b83; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
-.plc-register-read .ant-alert { margin-top: 10px; }
 .plc-status-card .ant-alert { margin-bottom: 12px; }
 .plc-mini-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .plc-mini-kpis > div { min-width: 0; padding: 10px; background: #f3f7fb; border-radius: 8px; }

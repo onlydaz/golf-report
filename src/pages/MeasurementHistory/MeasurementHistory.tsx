@@ -1,5 +1,5 @@
 import { EyeOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, DatePicker, Empty, InputNumber, Select, Spin, Table, Tag } from "antd";
+import { Alert, Button, Card, DatePicker, Empty, InputNumber, Select, Spin, Table } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { Dayjs } from "dayjs";
 import { useEffect, useRef, useState } from "react";
@@ -9,9 +9,8 @@ import PageHeader from "../../components/PageHeader";
 import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import {
   getMeasurementHistoryPage, getMeasurementSkus, getMeasurementSkuSummary, getMeasurementStatistics,
-  getPlcRawSnapshots,
   type MeasurementHistoryItem, type MeasurementHistoryPage, type MeasurementListRequest,
-  type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics, type PlcRawSnapshot,
+  type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics,
 } from "../../services/measurementService";
 import { formatDecimal, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime, reportDateBoundary } from "../../utils/reportTime";
@@ -38,9 +37,6 @@ function MeasurementHistory() {
   const [summaryError, setSummaryError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [statisticsError, setStatisticsError] = useState("");
-  const [rawSnapshots, setRawSnapshots] = useState<PlcRawSnapshot[]>([]);
-  const [rawSnapshotLoading, setRawSnapshotLoading] = useState(false);
-  const [rawSnapshotError, setRawSnapshotError] = useState("");
   const [filterError, setFilterError] = useState("");
   const [skuSearch, setSkuSearch] = useState({ text: "", page: 1 });
   const [skuOptions, setSkuOptions] = useState<string[]>([]);
@@ -94,16 +90,6 @@ function MeasurementHistory() {
       .finally(() => { if (active) setStatisticsLoading(false); });
     return () => { active = false; };
   }, [query.filters, databaseConnected, status?.lastSavedId, reload]);
-
-  useEffect(() => {
-    let active = true;
-    setRawSnapshotLoading(databaseConnected); setRawSnapshotError("");
-    if (!databaseConnected) { setRawSnapshots([]); return; }
-    void getPlcRawSnapshots().then(rows => { if (active) setRawSnapshots(rows); })
-      .catch(() => { if (active) setRawSnapshotError("Không thể tải lịch sử raw PLC."); })
-      .finally(() => { if (active) setRawSnapshotLoading(false); });
-    return () => { active = false; };
-  }, [databaseConnected, status?.lastSavedId, status?.rawCapture?.inboxId, reload]);
 
   useEffect(() => {
     let active = true;
@@ -162,19 +148,6 @@ function MeasurementHistory() {
     })),
     { title: "", key: "action", width: 150, align: "center", render: (_, row) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/measurements/${row.id}`)}>Xem chi tiết</Button> },
   ];
-  const rawColumns: ColumnsType<PlcRawSnapshot> = [
-    { title: "Loại", dataIndex: "kind", width: 120, render: (kind: PlcRawSnapshot["kind"]) => <Tag color="blue">RAW · {kind}</Tag> },
-    { title: "Thời gian nhận", dataIndex: "receivedAt", width: 180, render: formatReportTime },
-    { title: "RecordSeq", dataIndex: "recordSeq", width: 110, align: "right" },
-    { title: "TotalCount", dataIndex: "totalCount", width: 110, align: "right", render: (value: number | null) => value ?? "—" },
-    { title: "Tổng WORD", dataIndex: "wordCount", width: 110, align: "right" },
-    { title: "WORD khác 0", dataIndex: "nonZeroWords", width: 125, align: "right" },
-    { title: "Inbox", dataIndex: "id", width: 90, align: "right" },
-    { title: "Trạng thái", dataIndex: "processingStatus", width: 150,
-      render: (value: string) => value === "SESSION_UNCONFIRMED" ? "Đã lưu raw, chưa giải mã" : value },
-    { title: "Giá trị D25020–D25259", dataIndex: "rawRegisters", width: 520,
-      render: (values: number[]) => <span title={values.join(", ")} style={{ display: "block", maxWidth: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" }}>{values.join(", ")}</span> },
-  ];
   const shownFrom = detailPage?.total ? (selection.page - 1) * pageSize + 1 : 0;
   const shownTo = detailPage ? Math.min(selection.page * pageSize, detailPage.total) : 0;
   const options = [...new Set([...(draft.productCode ? [draft.productCode] : []), ...skuOptions])]
@@ -213,12 +186,6 @@ function MeasurementHistory() {
           onKeyDown: event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelection({ scope: query.filters, sku: row.productCode, page: 1 }); } }, style: { cursor: "pointer" } })}
         pagination={{ current: query.page, pageSize, total: skuPage?.total ?? 0, showSizeChanger: false, onChange: page => setQuery(current => ({ ...current, page })) }}
         scroll={{ x: 1110 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={summaryError ? "Chưa tải được tổng hợp SKU" : "Không có SKU phù hợp"} /> }} />
-    </Card>
-    <Card className="section-card" title="Raw PLC đã nhận" extra={<span className="history-table-note">Bản ghi chính thức, tách khỏi Measurement khi chưa giải mã đủ</span>}>
-      {rawSnapshotError && <Alert type="error" showIcon title={rawSnapshotError} />}
-      <Table<PlcRawSnapshot> className="history-table" rowKey="id" columns={rawColumns} dataSource={rawSnapshots} loading={rawSnapshotLoading}
-        pagination={{ pageSize: 10, showSizeChanger: false }} scroll={{ x: 760 }}
-        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={rawSnapshotError ? "Chưa tải được raw PLC" : "Chưa có raw PLC"} /> }} />
     </Card>
     <Card className="section-card" title={selectedSku ? `Chi tiết gậy · ${selectedSku}` : "Chi tiết gậy"} extra={<span className="history-table-note">Hiển thị {shownFrom}–{shownTo} / {detailPage?.total ?? 0} gậy</span>}>
       {detailError && <Alert type="error" showIcon title={detailError} />}

@@ -1,5 +1,5 @@
 use crate::{enums::MeasurementResult, models::*, repositories::*};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 pub struct MeasurementService;
 impl MeasurementService {
     pub fn validate(input: &MeasurementDraft) -> Result<(), String> {
@@ -112,22 +112,5 @@ impl MeasurementService {
             }
         }
         Ok(id)
-    }
-    pub async fn list(
-        pool: &PgPool,
-        request: MeasurementListRequest,
-    ) -> Result<MeasurementListResponse, String> {
-        MeasurementRepository::list(pool, &request).await
-    }
-    pub async fn find_by_id(pool: &PgPool, id: i64) -> Result<Measurement, String> {
-        MeasurementRepository::find_by_id(pool, id)
-            .await?
-            .ok_or_else(|| "Không tìm thấy phép đo".into())
-    }
-    pub async fn statistics(
-        pool: &PgPool,
-        request: MeasurementListRequest,
-    ) -> Result<MeasurementStatistics, String> {
-        MeasurementRepository::statistics(pool, &request).await
     }
 }

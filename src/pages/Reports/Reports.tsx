@@ -219,7 +219,6 @@ function Reports() {
     { title: "Thời gian nhận", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
     { title: "SKU", dataIndex: "productCode", width: 150 },
     { title: "Số gậy", dataIndex: "clubNumber", width: 80 },
-    { title: "RecordSeq", dataIndex: "recordSeq", width: 100 },
     { title: "BUTT Load (g)", dataIndex: "buttLoad", render: formatDecimal, width: 125 },
     { title: "TIP Load (g)", dataIndex: "tipLoad", render: formatDecimal, width: 125 },
     ...([ ["Butt", "buttResult"], ["Tip", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({

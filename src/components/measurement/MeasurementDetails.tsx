@@ -58,16 +58,6 @@ export default function MeasurementDetails({
                 children: data.clubNumber,
               },
               {
-                key: "seq",
-                label: "Mã lượt đo (RecordSeq)",
-                children: data.recordSeq,
-              },
-              {
-                key: "total",
-                label: "Tổng số lượt đo",
-                children: data.totalCount ?? "—",
-              },
-              {
                 key: "time",
                 label: "Thời gian nhận",
                 children: formatReportTime(data.measuredAt),

@@ -27,8 +27,6 @@ export interface PlcConnectionSettings {
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
 export const saveOperatorSku = (sku: string) => invoke<PlcConnectionSettings>("save_operator_sku", { sku });
 export const clearPlcConnectionLog = () => invoke<void>("clear_plc_connection_log");
-export const savePlcPollInterval = (pollIntervalMs: number) =>
-  invoke<PlcConnectionSettings>("save_plc_poll_interval", { pollIntervalMs });
 export const savePlcConnectionOptions = (pollIntervalMs: number, plcLocalIp: string) =>
   invoke<PlcConnectionSettings>("save_plc_connection_options", { pollIntervalMs, plcLocalIp });
 export interface PlcInspectionReport {
@@ -39,74 +37,9 @@ export interface PlcInspectionReport {
   message: string;
 }
 export const testPlcConnection = () => invoke<PlcInspectionReport>("test_plc_connection");
-export interface PlcRegisterWordsReport {
-  endpoint: PlcEndpoint;
-  plcLocalIp: string | null;
-  modbusAddressOffset: number;
-  startD: number;
-  words: number[];
-  readAt: string;
-}
-export const readPlcRegisterWords = (startD: number, wordCount: number) =>
-  invoke<PlcRegisterWordsReport>("read_plc_register_words", { startD, wordCount });
 export const connectPlcCollection = () => invoke<void>("connect_plc_collection");
 export const stopPlcCollection = () => invoke<void>("stop_plc_collection");
 
-export interface PlcRegisterSelection {
-  endpoint: PlcEndpoint;
-  kind: "BOOL" | "WORD";
-  address: string;
-}
-export interface PlcRegisterAccess {
-  address: string;
-  pduAddress: number;
-  addressOffset: number;
-  deviceModel: string;
-  programId: string;
-  readFunction: number;
-  writeFunction: number;
-  allowedValues: number[];
-  writeAllowed: boolean;
-  writeBlockReason: string | null;
-}
-export interface PlcRegisterRead { access: PlcRegisterAccess; value: number }
-export interface PlcRegisterWriteReport {
-  access: PlcRegisterAccess;
-  before: number;
-  requested: number;
-  after: number | null;
-  writeStatus: "ECHO_CONFIRMED" | "REFUSED" | "UNCONFIRMED";
-  readbackMatches: boolean | null;
-  message: string;
-}
-export const getPlcRegisterUiEnabled = () => invoke<boolean>("get_plc_register_ui_enabled");
-async function requirePlcRegisterUiEnabled() {
-  if (!await getPlcRegisterUiEnabled()) {
-    throw "Công cụ đọc/ghi thanh ghi kỹ thuật đang tắt.";
-  }
-}
-export const getPlcRegisterAccess = async (selection: PlcRegisterSelection) => {
-  await requirePlcRegisterUiEnabled();
-  return invoke<PlcRegisterAccess>("get_plc_register_access", { selection });
-};
-export const readPlcRegister = async (selection: PlcRegisterSelection) => {
-  await requirePlcRegisterUiEnabled();
-  return invoke<PlcRegisterRead>("read_plc_register", { selection });
-};
-export const writePlcRegister = async (request: {
-  selection: PlcRegisterSelection;
-  value: number;
-  expectedBefore: number;
-  programId: string;
-  mappingConfirmed: boolean;
-  deviceConfirmed: boolean;
-  machineSafeConfirmed: boolean;
-  pduAddress: number;
-  addressOffset: number;
-}) => {
-  await requirePlcRegisterUiEnabled();
-  return invoke<PlcRegisterWriteReport>("write_plc_register", { request });
-};
 export function isPlcIp(value: string): boolean {
   if (value.includes(":")) {
     if (!/^[0-9a-fA-F:]+$/.test(value)) return false;
@@ -117,6 +50,13 @@ export function isPlcIp(value: string): boolean {
 }
 export function plcConnectionError(error: unknown, fallback: string): string {
   if (typeof error !== "string") return fallback;
+  // Backend diagnostics remain internal; operator messages retain the required action.
+  if (/\braw\b|RAW_|240\s*WORD|D25020|D25259|\binbox\b|RecordSeq|TotalCount/i.test(error)) {
+    if (/ACK|RESET|CONFLICT|RECONCILIATION|đối chiếu|bộ đếm/i.test(error)) {
+      return "Dữ liệu hoặc xác nhận từ PLC cần đối chiếu. Không tự gửi lại ACK; vui lòng liên hệ kỹ thuật.";
+    }
+    return "Chưa có kết quả đo hợp lệ để hiển thị. Vui lòng liên hệ kỹ thuật nếu tình trạng kéo dài.";
+  }
   // Preserve protective warnings before replacing transport/internal errors.
   const protectiveWarnings: [RegExp, string][] = [
     [/reset|bộ đếm.*giảm|counter.*decreas/i, "Bộ đếm máy đo cần đối chiếu sau reset. Chưa thể tiếp tục thu; vui lòng liên hệ kỹ thuật."],

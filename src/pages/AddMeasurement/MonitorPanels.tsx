@@ -104,7 +104,7 @@ export function BendComparison({ records, productCode, loading, error, simulator
             const row = series.find(item => item.id === Number(label));
             if (!active || !row) return null;
             return <div className="monitor-bend-tooltip"><strong>{station} · Gậy #{row.clubNumber}</strong>
-              <div>{formatReportTime(row.measuredAt)} · RecordSeq {row.recordSeq}</div>
+              <div>{formatReportTime(row.measuredAt)}</div>
               <div>Giới hạn: {demo ? `${decimal(demo.bendMin)} – ${decimal(demo.bendMax)} mm (DEMO)` : "Chưa có dữ liệu cài đặt"}</div>
               {colors.map((color, i) => {
                 const value = row[keys[i]];

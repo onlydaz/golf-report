@@ -24,12 +24,18 @@ pub struct ModbusTcpReader {
 }
 impl ModbusTcpReader {
     pub fn new(config: As200Config) -> Self {
-        Self { config, ctx: None, local_ip: None }
+        Self {
+            config,
+            ctx: None,
+            local_ip: None,
+        }
     }
 
     async fn exchange(&mut self, address: u16, count: u16) -> Result<Vec<u16>, As200Error> {
         if self.ctx.is_none() {
-            let stream = super::connect_tcp(&self.config.address, self.local_ip, self.config.timeout).await?;
+            let stream =
+                super::connect_tcp(&self.config.address, self.local_ip, self.config.timeout)
+                    .await?;
             let ctx = tcp::attach_slave(stream, Slave(self.config.unit_id));
             self.ctx = Some(ctx);
         }
@@ -83,11 +89,24 @@ impl HoldingRegisterReader for ModbusTcpReader {
             .await
             .unwrap_or(Err(As200Error::Timeout));
         if matches!(&result, Err(As200Error::Timeout)) {
-            eprintln!("PLC_READ state=TIMEOUT endpoint={} local_ip={:?} stage={} timeout_ms={}",
-                self.config.address, self.local_ip, if self.ctx.is_some() { "FC03" } else { "TCP_CONNECT" }, duration.as_millis());
+            eprintln!(
+                "PLC_READ state=TIMEOUT endpoint={} local_ip={:?} stage={} timeout_ms={}",
+                self.config.address,
+                self.local_ip,
+                if self.ctx.is_some() {
+                    "FC03"
+                } else {
+                    "TCP_CONNECT"
+                },
+                duration.as_millis()
+            );
             if self.ctx.is_none() && self.local_ip.is_some() {
-                result = Err(As200Error::Transport(format!("Hết thời gian kết nối TCP PLC {}, IP nguồn {:?}. {}",
-                    self.config.address, self.local_ip, super::ROUTE_HELP)));
+                result = Err(As200Error::Transport(format!(
+                    "Hết thời gian kết nối TCP PLC {}, IP nguồn {:?}. {}",
+                    self.config.address,
+                    self.local_ip,
+                    super::ROUTE_HELP
+                )));
             }
         }
         // Sau lỗi/timeout, socket có thể chứa response dở. Hủy kết nối, nối lại ở lần gọi sau.
@@ -101,7 +120,7 @@ impl HoldingRegisterReader for ModbusTcpReader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
     /// Payload toàn 0: giữ raw; không suy diễn thành measurement.
-    ZeroTestRecord,
+    ZeroPayload,
     InvalidRecord {
         buffer_index: usize,
         error: String,
@@ -126,14 +145,6 @@ pub struct PublishedRecordSnapshot {
     /// None khi DataReady=0 đã được đọc lại ổn định; khi đó không đọc vùng bản ghi.
     pub buffer: Option<BufferSnapshot>,
     pub diagnostics: Vec<Diagnostic>,
-}
-impl PublishedRecordSnapshot {
-    pub fn is_zero_test(&self) -> bool {
-        self.control.data_ready == 1 && self.buffer.as_ref().is_some_and(|buffer| {
-            buffer.buffer_index == 0 && buffer.raw_registers.len() == map::RECORD_SIZE
-                && buffer.raw_registers.iter().all(|word| *word == 0)
-        })
-    }
 }
 pub struct As200Reader<T = ModbusTcpReader> {
     config: As200Config,
@@ -246,7 +257,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
 
         let mut diagnostics = Vec::new();
         let record = if raw.iter().all(|word| *word == 0) {
-            diagnostics.push(Diagnostic::ZeroTestRecord);
+            diagnostics.push(Diagnostic::ZeroPayload);
             None // Keep all 240 words. Version/Status/sequence are not invented.
         } else if raw[map::record::STATUS] & 1 == 0 {
             diagnostics.push(Diagnostic::InvalidRecord {
@@ -257,22 +268,10 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         } else {
             match decode::record(&raw, 0, self.config.word_order) {
                 Ok(record) => {
-                    if let Err(error) = record.validate_metadata(Some(i64::from(after.total_count)))
-                    {
-                        diagnostics.push(Diagnostic::InvalidRecord {
-                            buffer_index: 0,
-                            error,
-                        });
-                    }
                     if !record.complete() {
                         diagnostics.push(Diagnostic::IncompleteRecord {
                             buffer_index: 0,
                             record_seq: record.record_seq,
-                        });
-                    } else if let Err(error) = record.validate_workflow() {
-                        diagnostics.push(Diagnostic::InvalidRecord {
-                            buffer_index: 0,
-                            error,
                         });
                     }
                     Some(record)

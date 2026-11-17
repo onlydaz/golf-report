@@ -109,6 +109,7 @@ impl DatabaseState {
                 };
             }
             Err((state, message)) => {
+                eprintln!("DATABASE_STARTUP state={state:?} reason={message}");
                 let mut inner = self.inner.lock().await;
                 inner.pool = None;
                 inner.status = DatabaseStatus { state, message };
@@ -157,6 +158,12 @@ impl DatabaseState {
                 .username(&config.username)
                 .password(&config.password)
         };
+        eprintln!(
+            "DATABASE_CONNECT host={} port={} database={}",
+            options.get_host(),
+            options.get_port(),
+            options.get_database().unwrap_or("<default>"),
+        );
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(if cloud { 15 } else { 3 }))
@@ -202,25 +209,9 @@ async fn health_with_timeout(
 mod health_tests {
     use super::*;
     #[tokio::test]
-    #[ignore = "Opt-in AS200_READONLY_DATABASE=golf_report; SELECT only, no database outage or DML"]
+    #[ignore = "Explicit Neon integration opt-in; SELECT only, no real database outage"]
     async fn postgres_health_probe_recovers_status_on_the_same_pool_read_only() {
-        let target =
-            std::env::var("AS200_READONLY_DATABASE").expect("Specify read-only audit database");
-        assert_eq!(target, "golf_report");
-        let config = load_config().unwrap();
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::postgres::PgConnectOptions::new()
-                    .host(&config.host)
-                    .port(config.port)
-                    .database(&target)
-                    .username(&config.username)
-                    .password(&config.password)
-                    .options([("default_transaction_read_only", "on")]),
-            )
-            .await
-            .unwrap();
+        let pool=crate::database::test_support::readonly_pool(1).await;
         let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
             .fetch_one(&pool)
             .await

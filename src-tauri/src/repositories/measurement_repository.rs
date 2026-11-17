@@ -39,37 +39,21 @@ mod report_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "Requires an isolated local PostgreSQL instance; AS200_POINT_SUMMARY_TEST_PORT"]
+    #[ignore = "Explicit Neon integration opt-in; TEMP fixtures on a verified connection"]
     async fn point_summary_merges_skus_from_decision_samples() {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-        let port: u16 = std::env::var("AS200_POINT_SUMMARY_TEST_PORT")
-            .expect("Specify isolated test PostgreSQL port")
-            .parse()
-            .unwrap();
-        assert!(port >= 1024);
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                PgConnectOptions::new()
-                    .host("127.0.0.1")
-                    .port(port)
-                    .username("postgres")
-                    .database("golf_report_point_test"),
-            )
-            .await
-            .unwrap();
+        let pool=crate::database::test_support::pool(1).await;
         // Session-local fixtures shadow table names; never modify persistent tables.
         sqlx::raw_sql(
             r#"
             CREATE TEMP TABLE measurements(id bigint,product_code text,club_number int,
-                measured_at timestamptz,overall_result text);
+                measured_at timestamptz,overall_result text,source_id bigint);
             CREATE TEMP TABLE measurement_stations(id bigint,measurement_id bigint,
                 station_type text,result text,load numeric);
             CREATE TEMP TABLE measurement_points(id bigint,station_id bigint,point_number int,
                 position numeric,result text,attempt_count int,decide_attempt int);
             CREATE TEMP TABLE measurement_attempts(point_id bigint,attempt_number int,
                 push_dist numeric,bend numeric);
-            INSERT INTO measurements SELECT n,CASE WHEN n<=100 THEN 'A' ELSE 'B' END,n,
+            INSERT INTO measurements(id,product_code,club_number,measured_at,overall_result) SELECT n,CASE WHEN n<=100 THEN 'A' ELSE 'B' END,n,
                 '2026-11-16 10:00:00+07','NG' FROM generate_series(1,124) n;
             INSERT INTO measurement_stations SELECT id,id,'BUTT','NG',
                 CASE WHEN id<=100 THEN 10 ELSE 20 END FROM measurements;
@@ -200,10 +184,19 @@ mod report_tests {
         assert!(empty.point_summary.is_empty());
         assert!(empty.butt_histogram.is_empty());
 
-        // Replace only this connection's TEMP fixtures; exercise the shared BUTT bins.
+        // New connection for the second TEMP fixture; no DROP/TRUNCATE/DELETE.
+        pool.close().await;
+        let pool=crate::database::test_support::pool(1).await;
         sqlx::raw_sql(r#"
-            TRUNCATE measurement_attempts,measurement_points,measurement_stations,measurements;
-            INSERT INTO measurements VALUES
+            CREATE TEMP TABLE measurements(id bigint,product_code text,club_number int,
+                measured_at timestamptz,overall_result text,source_id bigint);
+            CREATE TEMP TABLE measurement_stations(id bigint,measurement_id bigint,
+                station_type text,result text,load numeric);
+            CREATE TEMP TABLE measurement_points(id bigint,station_id bigint,point_number int,
+                position numeric,result text,attempt_count int,decide_attempt int);
+            CREATE TEMP TABLE measurement_attempts(point_id bigint,attempt_number int,
+                push_dist numeric,bend numeric);
+            INSERT INTO measurements(id,product_code,club_number,measured_at,overall_result) VALUES
                 (1,'A',1,'2026-11-16 10:00:00+07','NG'),
                 (2,'B',2,'2026-11-16 11:00:00+07','NG'),
                 (3,'A',3,'2026-11-17 10:00:00+07','OK'),
@@ -282,30 +275,22 @@ mod report_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Opt-in AS200_TEST_DATABASE=golf_report; SELECT only, no test data created"]
+    #[ignore = "Explicit Neon integration opt-in; owned fixture then read-only report queries"]
     async fn postgres_report_filters_pagination_and_nested_details_read_only() {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-        let target = std::env::var("AS200_TEST_DATABASE").expect("Specify development database");
-        assert_eq!(target, "golf_report");
-        let config = crate::database::config::load_config().unwrap();
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(
-                PgConnectOptions::new()
-                    .host(&config.host)
-                    .port(config.port)
-                    .database(&target)
-                    .username(&config.username)
-                    .password(&config.password)
-                    .options([("default_transaction_read_only", "on")]),
-            )
-            .await
-            .unwrap();
-        let all = MeasurementRepository::report(&pool, &MeasurementListRequest::default())
+        let write_pool=crate::database::test_support::pool(2).await;
+        let key=crate::database::test_support::source_key("report");
+        let source=super::super::SourceRepository::upsert(&write_pool,&key,None).await.unwrap();
+        let mut row=crate::database::test_support::receipt(1);row.source_id=source.id;
+        row.publication_session=Some(crate::database::test_support::session());row.assigned_sku=Some(crate::database::test_support::sku());
+        let draft=crate::services::inbox_service::draft_from_inbox(&row).unwrap();
+        let mut tx=write_pool.begin().await.unwrap();crate::services::MeasurementService::insert(&mut tx,&draft).await.unwrap();tx.commit().await.unwrap();write_pool.close().await;
+        let pool=crate::database::test_support::readonly_pool(2).await;
+        let scope=MeasurementListRequest{product_code:Some(crate::database::test_support::sku()),..Default::default()};
+        let all = MeasurementRepository::report(&pool, &scope)
             .await
             .unwrap();
         let quality =
-            MeasurementRepository::quality_statistics(&pool, &MeasurementListRequest::default())
+            MeasurementRepository::quality_statistics(&pool, &scope)
                 .await
                 .unwrap();
         let is_measured = |point: &MeasurementPoint| {
@@ -393,7 +378,7 @@ mod report_tests {
             .fetch_one(&pool).await.unwrap();
         assert!(multi);
 
-        let daily = MeasurementRepository::statistics(&pool, &MeasurementListRequest::default())
+        let daily = MeasurementRepository::statistics(&pool, &scope)
             .await
             .unwrap()
             .daily;
@@ -431,7 +416,7 @@ mod report_tests {
             );
             assert_eq!(item.stations.len(), 2);
             for station in &item.stations {
-                assert_eq!(station.points.len(), 4);
+                assert_eq!(station.points.len(), if station.station_type==crate::models::StationType::Tip {1} else {4});
                 for point in &station.points {
                     assert_eq!(point.attempts.len(), point.attempt_count as usize);
                 }

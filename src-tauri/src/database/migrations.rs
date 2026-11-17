@@ -2,6 +2,8 @@ use sqlx::{FromRow, PgPool};
 
 pub const INITIAL_VERSION: i64 = 20261109120000;
 pub const REGISTRY_VERSION: i64 = 20261111120000;
+pub const PUBLICATION_VERSION: i64 = 20261117120000;
+pub const REGISTRY_RETIREMENT_VERSION: i64 = 20261117140000;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, FromRow)]
@@ -26,6 +28,11 @@ pub async fn audit(pool: &PgPool) -> Result<(Vec<String>, Vec<MigrationHistory>)
 }
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
     let (tables, history) = audit(pool).await?;
+    eprintln!(
+        "DATABASE_MIGRATION state=CHECKING embedded={:?} applied={:?} tables={tables:?}",
+        MIGRATOR.iter().map(|m| m.version).collect::<Vec<_>>(),
+        history.iter().map(|m| m.version).collect::<Vec<_>>(),
+    );
     if let Err(error) = validate_history(&tables, &history) {
         let location: (String, String, String) = sqlx::query_as(
             "SELECT current_database()::text, current_schema()::text, current_setting('search_path')",
@@ -49,10 +56,15 @@ pub async fn migrate(pool: &PgPool) -> Result<(), String> {
             location.0, location.1, location.2
         ));
     }
+    eprintln!("DATABASE_MIGRATION state=APPLYING_PENDING");
     MIGRATOR
         .run(pool)
         .await
-        .map_err(|e| format!("Migration AS200 thất bại (giữ nguyên lịch sử): {e}"))
+        .map_err(|e| format!("Migration AS200 thất bại (giữ nguyên lịch sử): {e}"))?;
+    let (tables, history) = audit(pool).await?;
+    validate_history(&tables, &history)?;
+    eprintln!("DATABASE_MIGRATION state=COMPLETE");
+    Ok(())
 }
 pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Result<(), String> {
     if history
@@ -67,6 +79,22 @@ pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Resu
         return Err(format!(
             "Database chưa có lịch sử AS200 nhưng còn bảng: {tables:?}. Không tự xóa hoặc chạy chồng schema."
         ));
+    }
+    // A retirement row alone is not proof: all preceding embedded versions must exist.
+    if let Some(last) = history.iter().map(|item| item.version).max() {
+        for migration in MIGRATOR.iter().filter(|m| m.version <= last) {
+            if history
+                .iter()
+                .filter(|h| h.version == migration.version)
+                .count()
+                != 1
+            {
+                return Err(format!(
+                    "Lịch sử SQLx thiếu hoặc trùng version {}; không tự sửa lịch sử.",
+                    migration.version
+                ));
+            }
+        }
     }
     if !history.is_empty() {
         if !history.iter().any(|item| item.version == INITIAL_VERSION) {
@@ -88,14 +116,35 @@ pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Resu
                 ));
             }
         }
+        let registry_retired = history
+            .iter()
+            .any(|item| item.version == REGISTRY_RETIREMENT_VERSION);
         if history.iter().any(|item| item.version == REGISTRY_VERSION)
+            && !registry_retired
             && !tables.iter().any(|name| name == "plc_source_registry")
         {
             return Err("Lịch sử SQLx ghi registry đã áp dụng nhưng thiếu bảng plc_source_registry. Không tự tạo lại bảng khi chưa đối chiếu schema và dữ liệu.".into());
         }
+        if registry_retired && tables.iter().any(|name| name == "plc_source_registry") {
+            return Err(
+                "SQLx ghi registry đã retire nhưng bảng vẫn tồn tại; cần đối chiếu schema/history."
+                    .into(),
+            );
+        }
+        if history
+            .iter()
+            .any(|item| item.version == PUBLICATION_VERSION)
+            && !tables.iter().any(|name| name == "plc_acquisition")
+        {
+            return Err("Lịch sử SQLx ghi publication đã áp dụng nhưng thiếu plc_acquisition; không tự tạo lại checkpoint.".into());
+        }
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "migration_tests.rs"]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {

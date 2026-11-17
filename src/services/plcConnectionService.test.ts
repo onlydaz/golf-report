@@ -1,18 +1,40 @@
   import { describe, expect, it } from "vitest";
   import { isPlcIp, plcConnectionError } from "./plcConnectionService";
-  import { getPlcDisplayStatus } from "../hooks/usePlcMonitor";
+  import { getMeasurementAvailabilityNotice, getPlcDisplayStatus } from "../hooks/usePlcMonitor";
   import type { As200Status } from "./as200Service";
   describe("PLC connection form", () => {
+    it("keeps raw diagnostics internal while preserving operator ACK warnings", () => {
+      for (const diagnostic of [
+        "RAW ZERO: 240 WORD [0, 0] Inbox #42",
+        "Đã lưu raw 240 WORD vào Inbox #42; chưa tạo measurement.",
+        "RAW_UNDECODED: D25020–D25259",
+      ]) {
+        const notice = plcConnectionError(diagnostic, "fallback");
+        expect(notice).toContain("Chưa có kết quả đo hợp lệ");
+        expect(notice).not.toMatch(/raw|WORD|Inbox|42|D25020/i);
+      }
+      const warning = plcConnectionError("ACK chưa rõ, TotalCount=1 RecordSeq=0", "fallback");
+      expect(warning).toContain("Không tự gửi lại ACK");
+      expect(warning).not.toMatch(/TotalCount|RecordSeq/);
+    });
     it("shares Worker labels without treating TCP or heartbeat as ACK confirmation", () => {
       const status: As200Status = {
         enabled: true, address: "127.0.0.1:1503", unitId: 1, sourceKey: "test", sessionId: "test-session",
         connection: "CONNECTED", state: "WAITING", message: "", pauseReason: null, warnings: [],
         plcHealth: "RUNNING", pcHeartbeatStatus: "DISABLED", ackStatus: "WAITING",
-        latest: null, volatileCount: 0, lastSavedId: null, manualRetryResults: [], blockedInboxIds: [],
-        blockedInboxCount: 0, retryWaitingCount: 0, retryDiagnostics: [],
+        latest: null, lastSavedId: null, blockedInboxIds: [],
+        blockedInboxCount: 0, retryWaitingCount: 0,
       };
       expect(getPlcDisplayStatus(status, "").collectionLabel).toBe("Đang thu dữ liệu");
       expect(status.ackStatus).toBe("WAITING");
+      const undecoded = { ...status, state: "RAW_UNDECODED", ackStatus: "ACKNOWLEDGED" as const };
+      const notice = getMeasurementAvailabilityNotice(undecoded);
+      expect(notice).toContain("Đã lưu dữ liệu");
+      expect(notice).toContain("chưa đủ thông tin");
+      expect(notice).toContain("số đo bằng 0 vẫn được chấp nhận");
+      expect(notice).not.toMatch(/RAW|240|WORD|Inbox|RecordSeq|TotalCount/);
+      expect(getMeasurementAvailabilityNotice({ ...status, state: "PROCESSED" })).toBeUndefined();
+      expect(getMeasurementAvailabilityNotice(undefined)).toBeUndefined();
       for (const ackStatus of ["FAILED", "RECONCILIATION_REQUIRED"] as const) {
         expect(getPlcDisplayStatus({ ...status, ackStatus }, "").collectionColor).toBe("red");
         expect(getPlcDisplayStatus({ ...status, ackStatus }, "").collectionLabel).toBe("Có lỗi");

@@ -114,9 +114,6 @@ export interface MeasurementStatistics {
   }>;
 }
 
-export const checkDatabaseConnection = () =>
-  invoke<string>("check_database_connection");
-
 export const getDatabaseStatus = () =>
   invoke<DatabaseStatus>("get_database_status");
 
@@ -141,25 +138,12 @@ export interface MeasurementHistoryItem extends BackendMeasurement {
   decisionPoints: Array<{ measurementId: number; station: "BUTT" | "TIP"; pointNumber: number; bend: string | null }>;
 }
 export interface MeasurementHistoryPage { items: MeasurementHistoryItem[]; total: number; page: number; pageSize: number }
-export interface PlcRawSnapshot {
-  id: number;
-  receivedAt: string;
-  recordSeq: number;
-  totalCount: number | null;
-  wordCount: number;
-  nonZeroWords: number;
-  rawRegisters: number[];
-  kind: "ZERO" | "UNDECODED";
-  processingStatus: string;
-}
 export const getMeasurementSkus = (search = "", page = 1) =>
   invoke<{ items: string[]; hasMore: boolean }>("get_measurement_skus", { search, page });
 export const getMeasurementSkuSummary = (request: MeasurementListRequest = {}) =>
   invoke<MeasurementSkuPage>("get_measurement_sku_summary", { request });
 export const getMeasurementHistoryPage = (request: MeasurementListRequest = {}) =>
   invoke<MeasurementHistoryPage>("get_measurement_history_page", { request });
-export const getPlcRawSnapshots = (limit = 20) =>
-  invoke<PlcRawSnapshot[]>("get_plc_raw_snapshots", { limit });
 
 export const getMeasurementById = (id: number) =>
   invoke<MeasurementDetail>("get_measurement_by_id", { id });
