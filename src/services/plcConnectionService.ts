@@ -1,7 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface PlcEndpoint { ip: string; port: number; unitId: number }
+export interface PlcRuntimeParameters {
+  layoutProfile: string;
+  controlStart: number;
+  bufferCount: number;
+  recordSize: number;
+  wordOrder: "LOW" | "HIGH";
+  modbusAddressOffset: number;
+  pollIntervalMs: number;
+  timeoutMs: number;
+  heartbeatTimeoutMs: number | null;
+  retryIntervalMs: number;
+  autoReconnect: boolean;
+  readOnly: boolean;
+  startWithWindows: boolean;
+  skuTableStart: number | null;
+}
+export interface PlcRuntimeSettings { endpoint: PlcEndpoint; parameters: PlcRuntimeParameters }
+export const savePlcRuntimeSettings = (value: PlcRuntimeSettings, expectedRevision: string) =>
+  invoke<PlcConnectionSettings>("save_plc_runtime_settings", { value, expectedRevision });
+export const applyPlcRuntimeSettings = (value: PlcRuntimeSettings, expectedRevision: string, resetConfirmed = false) =>
+  invoke<void>("apply_plc_runtime_settings", { value, expectedRevision, resetConfirmed });
+export const testPlcRuntimeSettings = (value: PlcRuntimeSettings) =>
+  invoke<PlcInspectionReport>("test_plc_runtime_settings", { value });
 export interface PlcConnectionSettings {
+  parameters: PlcRuntimeParameters;
+  activeParameters: PlcRuntimeParameters | null;
+  verificationRequired: boolean;
   endpoint: PlcEndpoint | null;
   configured: boolean;
   technicalReady: boolean;
@@ -13,6 +39,17 @@ export interface PlcConnectionSettings {
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
 /** Kết nối + đọc FC03 thành công là "đã kết nối"; `mappingWarning` báo dữ liệu không khớp register map. */
 export interface PlcProbeReport { mappingWarning: string | null }
+export interface PlcInspectionReport extends PlcProbeReport {
+  tcpConnected: boolean;
+  modbusReadSucceeded: boolean;
+  as200Valid: boolean;
+  message: string;
+}
+export interface PlcConnectionOutcome {
+  inspection: PlcInspectionReport | null;
+  collectionStarted: boolean;
+  blockReason: string | null;
+}
 export const testPlcConnection = (value: PlcEndpoint) => invoke<PlcProbeReport>("test_plc_connection", { value });
 export const stopPlcCollection = () => invoke<void>("stop_plc_collection");
 
@@ -71,8 +108,17 @@ export const writePlcRegister = async (request: {
   await requirePlcRegisterUiEnabled();
   return invoke<PlcRegisterWriteReport>("write_plc_register", { request });
 };
-export const connectPlcCollection = (value: PlcEndpoint, expectedRevision: string, resetConfirmed = false) =>
-  invoke<void>("connect_plc_collection", { value, expectedRevision, resetConfirmed });
+export interface PlcSourceVerification {
+  physicalIdentity: string;
+  newSourceConfirmed: boolean;
+  registerMapConfirmed: boolean;
+  ackWriteApproved: boolean;
+}
+/** QC never sends physical-source approval or reset/session confirmation. */
+export const connectVerifiedPlc = (value: PlcEndpoint, expectedRevision: string) =>
+  invoke<PlcConnectionOutcome>("connect_verified_plc", { value, expectedRevision });
+export const connectPlcCollection = (value: PlcEndpoint, expectedRevision: string, resetConfirmed = false, sourceVerification?: PlcSourceVerification) =>
+  invoke<void>("connect_plc_collection", { value, expectedRevision, resetConfirmed, sourceVerification });
 export const updatePlcConnectionSettings = (value: PlcEndpoint, expectedRevision: string) =>
   invoke<PlcConnectionSettings>("update_plc_connection_settings", { value, expectedRevision });
 

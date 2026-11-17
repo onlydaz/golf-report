@@ -190,6 +190,7 @@ pub struct ResultDistribution {
 #[serde(rename_all = "camelCase")]
 pub struct MeasurementQualityStatistics {
     pub retested_clubs: i64,
+    pub butt_histogram: Vec<BendHistogramBin>,
     pub points: Vec<PointQualityStatistics>,
     pub point_summary: Vec<PointSummaryStatistics>,
 }

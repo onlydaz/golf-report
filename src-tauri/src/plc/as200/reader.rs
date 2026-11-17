@@ -45,15 +45,23 @@ impl ModbusTcpReader {
         let response = ctx
             .call(Request::ReadHoldingRegisters(address, count))
             .await
-            .map_err(|e| As200Error::Transport(e.to_string()))?
-            .map_err(|e| As200Error::Transport(format!("PLC trả exception FC03: {e}")))?;
+            .map_err(|e| match e {
+                tokio_modbus::Error::Protocol(_) => As200Error::Protocol(e.to_string()),
+                tokio_modbus::Error::Transport(ref io)
+                    if io.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    As200Error::Protocol(e.to_string())
+                }
+                _ => As200Error::Transport(e.to_string()),
+            })?
+            .map_err(|e| As200Error::Protocol(format!("PLC trả exception FC03: {e}")))?;
         let Response::ReadHoldingRegisters(words) = response else {
-            return Err(As200Error::Transport(format!(
+            return Err(As200Error::Protocol(format!(
                 "FC03 nhận response không đúng loại: {response:?}"
             )));
         };
         if words.len() != usize::from(count) {
-            return Err(As200Error::Transport(format!(
+            return Err(As200Error::Protocol(format!(
                 "FC03 sai kích thước dữ liệu: cần {count} WORD, nhận {}",
                 words.len()
             )));
@@ -146,23 +154,37 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
                 .read_holding_registers(address + result.len() as u16, block_size as u16)
                 .await?;
             if block.len() != block_size {
-                return Err(As200Error::Transport("FC03 trả thiếu WORD".into()));
+                return Err(As200Error::Protocol("FC03 trả thiếu WORD".into()));
             }
             result.extend(block);
         }
         Ok(result)
     }
     pub async fn read_control(&mut self) -> Result<PlcControl, As200Error> {
+        if self.config.record_size != map::RECORD_SIZE
+            || self.config.buffer_count != map::BUFFER_COUNT
+            || usize::from(self.config.control_start)
+                + map::CONTROL_SIZE
+                + self.config.record_size * self.config.buffer_count
+                > 65536
+        {
+            return Err(As200Error::InvalidData(
+                "Profile AS200 chỉ hỗ trợ 2 buffer × 240 WORD và vùng nhớ hợp lệ".into(),
+            ));
+        }
         let raw = self
-            .read_range(map::CONTROL_BASE, map::CONTROL_SIZE)
+            .read_range(self.config.control_start, map::CONTROL_SIZE)
             .await?;
         decode::control(&raw, self.config.word_order)
     }
     /// Raw Bản ghi 1; caller must surround this with stable control/raw checks.
     pub async fn read_published_words(&mut self) -> Result<Vec<u16>, As200Error> {
         self.read_range(
-            map::CONTROL_BASE + map::CONTROL_SIZE as u16,
-            map::RECORD_SIZE,
+            self.config
+                .control_start
+                .checked_add(map::CONTROL_SIZE as u16)
+                .ok_or_else(|| As200Error::InvalidData("Địa chỉ Bản ghi 1 vượt phạm vi".into()))?,
+            self.config.record_size,
         )
         .await
     }

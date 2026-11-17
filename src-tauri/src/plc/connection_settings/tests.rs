@@ -1,6 +1,725 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+async fn saving_an_unknown_endpoint_only_stages_settings_and_preserves_running_source() {
+    let dir = Fixture::new();
+    let state = dir.state().await;
+    let file = dir.0.join("as200_config.toml");
+    let (_, config) = read(&file).unwrap();
+    let before = std::fs::read(&file).unwrap();
+    let journal_path = config.journal_file(&file);
+    let journal = std::fs::read(&journal_path).unwrap();
+    {
+        let mut status = state.status.write().await;
+        status.enabled = true;
+        status.connection = "CONNECTED".into();
+        status.address = config.address.clone();
+        status.unit_id = config.unit_id;
+    }
+    let value = RuntimeSettings {
+        endpoint: Endpoint {
+            ip: "127.0.0.2".into(),
+            port: 1504,
+            unit_id: 2,
+        },
+        parameters: RuntimeParameters::from_config(&config),
+    };
+    let saved = save_connection_draft(&state, value.clone(), &revision(TEXT))
+        .await
+        .unwrap();
+    assert_eq!(saved.endpoint.as_ref(), Some(&value.endpoint));
+    assert!(
+        saved.parameters.read_only,
+        "New targets must not inherit ACK permission"
+    );
+    assert_eq!(
+        saved.active_endpoint.as_ref(),
+        Some(&endpoint(&config).unwrap())
+    );
+    assert!(saved.worker_running);
+    assert!(saved.verification_required);
+    assert!(saved.restart_required);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+    assert!(
+        qc_profile_history(&file, &config, &value.endpoint)
+            .unwrap()
+            .is_none()
+    );
+    let draft = std::fs::read_to_string(file.with_extension("connection-draft")).unwrap();
+    for field in [
+        "source_key",
+        "session_id",
+        "journal_path",
+        "accepted",
+        "receipt",
+        "ack_enabled",
+    ] {
+        assert!(
+            !draft.contains(field),
+            "draft must not carry source history or ACK: {field}"
+        );
+    }
+    assert!(
+        save_connection_draft(&state, value, &revision(TEXT))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(file.with_extension("connection-draft")).unwrap(),
+        draft
+    );
+    assert!(state.status.read().await.enabled);
+}
+
+#[tokio::test]
+async fn connection_draft_is_invalidated_by_a_changed_live_profile_and_never_autostarts() {
+    let dir = Fixture::new();
+    let state = dir.state().await;
+    let file = dir.0.join("as200_config.toml");
+    let (_, config) = read(&file).unwrap();
+    let mut parameters = RuntimeParameters::from_config(&config);
+    parameters.poll_interval_ms = 1000;
+    let value = RuntimeSettings {
+        endpoint: endpoint(&config).unwrap(),
+        parameters,
+    };
+    let saved = save_connection_draft(&state, value, &revision(TEXT))
+        .await
+        .unwrap();
+    assert_eq!(saved.parameters.poll_interval_ms, 1000);
+    assert!(!state.status.read().await.enabled);
+    assert_eq!(
+        read(&file).unwrap().1.poll_interval_ms,
+        config.poll_interval_ms
+    );
+    let external = format!("{TEXT}# external edit\n");
+    std::fs::write(&file, &external).unwrap();
+    assert!(connection_draft(&file, &external).unwrap().is_none());
+    let restored = get(&state).await.unwrap();
+    assert_eq!(
+        restored.parameters.poll_interval_ms,
+        config.poll_interval_ms
+    );
+    assert_eq!(restored.revision, revision(&external));
+    assert!(!state.status.read().await.enabled);
+}
+
+#[tokio::test]
+async fn inspection_of_an_unregistered_source_is_fc03_only_and_does_not_grant_collection() {
+    for valid in [true, false] {
+        let dir = Fixture::new();
+        let state = dir.state().await;
+        let file = dir.0.join("as200_config.toml");
+        let (_, current) = read(&file).unwrap();
+        let journal_path = current.journal_file(&file);
+        let journal = std::fs::read(&journal_path).unwrap();
+        let config_bytes = std::fs::read(&file).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                tcp.read(&mut [0; 1]).await.unwrap(),
+                0,
+                "TCP reachability must not send data"
+            );
+            drop(tcp);
+            let mut words = vec![0; 500];
+            words[0] = if valid { 1 } else { 99 };
+            words[1] = 240;
+            words[2] = 2;
+            serve_registers(listener, words).await.unwrap();
+        });
+        let target = Endpoint {
+            ip: "127.0.0.1".into(),
+            port: address.port().into(),
+            unit_id: 1,
+        };
+        let runtime = RuntimeSettings {
+            endpoint: target.clone(),
+            parameters: RuntimeParameters::from_config(&probe_config(address.to_string())),
+        };
+        let saved = save_connection_draft(&state, runtime, &revision(TEXT))
+            .await
+            .unwrap();
+        assert_eq!(saved.endpoint.as_ref(), Some(&target));
+        // Missing history is a collection decision, not a reason to skip the probe.
+        assert!(
+            qc_profile_history(&file, &current, &target)
+                .unwrap()
+                .is_none()
+        );
+        let reason = "Baseline chưa được thiết lập; chưa cấp ACK".to_string();
+        let inspected = inspect_endpoint(probe_config(address.to_string())).await;
+        assert!(inspected.tcp_connected);
+        assert!(inspected.modbus_read_succeeded);
+        assert_eq!(inspected.as200_valid, valid);
+        let outcome = ConnectionOutcome::inspection_only(inspected, reason);
+        assert!(!outcome.collection_started);
+        assert!(
+            outcome
+                .block_reason
+                .as_deref()
+                .unwrap()
+                .contains("Baseline")
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+        assert!(!state.status.read().await.enabled);
+        assert!(!dir.0.join("local-runtime/managed-sources").exists());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn inspection_separates_tcp_only_from_modbus_and_refused_tcp() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        assert_eq!(tcp.read(&mut [0; 1]).await.unwrap(), 0);
+        drop(tcp);
+        let (_modbus, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+    let mut config = probe_config(address.to_string());
+    config.timeout_ms = 100;
+    let result = inspect_endpoint(config.clone()).await;
+    assert!(result.tcp_connected);
+    assert!(!result.modbus_read_succeeded);
+    assert!(!result.as200_valid);
+    server.abort();
+    let _ = server.await;
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.address = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    let result = inspect_endpoint(config).await;
+    assert!(!result.tcp_connected);
+    assert!(!result.modbus_read_succeeded);
+    assert!(!result.as200_valid);
+}
+
+#[test]
+fn qc_requires_existing_verified_identity_and_keeps_ack_policy() {
+    let config = SimulatorConfig {
+        enabled: true,
+        mode: "modbus".into(),
+        technical_setup_confirmed: true,
+        source_key: "saved-source".into(),
+        confirmed_session_id: Some("saved-session".into()),
+        journal_path: Some(PathBuf::from(
+            "local-runtime/managed-sources/saved-source/capture.json",
+        )),
+        read_only: true,
+        ack_enabled: false,
+        ack_protocol: Some("as200".into()),
+        allow_plc_connection: true,
+        ..Default::default()
+    };
+    require_qc_profile(&config).unwrap();
+    let dir = Fixture::new();
+    let file = dir.0.join("as200_config.toml");
+    std::fs::write(&file, "enabled=true\nmode='modbus'\ntechnical_setup_confirmed=true\naddress='127.0.0.1:1503'\nunit_id=1\nsource_key='saved-source'\nconfirmed_session_id='saved-session'\njournal_path='local-runtime/managed-sources/saved-source/capture.json'\nread_only=true\nack_enabled=false\nallow_plc_connection=true\nack_protocol='as200'\n").unwrap();
+    let before = std::fs::read(&file).unwrap();
+    assert!(
+        qc_profile_history(&file, &config, &endpoint(&config).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    let unknown = Endpoint {
+        ip: "127.0.0.2".into(),
+        port: 1503,
+        unit_id: 1,
+    };
+    assert!(
+        qc_profile_history(&file, &config, &unknown)
+            .unwrap()
+            .is_none()
+    );
+    let a = endpoint_source_key(&endpoint(&config).unwrap()).unwrap();
+    assert_ne!(a, endpoint_source_key(&unknown).unwrap());
+    assert_ne!(
+        a,
+        endpoint_source_key(&Endpoint {
+            port: 1504,
+            ..endpoint(&config).unwrap()
+        })
+        .unwrap()
+    );
+    assert_ne!(
+        a,
+        endpoint_source_key(&Endpoint {
+            unit_id: 2,
+            ..endpoint(&config).unwrap()
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        endpoint_source_key(&Endpoint {
+            ip: "0:0:0:0:0:0:0:1".into(),
+            port: 1503,
+            unit_id: 1
+        })
+        .unwrap(),
+        endpoint_source_key(&Endpoint {
+            ip: "::1".into(),
+            port: 1503,
+            unit_id: 1
+        })
+        .unwrap()
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    assert_eq!(
+        std::fs::read_dir(&dir.0).unwrap().count(),
+        1,
+        "QC must not create registry/profile/Journal files for an unknown endpoint"
+    );
+    assert!(!config.ack_enabled);
+    assert_eq!(
+        config.confirmed_session_id.as_deref(),
+        Some("saved-session")
+    );
+    for (missing, code) in [
+        (
+            SimulatorConfig {
+                technical_setup_confirmed: false,
+                ..config.clone()
+            },
+            "SOURCE_NOT_VERIFIED",
+        ),
+        (
+            SimulatorConfig {
+                source_key: String::new(),
+                ..config.clone()
+            },
+            "SOURCE_ID_MISSING",
+        ),
+        (
+            SimulatorConfig {
+                confirmed_session_id: None,
+                ..config.clone()
+            },
+            "SESSION_MISSING",
+        ),
+        (
+            SimulatorConfig {
+                confirmed_session_id: Some(" ".into()),
+                ..config.clone()
+            },
+            "SESSION_MISSING",
+        ),
+        (
+            SimulatorConfig {
+                journal_path: None,
+                ..config.clone()
+            },
+            "JOURNAL_MISSING",
+        ),
+        (
+            SimulatorConfig {
+                journal_path: Some(PathBuf::new()),
+                ..config.clone()
+            },
+            "JOURNAL_MISSING",
+        ),
+        (
+            SimulatorConfig {
+                enabled: false,
+                ..config.clone()
+            },
+            "SOURCE_DISABLED",
+        ),
+    ] {
+        assert!(require_qc_profile(&missing).unwrap_err().contains(code));
+    }
+    let invalid_map = SimulatorConfig {
+        record_size: 239,
+        ..config
+    };
+    assert!(require_qc_profile(&invalid_map).is_err());
+}
+
+#[test]
+fn new_source_requires_external_identity_and_map_confirmation_without_default_ack() {
+    let mut verification: SourceVerification = serde_json::from_value(serde_json::json!({
+        "physicalIdentity": " SERIAL-TEST-1 ", "newSourceConfirmed": true, "registerMapConfirmed": true
+    })).unwrap();
+    assert_eq!(verification.validate().unwrap(), "SERIAL-TEST-1");
+    assert!(!verification.ack_write_approved);
+    verification.new_source_confirmed = false;
+    assert!(verification.validate().is_err());
+    verification.new_source_confirmed = true;
+    verification.register_map_confirmed = false;
+    assert!(verification.validate().is_err());
+    verification.register_map_confirmed = true;
+    for identity in [
+        "".to_string(),
+        "  ".to_string(),
+        "bad\nserial".to_string(),
+        "x".repeat(201),
+    ] {
+        verification.physical_identity = identity;
+        assert!(verification.validate().is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "Isolated loopback PostgreSQL only: AS200_SOURCE_SWITCH_TEST_PORT; TEMP tables and FC03 mocks"]
+async fn automatic_endpoint_source_is_read_only_separate_and_recoverable() {
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    let port: u16 = std::env::var("AS200_SOURCE_SWITCH_TEST_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(port >= 1024);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(port)
+                .username("postgres")
+                .database("golf_report_point_test"),
+        )
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TEMP TABLE plc_sources(id bigserial PRIMARY KEY,source_key text UNIQUE,description text); CREATE TEMP TABLE plc_source_registry(source_id bigint,endpoint_ip inet,endpoint_port integer,unit_id integer,as200_verified boolean,ack_write_approved boolean); CREATE TEMP TABLE plc_inbox(source_id bigint); CREATE TEMP TABLE measurements(source_id bigint);").execute(&pool).await.unwrap();
+    let dir = Fixture::new();
+    let file = dir.0.join("as200_config.toml");
+    std::fs::write(&file, TEXT).unwrap();
+    let old_journal = dir.0.join("old.json");
+    std::fs::write(&old_journal, "keep old receipts and ACK intent").unwrap();
+    let mut identities = Vec::new();
+    for total in [0_u16, 0, 1] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..if total == 0 { 2 } else { 1 } {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                for _ in 0..if total == 0 { 9 } else { 1 } {
+                    let mut request = [0; 12];
+                    socket.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request[7], 3, "Automatic sources never write ACK/heartbeat");
+                    let offset = u16::from_be_bytes([request[8], request[9]]) as usize - 25000;
+                    let count = u16::from_be_bytes([request[10], request[11]]) as usize;
+                    let mut words = vec![0u16; 500];
+                    words[0] = 1;
+                    words[1] = 240;
+                    words[2] = 2;
+                    words[4] = total;
+                    let mut response = request[..7].to_vec();
+                    response[4..6].copy_from_slice(&((count * 2 + 3) as u16).to_be_bytes());
+                    response.extend([3, (count * 2) as u8]);
+                    for word in &words[offset..offset + count] {
+                        response.extend(word.to_be_bytes());
+                    }
+                    socket.write_all(&response).await.unwrap();
+                }
+            }
+        });
+        let target = Endpoint {
+            ip: "127.0.0.1".into(),
+            port: address.port().into(),
+            unit_id: 1,
+        };
+        let config = SimulatorConfig {
+            address: address.to_string(),
+            mode: "modbus".into(),
+            source_key: "outgoing".into(),
+            confirmed_session_id: Some("outgoing-session".into()),
+            journal_path: Some(old_journal.clone()),
+            ack_enabled: true,
+            ack_protocol: Some("as200".into()),
+            ..Default::default()
+        };
+        let prepared = prepare_managed_runtime(&file, TEXT, &config, &target, &pool, None).await;
+        server.await.unwrap();
+        if total != 0 {
+            assert!(prepared.is_err());
+            assert!(
+                !dir.0
+                    .join("local-runtime/managed-sources")
+                    .join(endpoint_source_key(&target).unwrap())
+                    .exists()
+            );
+            continue;
+        }
+        let (after, next) = prepared.unwrap();
+        assert!(
+            next.read_only
+                && !next.ack_enabled
+                && !next.pc_heartbeat_enabled
+                && !next.allow_plc_heartbeat_write
+        );
+        assert_eq!(next.source_key, endpoint_source_key(&target).unwrap());
+        assert_ne!(next.source_key, config.source_key);
+        assert_ne!(next.confirmed_session_id, config.confirmed_session_id);
+        let journal = std::fs::read(next.journal_path.as_ref().unwrap()).unwrap();
+        let captured: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(captured["version"], 4);
+        assert_eq!(captured["published_ack"]["accepted"], 0);
+        assert!(captured["published_ack"]["intent"].is_null());
+        assert_eq!(captured["deliveries"].as_array().unwrap().len(), 0);
+        let restored = qc_profile_history(&file, &simulator_config::parse(TEXT).unwrap(), &target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.config.source_key, next.source_key);
+        assert_eq!(
+            restored.config.confirmed_session_id,
+            next.confirmed_session_id
+        );
+        assert_eq!(
+            std::fs::read(restored.config.journal_path.unwrap()).unwrap(),
+            journal
+        );
+        verify_registered_source(&pool, &next).await.unwrap();
+        let mut unauthorized = next.clone();
+        unauthorized.read_only = false;
+        unauthorized.ack_enabled = true;
+        assert!(
+            verify_registered_source(&pool, &unauthorized)
+                .await
+                .unwrap_err()
+                .contains("ACK_NOT_APPROVED")
+        );
+        assert!(simulator_config::parse(&after).unwrap().read_only);
+        identities.push((next.source_key, next.journal_path));
+    }
+    assert_ne!(identities[0], identities[1]);
+    assert_eq!(
+        std::fs::read_to_string(&old_journal).unwrap(),
+        "keep old receipts and ACK intent"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), TEXT);
+    let grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM plc_source_registry WHERE ack_write_approved")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(grants, 0);
+}
+
+#[tokio::test]
+#[ignore = "Isolated loopback PostgreSQL only: AS200_SOURCE_SWITCH_TEST_PORT; TEMP tables and mock FC03"]
+async fn source_registry_and_new_journal_are_separate_without_inherited_ack() {
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    let port: u16 = std::env::var("AS200_SOURCE_SWITCH_TEST_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(port >= 1024);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(port)
+                .username("postgres")
+                .database("golf_report_point_test"),
+        )
+        .await
+        .unwrap();
+    // TEMP tables shadow persistent names on this single test connection.
+    sqlx::raw_sql(r#"
+        CREATE TEMP TABLE plc_sources(id bigserial PRIMARY KEY,source_key text UNIQUE,description text);
+        CREATE TEMP TABLE plc_source_registry(source_id bigint PRIMARY KEY REFERENCES plc_sources(id),
+            physical_identity text UNIQUE,endpoint_ip inet,endpoint_port integer,unit_id integer,
+            session_id text,as200_verified boolean,ack_write_approved boolean,verified_at timestamptz,
+            UNIQUE(endpoint_ip,endpoint_port,unit_id));
+        CREATE TEMP TABLE plc_inbox(source_id bigint);
+        CREATE TEMP TABLE measurements(source_id bigint);
+        INSERT INTO plc_sources(source_key,description) VALUES('old-simulator','do not overwrite');
+    "#).execute(&pool).await.unwrap();
+    let verification = SourceVerification {
+        physical_identity: "TEST-SERIAL-NEW".into(),
+        new_source_confirmed: true,
+        register_map_confirmed: true,
+        ack_write_approved: false,
+    };
+    let endpoint = Endpoint {
+        ip: "127.0.0.1".into(),
+        port: 1503,
+        unit_id: 1,
+    };
+    let first = ensure_managed_source(&pool, &endpoint, &verification)
+        .await
+        .unwrap();
+    let mut registered_config = SimulatorConfig {
+        source_key: first.0.clone(),
+        mode: "modbus".into(),
+        address: "127.0.0.1:1503".into(),
+        read_only: true,
+        ..Default::default()
+    };
+    verify_registered_source(&pool, &registered_config)
+        .await
+        .unwrap();
+    registered_config.read_only = false;
+    assert!(
+        verify_registered_source(&pool, &registered_config)
+            .await
+            .is_err()
+    );
+    registered_config.read_only = true;
+    registered_config.address = "127.0.0.1:1504".into();
+    assert!(
+        verify_registered_source(&pool, &registered_config)
+            .await
+            .is_err()
+    );
+    assert_ne!(first.0, "old-simulator");
+    assert_eq!(
+        first,
+        ensure_managed_source(&pool, &endpoint, &verification)
+            .await
+            .unwrap()
+    ); // Retry only an unused registration.
+    let other = SourceVerification {
+        physical_identity: "OTHER-DEVICE".into(),
+        ..verification
+    };
+    assert!(
+        ensure_managed_source(&pool, &endpoint, &other)
+            .await
+            .is_err()
+    );
+    assert!(
+        ensure_managed_source(
+            &pool,
+            &Endpoint {
+                port: 1504,
+                ..endpoint.clone()
+            },
+            &SourceVerification {
+                physical_identity: "TEST-SERIAL-NEW".into(),
+                ..other
+            }
+        )
+        .await
+        .is_err()
+    );
+    let approval = SourceVerification {
+        physical_identity: "TEST-SERIAL-NEW".into(),
+        new_source_confirmed: true,
+        register_map_confirmed: true,
+        ack_write_approved: true,
+    };
+    assert!(
+        ensure_managed_source(&pool, &endpoint, &approval)
+            .await
+            .is_err()
+    ); // Cannot upgrade a saved registry grant.
+    sqlx::query(
+        "INSERT INTO measurements(source_id) SELECT id FROM plc_sources WHERE source_key=$1",
+    )
+    .bind(&first.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let verification = SourceVerification {
+        ack_write_approved: false,
+        ..approval
+    };
+    assert!(
+        ensure_managed_source(&pool, &endpoint, &verification)
+            .await
+            .is_err()
+    ); // Missing endpoint profile cannot become a new epoch.
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..9 {
+                let mut request = [0; 12];
+                socket.read_exact(&mut request).await.unwrap();
+                assert_eq!(
+                    request[7], 3,
+                    "No ACK/heartbeat write while enrolling a source"
+                );
+                let offset = u16::from_be_bytes([request[8], request[9]]) as usize - 25000;
+                let count = u16::from_be_bytes([request[10], request[11]]) as usize;
+                let mut words = vec![0_u16; 500];
+                words[0] = 1;
+                words[1] = 240;
+                words[2] = 2;
+                let mut response = request[..7].to_vec();
+                response[4..6].copy_from_slice(&((count * 2 + 3) as u16).to_be_bytes());
+                response.extend([3, (count * 2) as u8]);
+                for word in &words[offset..offset + count] {
+                    response.extend(word.to_be_bytes());
+                }
+                socket.write_all(&response).await.unwrap();
+            }
+        }
+    });
+    let dir = Fixture::new();
+    let file = dir.0.join("as200_config.toml");
+    std::fs::write(&file, TEXT).unwrap();
+    let old_journal = dir.0.join("old-capture.json");
+    std::fs::write(&old_journal, "preserve old journal, intent and checkpoint").unwrap();
+    let config = SimulatorConfig {
+        mode: "modbus".into(),
+        address: address.to_string(),
+        source_key: "old-simulator".into(),
+        confirmed_session_id: Some("old-session".into()),
+        journal_path: Some(old_journal.clone()),
+        plc_heartbeat_timeout_ms: Some(5000),
+        ..Default::default()
+    };
+    let target = Endpoint {
+        ip: "127.0.0.1".into(),
+        port: address.port() as u32,
+        unit_id: 1,
+    };
+    let verification = SourceVerification {
+        physical_identity: "MOCK-SERIAL-ONLY".into(),
+        ..verification
+    };
+    let (after, next) =
+        prepare_managed_runtime(&file, TEXT, &config, &target, &pool, Some(&verification))
+            .await
+            .unwrap();
+    let new_journal_before = std::fs::read(next.journal_path.as_ref().unwrap()).unwrap();
+    let repeated =
+        prepare_managed_runtime(&file, TEXT, &config, &target, &pool, Some(&verification))
+            .await
+            .unwrap_err();
+    assert!(repeated.contains("Journal riêng"));
+    assert_eq!(
+        std::fs::read(next.journal_path.as_ref().unwrap()).unwrap(),
+        new_journal_before
+    );
+    server.await.unwrap();
+    assert_ne!(next.source_key, config.source_key);
+    assert_ne!(next.confirmed_session_id, config.confirmed_session_id);
+    assert!(next.read_only && !next.ack_enabled && !next.pc_heartbeat_enabled);
+    let parsed = simulator_config::parse(&after).unwrap();
+    assert!(parsed.read_only && !parsed.ack_enabled);
+    let journal: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(next.journal_path.unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(journal["version"], 4);
+    assert_eq!(journal["last_total"], 0);
+    assert_eq!(journal["published_ack"]["accepted"], 0);
+    assert!(journal["published_ack"]["intent"].is_null());
+    assert!(journal["deliveries"].as_array().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(old_journal).unwrap(),
+        "preserve old journal, intent and checkpoint"
+    );
+    assert_eq!(std::fs::read_to_string(file).unwrap(), TEXT); // Preparation never replaces the active config.
+    let old: String =
+        sqlx::query_scalar("SELECT description FROM plc_sources WHERE source_key='old-simulator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(old, "do not overwrite");
+}
+
 fn empty_new_snapshot() -> super::super::as200::reader::PublishedRecordSnapshot {
     use super::super::as200::{WordOrder, decode, reader::PublishedRecordSnapshot};
     let mut control = vec![0_u16; 20];
@@ -710,4 +1429,160 @@ async fn test_connection_fails_only_when_plc_cannot_be_reached() {
     let mut cfg = probe_config(address);
     cfg.timeout_ms = 300;
     assert_eq!(probe_link(cfg).await.unwrap_err(), CONNECT);
+}
+
+#[tokio::test]
+async fn runtime_settings_roundtrip_keeps_identity_and_journal_and_rejects_unverified_changes() {
+    let dir = Fixture::new();
+    let state = dir.state().await;
+    let original = get(&state).await.unwrap();
+    let journal = std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap();
+    let mut parameters = original.parameters.clone();
+    parameters.poll_interval_ms = 750;
+    parameters.timeout_ms = 3000;
+    parameters.heartbeat_timeout_ms = Some(9000);
+    parameters.retry_interval_ms = 2500;
+    parameters.auto_reconnect = false;
+    let request = || RuntimeSettings {
+        endpoint: original.endpoint.clone().unwrap(),
+        parameters: parameters.clone(),
+    };
+    state.status.write().await.enabled = true; // Saving does not restart or stop the active Worker.
+    let saved = save_runtime(&state, request(), &original.revision)
+        .await
+        .unwrap();
+    assert!(state.status.read().await.enabled);
+    assert!(saved.restart_required);
+    assert_eq!(saved.parameters, parameters);
+    assert!(
+        save_runtime(&state, request(), &original.revision)
+            .await
+            .is_err()
+    );
+    state.status.write().await.enabled = false;
+    let (text, loaded) = read(&dir.0.join("as200_config.toml")).unwrap();
+    assert_eq!(
+        loaded.reader().timeout,
+        std::time::Duration::from_millis(3000)
+    );
+    assert_eq!(
+        loaded.source_key,
+        simulator_config::parse(TEXT).unwrap().source_key
+    );
+    assert_eq!(
+        loaded.confirmed_session_id,
+        simulator_config::parse(TEXT).unwrap().confirmed_session_id
+    );
+    assert_eq!(
+        std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap(),
+        journal
+    );
+    for (count, size) in [(3, 240), (2, 256), (2, 300)] {
+        let mut rejected = parameters.clone();
+        rejected.buffer_count = count;
+        rejected.record_size = size;
+        assert!(
+            save_runtime(
+                &state,
+                RuntimeSettings {
+                    endpoint: original.endpoint.clone().unwrap(),
+                    parameters: rejected
+                },
+                &saved.revision
+            )
+            .await
+            .is_err()
+        );
+    }
+    for changed in 0..3 {
+        let mut rejected = parameters.clone();
+        match changed {
+            0 => rejected.control_start = 26000,
+            1 => rejected.word_order = StoredWordOrder::Low,
+            _ => rejected.modbus_address_offset = 0,
+        }
+        assert!(
+            save_runtime(
+                &state,
+                RuntimeSettings {
+                    endpoint: original.endpoint.clone().unwrap(),
+                    parameters: rejected
+                },
+                &saved.revision
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.0.join("as200_config.toml")).unwrap(),
+        text
+    );
+    assert_eq!(
+        std::fs::read(dir.0.join("as200_capture_journal.json")).unwrap(),
+        journal
+    );
+}
+#[test]
+fn runtime_parameters_reject_fake_options_and_invalid_timing() {
+    let c = SimulatorConfig::default();
+    let good = RuntimeParameters::from_config(&c);
+    for field in 0..8 {
+        let mut p = good.clone();
+        match field {
+            0 => p.start_with_windows = true,
+            1 => p.sku_table_start = Some(1000),
+            2 => p.poll_interval_ms = 0,
+            3 => p.poll_interval_ms = 49,
+            4 => p.timeout_ms = 0,
+            5 => p.heartbeat_timeout_ms = Some(1000),
+            6 => p.retry_interval_ms = 0,
+            _ => p.layout_profile = "unknown".into(),
+        }
+        assert!(p.apply(&c).is_err());
+    }
+    let mut p = good;
+    p.read_only = true;
+    p.control_start = 26000;
+    let next = p.apply(&c).unwrap();
+    assert!(!next.ack_enabled);
+    assert_eq!(next.reader().control_start, 26000);
+}
+
+#[tokio::test]
+async fn fresh_profile_can_save_relocated_read_only_parameters_without_creating_history() {
+    let dir = Fixture::new();
+    let file = create_initial(&dir.0, &value()).unwrap();
+    let state = WorkerState::default();
+    state.settings_ready.store(true, Ordering::SeqCst);
+    *state.settings_path.lock().await = Some(file.clone());
+    let current = get(&state).await.unwrap();
+    let mut parameters = current.parameters.clone();
+    parameters.control_start = 26000;
+    parameters.word_order = StoredWordOrder::High;
+    parameters.modbus_address_offset = -1;
+    parameters.read_only = true;
+    let saved = save_runtime(
+        &state,
+        RuntimeSettings {
+            endpoint: value(),
+            parameters: parameters.clone(),
+        },
+        &current.revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.parameters, parameters);
+    let (config, _) = simulator_config::load(Some(&dir.0)).unwrap().unwrap();
+    assert_eq!(config.reader().control_start, 26000);
+    assert_eq!(
+        config.reader().word_order,
+        super::super::as200::WordOrder::HighWordFirst
+    );
+    assert_eq!(config.reader().modbus_address_offset, -1);
+    assert!(!config.ack_enabled && !config.enabled && !config.technical_setup_confirmed);
+    assert!(config.source_key.is_empty() && config.confirmed_session_id.is_none());
+    assert!(!dir.0.join("local-runtime").exists());
+    assert!(!config.journal_file(&file).exists());
+    assert!(saved.verification_required);
 }

@@ -175,6 +175,7 @@ export interface PointQualityStatistics {
 }
 export interface MeasurementQualityStatistics {
   retestedClubs: number;
+  buttHistogram: Array<{ lower: string; upper: string; count: number }>;
   points: PointQualityStatistics[];
   pointSummary: PointSummaryStatistics[];
 }

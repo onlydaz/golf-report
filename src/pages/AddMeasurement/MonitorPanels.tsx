@@ -1,7 +1,9 @@
-﻿import { Alert, Button, Card, Empty, Spin, Table } from "antd";
+﻿import { Alert, Button, Card, Empty, Select, Spin, Table } from "antd";
 import { useNavigate } from "react-router-dom";
+import { useState } from "react";
+import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ResultTag } from "../../components/measurement/MeasurementDetails";
-import type { BackendMeasurement, MeasurementDetail, MeasurementStatistics } from "../../services/measurementService";
+import type { BackendMeasurement, MeasurementDetail, MeasurementHistoryItem, MeasurementStatistics } from "../../services/measurementService";
 import { formatDecimal, isUnmeasuredPoint } from "../../utils/as200Report";
 import { formatReportTime } from "../../utils/reportTime";
 
@@ -32,14 +34,55 @@ export function ProductionSummary({ productCode, statistics, loading }: {
   </>;
 }
 
-export function BendComparison() {
-  return <Card className="section-card monitor-bend" title="Độ cong so với cài đặt · Gậy gần nhất">
-    <div className="monitor-chart-settings"><span>Load cài đặt <b>—</b></span><span>Giới hạn Bend <b>—</b></span><span>Vị trí cài đặt <b>—</b></span></div>
+export function decisionBend(row: MeasurementHistoryItem, station: "BUTT" | "TIP", pointNumber: number) {
+  return row.decisionPoints.find(point => point.measurementId === row.id
+    && point.station === station && point.pointNumber === pointNumber)?.bend ?? null;
+}
+
+export function buildBendSeries(records: MeasurementHistoryItem[], productCode: string | undefined, station: "BUTT" | "TIP") {
+  if (!productCode) return [];
+  return [...new Map(records.filter(row => row.productCode === productCode).map(row => [row.id, row])).values()]
+    .sort((a, b) => Date.parse(b.measuredAt) - Date.parse(a.measuredAt) || b.id - a.id)
+    .slice(0, 30).reverse().map(row => {
+      const points = [1, 2, 3, 4].map(point => {
+        const value = decisionBend(row, station, point);
+        return value != null && value.trim() !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+      });
+      return { id: row.id, clubNumber: row.clubNumber, measuredAt: row.measuredAt, recordSeq: row.recordSeq,
+        p1: points[0], p2: points[1], p3: points[2], p4: points[3] };
+    });
+}
+
+export function BendComparison({ records, productCode, loading, error }: {
+  records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string;
+}) {
+  const [station, setStation] = useState<"BUTT" | "TIP">("BUTT");
+  const series = buildBendSeries(records, productCode, station);
+  const hasBend = series.some(row => [row.p1, row.p2, row.p3, row.p4].some(value => value != null));
+  return <Card className="section-card monitor-bend" title="Độ cong thực tế · 30 gậy gần nhất"
+    extra={<Select aria-label="Trạm biểu đồ độ cong" value={station} onChange={setStation}
+      options={[{ value: "BUTT", label: "Trạm BUTT" }, { value: "TIP", label: "Trạm TIP" }]} />}>
+    <div className="monitor-chart-settings"><span>Lực đè cài đặt <b>—</b></span><span>Giới hạn độ cong <b>—</b></span><span>Vị trí cài đặt <b>—</b></span></div>
     <div className="monitor-chart-legend" aria-label="Chú giải điểm đo">{["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].map((color, i) => <span key={color}><i style={{ background: color }} />Điểm {i + 1}</span>)}</div>
-    <div className="monitor-chart-empty">
-      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có dữ liệu để đối chiếu độ cong với cài đặt" />
-      <p className="monitor-caption">Chưa có setpoint theo SKU và chuỗi Bend của 30 gậy trong dữ liệu đang tải.</p>
-    </div>
+    {error && <Alert type="error" showIcon title={error} />}
+    <Spin spinning={loading}>
+      {hasBend ? <div className="monitor-bend-chart"><ResponsiveContainer width="100%" height="100%">
+        <LineChart data={series} margin={{ top: 16, right: 18, bottom: 8, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="id" tickFormatter={id => `#${series.find(row => row.id === id)?.clubNumber ?? "—"}`} />
+          <YAxis width={65} label={{ value: "Độ cong (mm)", angle: -90, position: "insideLeft" }} />
+          <Tooltip labelFormatter={id => {
+            const row = series.find(item => item.id === Number(id));
+            return row ? `#${row.clubNumber} · ${formatReportTime(row.measuredAt)} · RecordSeq ${row.recordSeq}` : "";
+          }} formatter={value => `${formatDecimal(value == null ? null : String(value))} mm`} />
+          {["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].map((color, i) =>
+            <Line key={color} type="linear" dataKey={`p${i + 1}`} name={`${station} · Điểm ${i + 1}`} stroke={color}
+              connectNulls={false} dot={{ r: 3 }} activeDot={{ r: 5 }} isAnimationActive={false} />)}
+        </LineChart>
+      </ResponsiveContainer></div> : <div className="monitor-chart-empty">
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={productCode ? `Chưa có dữ liệu độ cong đã lưu cho trạm ${station}` : "Chưa xác định SKU đang hiển thị"} />
+      </div>}
+    </Spin>
     <div className="monitor-chart-axis"><span>Gậy cũ hơn</span><span>Thứ tự gậy →</span><span>Gậy mới nhất</span></div>
   </Card>;
 }
@@ -52,40 +95,37 @@ export function CurrentPointTable({ detail, loading }: { detail?: MeasurementDet
         pushDist: decision?.pushDist, bend: decision?.bend };
     })
   ) ?? []);
-  return <Table className="monitor-point-table" size="small" rowKey="key" dataSource={rows} loading={loading} pagination={false} scroll={{ x: 650 }}
+  return <Table className="monitor-point-table" size="small" rowKey="key" dataSource={rows} loading={loading} pagination={false} tableLayout="fixed"
     locale={{ emptyText: "Chưa có chi tiết đo đã lưu của gậy này." }} columns={[
-      { title: "Trạm / Điểm", render: (_, row) => `${row.station} · P${row.pointNumber}`, width: 100 },
-      { title: "Vị trí (mm)", render: (_, row) => formatDecimal(isUnmeasuredPoint(row) ? null : row.position), width: 85 },
-      { title: "Lực đo (g)", dataIndex: "load", render: formatDecimal, width: 80 },
-      { title: "Khoảng cách đẩy (mm)", dataIndex: "pushDist", render: formatDecimal, width: 100 },
-      { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: 90 },
-      { title: "Số lần đo", dataIndex: "attemptCount", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 80 },
-      { title: "Kết quả", dataIndex: "result", render: (result, row) => isUnmeasuredPoint(row) ? "—" : <ResultTag result={result} qcLabels />, width: 85 },
+      { title: "Trạm / Điểm", render: (_, row) => `${row.station} · P${row.pointNumber}` },
+      { title: "Vị trí (mm)", render: (_, row) => formatDecimal(isUnmeasuredPoint(row) ? null : row.position), width: "13%" },
+      { title: "Lực đo (g)", dataIndex: "load", render: formatDecimal, width: "13%" },
+      { title: "Khoảng cách đẩy (mm)", dataIndex: "pushDist", render: formatDecimal, width: "17%" },
+      { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: "14%" },
+      { title: <span className="monitor-attempt-heading">Số<br />lần đo</span>, dataIndex: "attemptCount", align: "center", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 54 },
+      { title: "Kết quả", dataIndex: "result", render: (result, row) => isUnmeasuredPoint(row) ? "—" : <ResultTag result={result} qcLabels />, width: "13%" },
     ]} />;
 }
 
-export function RecentMeasurements({ records, detail, loading, error, onRefresh }: {
-  records: BackendMeasurement[]; detail?: MeasurementDetail; loading: boolean; error: string; onRefresh: () => void;
+export function RecentMeasurements({ records, loading, error, onRefresh, page, total, onPageChange }: {
+  records: MeasurementHistoryItem[]; loading: boolean; error: string; onRefresh: () => void;
+  page: number; total: number; onPageChange: (page: number) => void;
 }) {
   const navigate = useNavigate();
-  const bends = (row: BackendMeasurement, type: "BUTT" | "TIP") => {
-    if (detail?.id !== row.id) return "—";
-    const station = detail.stations.find(item => item.stationType === type);
-    return station ? [...station.points].sort((a, b) => a.pointNumber - b.pointNumber).map(point =>
-      formatDecimal(point.attempts.find(attempt => attempt.attemptNumber === point.decideAttempt)?.bend)).join(" / ") : "—";
-  };
+  const bends = (row: MeasurementHistoryItem, type: "BUTT" | "TIP") =>
+    [1, 2, 3, 4].map(point => formatDecimal(decisionBend(row, type, point))).join(" / ");
   return <Card className="section-card monitor-recent" title="Các gậy gần nhất"
     extra={<div className="monitor-recent-actions"><Button type="text" size="small" loading={loading} onClick={onRefresh}>Làm mới</Button><Button type="link" size="small" onClick={() => navigate("/measurements")}>Xem toàn bộ lịch sử →</Button></div>}>
     {error && <Alert type="error" showIcon title={error} className="add-measurement-alert" />}
-    <Table<BackendMeasurement> rowKey="id" size="small" loading={loading} dataSource={records}
-      pagination={{ pageSize: 6, hideOnSinglePage: true, showSizeChanger: false }} scroll={{ x: 950 }}
+    <Table<MeasurementHistoryItem> rowKey="id" size="small" loading={loading} dataSource={records}
+      pagination={{ current: page, total, pageSize: 6, onChange: onPageChange, hideOnSinglePage: true, showSizeChanger: false }} scroll={{ x: 950 }}
       locale={{ emptyText: "Chưa có kết quả đo đã lưu." }}
       onRow={row => ({ onClick: () => navigate(`/measurements/${row.id}`), style: { cursor: "pointer" } })}
       columns={[
         { title: "Thời gian", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
         { title: "Số gậy", dataIndex: "clubNumber", render: value => `#${value}`, width: 80 },
         { title: "BUTT P1 / P2 / P3 / P4 (mm)", render: (_, row) => bends(row, "BUTT"), width: 260 },
-        { title: <span title="Bend các điểm TIP theo thứ tự điểm, không tự gộp thành một giá trị">TIP (mm)</span>, render: (_, row) => bends(row, "TIP"), width: 190 },
+        { title: <span title="Độ cong các điểm TIP theo thứ tự điểm, không tự gộp thành một giá trị">TIP (mm)</span>, render: (_, row) => bends(row, "TIP"), width: 190 },
         ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({ title, dataIndex, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />, width: 85 })),
       ]} />
   </Card>;

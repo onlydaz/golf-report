@@ -121,6 +121,17 @@ impl AckWriter {
         protocol: Option<&str>,
         allow_plc_connection: bool,
     ) -> Result<Self, String> {
+        let end = usize::from(cfg.control_start)
+            .checked_add(map::CONTROL_SIZE + map::BUFFER_COUNT * map::RECORD_SIZE)
+            .filter(|v| *v <= 65536)
+            .ok_or("ACK layout address overflow")?;
+        if cfg.record_size != map::RECORD_SIZE
+            || cfg.buffer_count != map::BUFFER_COUNT
+            || map::modbus_address(cfg.control_start, cfg.modbus_address_offset).is_none()
+            || map::modbus_address((end - 1) as u16, cfg.modbus_address_offset).is_none()
+        {
+            return Err("ACK layout chưa tương thích hoặc vùng địa chỉ không hợp lệ".into());
+        }
         let address: std::net::SocketAddr = cfg
             .address
             .parse()
@@ -138,7 +149,7 @@ impl AckWriter {
             return Err("ACK invalid count".into());
         }
         let address = map::modbus_address(
-            map::CONTROL_BASE + map::control::PC_READ_COUNT as u16,
+            self.cfg.control_start + map::control::PC_READ_COUNT as u16,
             self.cfg.modbus_address_offset,
         )
         .ok_or("ACK address overflow")?;
@@ -158,7 +169,7 @@ impl AckWriter {
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
-            map::CONTROL_BASE + map::control::PC_READ_DONE as u16,
+            self.cfg.control_start + map::control::PC_READ_DONE as u16,
             self.cfg.modbus_address_offset,
         )
         .ok_or("ACK address overflow")?;
@@ -241,6 +252,9 @@ mod tests {
                     stream.write_all(&request).await.unwrap();
                 });
                 let cfg = As200Config {
+                    control_start: 25000,
+                    record_size: 240,
+                    buffer_count: 2,
                     address,
                     unit_id: 1,
                     modbus_address_offset: -1,
@@ -278,6 +292,9 @@ mod tests {
                 }
             });
             let cfg = As200Config {
+                control_start: 25000,
+                record_size: 240,
+                buffer_count: 2,
                 address,
                 unit_id: 1,
                 modbus_address_offset: 0,
@@ -294,6 +311,9 @@ mod tests {
     async fn prepared_done_does_not_send_until_explicitly_consumed() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            control_start: 25000,
+            record_size: 240,
+            buffer_count: 2,
             address: listener.local_addr().unwrap().to_string(),
             unit_id: 1,
             modbus_address_offset: 0,
@@ -322,6 +342,9 @@ mod tests {
     ) -> (As200Config, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            control_start: 25000,
+            record_size: 240,
+            buffer_count: 2,
             address: listener.local_addr().unwrap().to_string(),
             unit_id: 1,
             modbus_address_offset: -1,
@@ -393,6 +416,9 @@ mod tests {
     async fn prepared_stream_is_used_for_done_without_new_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            control_start: 25000,
+            record_size: 240,
+            buffer_count: 2,
             address: listener.local_addr().unwrap().to_string(),
             unit_id: 1,
             modbus_address_offset: 0,
@@ -416,5 +442,51 @@ mod tests {
         });
         writer.done_prepared(prepared).await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relocated_ack_uses_profile_control_base_and_offset() {
+        for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut frame = [0; 17];
+                socket.read_exact(&mut frame).await.unwrap();
+                assert_eq!(frame[7], 16);
+                assert_eq!(u16::from_be_bytes([frame[8], frame[9]]), 26007);
+                let expected = if order == WordOrder::LowWordFirst {
+                    [0, 2, 0, 1]
+                } else {
+                    [0, 1, 0, 2]
+                };
+                assert_eq!(&frame[13..], &expected);
+                let reply = [
+                    frame[0], frame[1], 0, 0, 0, 6, 1, 16, frame[8], frame[9], 0, 2,
+                ];
+                socket.write_all(&reply).await.unwrap();
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut frame = [0; 12];
+                socket.read_exact(&mut frame).await.unwrap();
+                assert_eq!(frame[7], 6);
+                assert_eq!(u16::from_be_bytes([frame[8], frame[9]]), 26011);
+                assert_eq!(&frame[10..], &[0, 1]);
+                socket.write_all(&frame).await.unwrap();
+            });
+            let cfg = As200Config {
+                control_start: 26000,
+                record_size: 240,
+                buffer_count: 2,
+                address,
+                unit_id: 1,
+                modbus_address_offset: -1,
+                word_order: order,
+                timeout: Duration::from_millis(1000),
+            };
+            let writer = AckWriter::new(cfg, "modbus", true, Some("as200"), true).unwrap();
+            writer.count(65538).await.unwrap();
+            send_done(&writer).await.unwrap();
+            server.await.unwrap();
+        }
     }
 }

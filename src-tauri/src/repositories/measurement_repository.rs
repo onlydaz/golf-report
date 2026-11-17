@@ -198,6 +198,86 @@ mod report_tests {
         .await
         .unwrap();
         assert!(empty.point_summary.is_empty());
+        assert!(empty.butt_histogram.is_empty());
+
+        // Replace only this connection's TEMP fixtures; exercise the shared BUTT bins.
+        sqlx::raw_sql(r#"
+            TRUNCATE measurement_attempts,measurement_points,measurement_stations,measurements;
+            INSERT INTO measurements VALUES
+                (1,'A',1,'2026-11-16 10:00:00+07','NG'),
+                (2,'B',2,'2026-11-16 11:00:00+07','NG'),
+                (3,'A',3,'2026-11-17 10:00:00+07','OK'),
+                (4,'A',4,'2026-11-16 12:00:00+07','OK');
+            INSERT INTO measurement_stations SELECT id,id,'BUTT',overall_result,10 FROM measurements;
+            INSERT INTO measurement_stations SELECT id+100,id,'TIP','OK',20 FROM measurements;
+            INSERT INTO measurement_points VALUES
+                (11,1,1,50,'NG',2,2),(12,1,2,75,'OK',1,1),
+                (13,1,3,100,'OK',1,1),(14,1,4,125,'NG',1,1),
+                (21,2,1,50,'NG',1,1),(22,2,2,NULL,'UNMEASURED',0,NULL),
+                (23,2,3,100,'OK',1,1),(24,2,4,125,'SKIPPED',1,1),
+                (31,3,1,50,'OK',1,1),(41,4,1,50,'OK',1,1),
+                (101,101,1,50,'OK',1,1),(102,102,1,50,'OK',1,1);
+            INSERT INTO measurement_attempts VALUES
+                (11,1,999,999),(11,2,999,-1),(12,1,999,0),(13,1,999,1),
+                (14,1,999,2),(21,1,999,-2),(23,1,999,NULL),(24,1,999,100),
+                (31,1,999,8),(41,1,999,NULL),(101,1,999,99),(102,1,999,99);
+        "#).execute(&pool).await.unwrap();
+        let day_request = MeasurementListRequest {
+            measured_from: single_request.measured_from,
+            measured_to: single_request.measured_to,
+            ..Default::default()
+        };
+        let day = MeasurementRepository::quality_statistics(&pool, &day_request)
+            .await
+            .unwrap();
+        assert_eq!(day.butt_histogram.iter().map(|b| b.count).sum::<i64>(), 5);
+        assert_eq!(day.butt_histogram[5].count, 1); // Zero is a real decision Bend.
+        assert_eq!(day.retested_clubs, 1); // Two attempts still contribute one decision sample.
+        for (actual, expected) in [
+            (&day.butt_histogram[0].lower, -2),
+            (&day.butt_histogram[9].upper, 2),
+        ] {
+            assert_eq!(
+                actual.parse::<bigdecimal::BigDecimal>().unwrap(),
+                bigdecimal::BigDecimal::from(expected)
+            );
+        }
+        let four = MeasurementRepository::quality_statistics(
+            &pool,
+            &MeasurementListRequest {
+                product_code: Some("A".into()),
+                club_number: Some(1),
+                result: Some(crate::enums::MeasurementResult::Ng),
+                butt_result: Some(crate::enums::MeasurementResult::Ng),
+                tip_result: Some(crate::enums::MeasurementResult::Ok),
+                ..day_request.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(four.butt_histogram.iter().map(|b| b.count).sum::<i64>(), 4); // Includes P4 NG.
+        let one = MeasurementRepository::quality_statistics(
+            &pool,
+            &MeasurementListRequest {
+                product_code: Some("B".into()),
+                ..day_request.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.butt_histogram.len(), 1);
+        assert_eq!(one.butt_histogram[0].count, 1);
+        assert_eq!(one.butt_histogram[0].lower, one.butt_histogram[0].upper);
+        let null_only = MeasurementRepository::quality_statistics(
+            &pool,
+            &MeasurementListRequest {
+                club_number: Some(4),
+                ..day_request
+            },
+        )
+        .await
+        .unwrap();
+        assert!(null_only.butt_histogram.is_empty());
         pool.close().await;
     }
 
@@ -370,9 +450,11 @@ mod report_tests {
             let filtered = MeasurementRepository::report(&pool, &request)
                 .await
                 .unwrap();
-            assert!(filtered
-                .iter()
-                .any(|item| item.summary.id == first.summary.id));
+            assert!(
+                filtered
+                    .iter()
+                    .any(|item| item.summary.id == first.summary.id)
+            );
             assert!(filtered.iter().all(|item| item.summary.product_code
                 == first.summary.product_code
                 && item.summary.club_number == first.summary.club_number
@@ -463,15 +545,19 @@ mod report_tests {
                 .total,
             0
         );
-        assert!(MeasurementRepository::history_page(&pool, &empty)
-            .await
-            .unwrap()
-            .items
-            .is_empty());
-        assert!(MeasurementRepository::report(&pool, &empty)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            MeasurementRepository::history_page(&pool, &empty)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(
+            MeasurementRepository::report(&pool, &empty)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             MeasurementRepository::statistics(&pool, &empty)
                 .await
@@ -640,8 +726,25 @@ impl MeasurementRepository {
             FROM samples s JOIN grouped g USING(product_code,station,point_number)
             WHERE s.position IS NOT DISTINCT FROM g.position AND s.bend IS NOT NULL
             GROUP BY s.product_code,s.station,s.point_number,s.position,bin
+        ), butt_samples AS (
+            SELECT bend FROM samples
+            WHERE station='BUTT' AND point_number BETWEEN 1 AND 4 AND bend IS NOT NULL
+        ), butt_range AS (
+            SELECT count(*) AS amount,min(bend) AS lo,max(bend) AS hi FROM butt_samples
+        ), butt_bins AS (
+            SELECT CASE WHEN r.hi=r.lo THEN 0 ELSE
+                least(9,greatest(0,floor((s.bend-r.lo)*10/nullif(r.hi-r.lo,0))::int)) END AS bin,
+                count(*) AS amount
+            FROM butt_samples s CROSS JOIN butt_range r GROUP BY bin
         ) SELECT jsonb_build_object(
             'retestedClubs',(SELECT count(DISTINCT measurement_id) FROM samples WHERE attempt_count>1),
+            'buttHistogram',coalesce((SELECT jsonb_agg(jsonb_build_object(
+                'lower',(CASE WHEN r.lo=r.hi THEN r.lo ELSE r.lo+(r.hi-r.lo)*bins.n/10 END)::text,
+                'upper',(CASE WHEN r.lo=r.hi THEN r.hi ELSE r.lo+(r.hi-r.lo)*(bins.n+1)/10 END)::text,
+                'count',coalesce(b.amount,0)) ORDER BY bins.n)
+                FROM butt_range r CROSS JOIN LATERAL generate_series(0,CASE WHEN r.amount=0 THEN -1
+                    WHEN r.lo=r.hi THEN 0 ELSE 9 END) bins(n)
+                LEFT JOIN butt_bins b ON b.bin=bins.n),'[]'::jsonb),
             'pointSummary',coalesce((SELECT jsonb_agg(jsonb_build_object(
                 'station',s.station,'pointNumber',s.point_number,'position',s.position::text,
                 'loadAvg',s.load_avg,'pushDistAvg',s.push_dist_avg,

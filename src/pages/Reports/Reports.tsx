@@ -28,7 +28,6 @@ type Period = "today" | "week" | "custom";
 const defaultRange = (): [Dayjs, Dayjs] => [vietnamNow().subtract(6, "day"), vietnamNow()];
 const numeric = (value: string | null) => value == null || !Number.isFinite(Number(value))
   ? "—" : Number(value).toLocaleString("vi-VN", { maximumSignificantDigits: 9 });
-const pointKey = (point: PointQualityStatistics) => JSON.stringify([point.productCode, point.station, point.pointNumber, point.position]);
 const pointLabel = (point: PointQualityStatistics) => `${point.productCode} · ${point.station} P${point.pointNumber} · ${formatDecimal(point.position)} mm`;
 
 function Reports() {
@@ -61,7 +60,6 @@ function Reports() {
   const [error, setError] = useState("");
   const [listError, setListError] = useState("");
   const [exporting, setExporting] = useState(false);
-  const [selectedPoint, setSelectedPoint] = useState<string>();
 
   useEffect(() => {
     let active = true;
@@ -81,15 +79,13 @@ function Reports() {
 
   useEffect(() => {
     let active = true;
-    setStats(undefined); setQuality(undefined); setSelectedPoint(undefined); setError("");
+    setStats(undefined); setQuality(undefined); setError("");
     setLoading(databaseConnected);
     if (!databaseConnected) return;
     void Promise.all([getMeasurementStatistics(query.filters), getMeasurementQualityStatistics(query.filters)])
       .then(([summary, points]) => {
         if (!active) return;
         setStats(summary); setQuality(points);
-        const first = points.points.find(point => point.bendCount > 0);
-        setSelectedPoint(first ? pointKey(first) : undefined);
       }).catch(() => { if (active) setError("Không thể tải báo cáo chất lượng. Vui lòng tạo báo cáo lại."); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
@@ -149,10 +145,19 @@ function Reports() {
   };
 
   const points = quality?.points ?? [];
-  const chosen = points.find(point => pointKey(point) === selectedPoint);
   const topNg = [...points].filter(point => point.ng > 0).sort((a, b) => b.ng - a.ng).slice(0, 12)
-    .map(point => ({ ...point, label: pointLabel(point), rate: 100 * point.ng / point.measured }));
-  const mostNg = topNg[0];
+    .map(point => ({ ...point, label: pointLabel(point),
+      rate: stats?.totalMeasurements ? 100 * point.ng / stats.totalMeasurements : null }));
+  // Each measurement belongs to one SKU/position at a given station/point.
+  // Combine those groups for this card; keep the chart's detailed groups unchanged.
+  const ngByPoint = new Map<string, { station: string; pointNumber: number; ng: number }>();
+  for (const point of points) {
+    const key = `${point.station}-${point.pointNumber}`;
+    const entry = ngByPoint.get(key) ?? { station: point.station, pointNumber: point.pointNumber, ng: 0 };
+    entry.ng += point.ng;
+    ngByPoint.set(key, entry);
+  }
+  const mostNg = stats?.totalNg ? [...ngByPoint.values()].filter(point => point.ng > 0).sort((a, b) => b.ng - a.ng)[0] : undefined;
   const daily = stats?.daily.map(item => ({ ...item, rate: item.total ? 100 * item.ok / item.total : null })) ?? [];
   const spanDays = query.filters.measuredFrom && query.filters.measuredTo
     ? dayjs(query.filters.measuredTo).diff(dayjs(query.filters.measuredFrom), "day") : daily.length;
@@ -164,9 +169,9 @@ function Reports() {
     const entry = grouped.get(key) ?? { date: key, ok: 0, ng: 0 };
     entry.ok += item.ok; entry.ng += item.ng; grouped.set(key, entry);
   }
-  const histogram = chosen?.histogram.map((bin, index) => ({ ...bin,
+  const histogram = quality?.buttHistogram?.map((bin, index) => ({ ...bin,
     label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
-    bounds: `[${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${index === chosen.histogram.length - 1 ? "]" : ")"} mm`,
+    bounds: `[${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${index === quality.buttHistogram.length - 1 ? "]" : ")"} mm`,
   })) ?? [];
   const cards = [
     ["Tổng số gậy", stats?.totalMeasurements, "blue"], ["Tổng OK", stats?.totalOk, "green"],
@@ -243,8 +248,14 @@ function Reports() {
       <span>{label}</span><strong>{loading ? <Spin size="small" /> : typeof value === "number" ? value.toLocaleString("vi-VN") : value ?? "—"}</strong>
     </Card>)}</div>
     {quality && stats && <div className="reports-extra-stats">
-      <Card><span>Điểm có nhiều NG nhất</span><strong>{mostNg ? `${mostNg.label}: ${mostNg.ng} gậy` : "Chưa có điểm NG"}</strong></Card>
-      <Card><span>Gậy đo lại (ít nhất một điểm có ≥ 2 lượt)</span><strong>{quality.retestedClubs.toLocaleString("vi-VN")} · {stats.totalMeasurements ? (100 * quality.retestedClubs / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}%</strong></Card>
+      <Card><span>NG nhiều nhất tại</span>
+        <strong>{mostNg ? `${mostNg.station} · P${mostNg.pointNumber}` : "Chưa có"}</strong>
+        <small>{mostNg?.ng.toLocaleString("vi-VN") ?? "0"} gậy · {mostNg && stats.totalNg ? (100 * mostNg.ng / stats.totalNg).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng NG</small>
+      </Card>
+      <Card><span>Gậy phải đo lại (≥ 2 lần)</span>
+        <strong>{stats.totalMeasurements ? quality.retestedClubs.toLocaleString("vi-VN") : "0"}</strong>
+        <small>{stats.totalMeasurements ? (100 * quality.retestedClubs / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng gậy</small>
+      </Card>
     </div>}
     <div className="reports-chart-grid">
       <Card className="section-card" title={`Số lượng OK / NG theo ${timeUnit === "month" ? "tháng" : timeUnit === "week" ? "tuần (từ Chủ nhật)" : "ngày"}`}>
@@ -257,10 +268,20 @@ function Reports() {
         <div className="reports-stations">{stats?.stationResults.map(station => <div key={station.station}>
           <b>{station.station.toUpperCase()}</b><span>{station.ng} gậy NG · {stats.totalMeasurements ? (station.ng * 100 / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng gậy</span>
         </div>)}</div>
-        {topNg.length ? <div className="report-chart report-ng-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={topNg} layout="vertical" margin={{ left: 0, right: 25 }}>
-          <CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} /><YAxis type="category" dataKey="label" width={115} tick={{ fontSize: 13 }} tickFormatter={value => value.length > 16 ? value.slice(0, 15) + "…" : value} />
-          <Tooltip formatter={(value, _name, item) => [`${value} gậy · ${item.payload.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}% tại điểm này`, "NG"]} />
-          <Bar dataKey="ng" fill="#cf3c48" />
+        {topNg.length ? <div className="report-chart report-ng-chart" style={{ height: Math.max(336, topNg.length * 40) }}><ResponsiveContainer width="100%" height="100%"><BarChart data={topNg} layout="vertical" margin={{ left: 0, right: 25 }}>
+          <CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} />
+          <YAxis type="category" dataKey="label" width={145} interval={0} tick={({ x, y, payload }) => {
+            const point = topNg.find(item => item.label === payload.value);
+            return point ? <text x={Number(x) - 4} y={Number(y)} textAnchor="end" fill="#526b83" fontSize={13}>
+              <title>{point.label}</title>
+              <tspan x={Number(x) - 4} dy={-5}>{point.productCode.length > 17 ? `${point.productCode.slice(0, 16)}…` : point.productCode}</tspan>
+              <tspan x={Number(x) - 4} dy={16}>{point.station} · P{point.pointNumber} · {formatDecimal(point.position)} mm</tspan>
+            </text> : <g />;
+          }} />
+          <Tooltip formatter={(value, _name, item) => [
+            `${value} gậy · ${item.payload.rate == null ? "—" : item.payload.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 }) + "%"} tổng gậy (${stats?.totalMeasurements.toLocaleString("vi-VN") ?? "—"} gậy)`, "NG",
+          ]} />
+          <Bar dataKey="ng" name="Số gậy NG" fill="#cf3c48" />
         </BarChart></ResponsiveContainer></div> : empty}
       </Card>
       <Card className="section-card" title="Tỷ lệ OK theo ngày">
@@ -275,13 +296,11 @@ function Reports() {
       </Card>
     </div>
     <div className="reports-detail-grid">
-      <Card className="section-card" title="Phân bố độ cong">
-        <Select className="reports-point-picker" placeholder="Chọn SKU / trạm / điểm / vị trí" value={selectedPoint} onChange={setSelectedPoint}
-          options={points.filter(point => point.bendCount > 0).map(point => ({ value: pointKey(point), label: pointLabel(point) }))} />
+      <Card className="section-card" title="Phân bố độ cong BUTT (tất cả điểm)">
         {histogram.length ? <>
           <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={histogram}>
             <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="label" tick={{ fontSize: 13 }} interval="preserveStartEnd" label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />
-            <YAxis allowDecimals={false} width={40} /><Tooltip labelFormatter={(_label, payload) => payload?.[0]?.payload.bounds ?? ""} /><Bar dataKey="count" name="Số gậy" fill="#3987c9" />
+            <YAxis allowDecimals={false} width={65} label={{ value: "Số phép đo", angle: -90, position: "insideLeft" }} /><Tooltip labelFormatter={(_label, payload) => payload?.[0]?.payload.bounds ?? ""} /><Bar dataKey="count" name="Số phép đo" fill="#3987c9" />
           </BarChart></ResponsiveContainer></div>
         </> : empty}
       </Card>

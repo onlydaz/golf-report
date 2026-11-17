@@ -185,7 +185,7 @@ impl Journal {
 
 impl Engine {
     pub(super) fn published_binding(config: &SimulatorConfig) -> String {
-        format!(
+        let mut binding = format!(
             "published-ack-v1|{}|{}|{}|{}|{:?}|{}|{:?}|as200",
             config.mode,
             config.address,
@@ -194,7 +194,18 @@ impl Engine {
             config.confirmed_session_id,
             config.modbus_address_offset,
             config.word_order
-        )
+        );
+        // Keep the established binding byte-for-byte for the original verified map.
+        if config.control_start != as200::map::CONTROL_BASE {
+            binding.push_str(&format!(
+                "|{}|{}|{}|{}",
+                config.layout_profile,
+                config.control_start,
+                config.buffer_count,
+                config.record_size
+            ));
+        }
+        binding
     }
 
     pub(super) fn open(
@@ -203,9 +214,9 @@ impl Engine {
         state: WorkerState,
     ) -> Result<Arc<Self>, String> {
         config.validate()?;
-        if !config.ack_enabled
+        if (!config.read_only
+            && (!config.ack_enabled || !simulator_config::ack_scope_allows(&config)))
             || !config.allow_plc_connection
-            || !simulator_config::ack_scope_allows(&config)
             || config.pc_heartbeat_enabled
             || config.allow_plc_heartbeat_write
             || config.confirmed_session_id.is_none()
@@ -249,6 +260,9 @@ impl Engine {
             }
         };
         journal.validate(&config)?;
+        if config.read_only && journal.pending_ack() {
+            return Err("Journal còn ACK intent chưa đối chiếu; không chuyển sang chỉ đọc để vượt trạng thái chưa xác định.".into());
+        }
         Ok(Arc::new(Self {
             config,
             path,

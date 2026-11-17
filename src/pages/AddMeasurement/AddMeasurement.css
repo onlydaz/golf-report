@@ -303,7 +303,8 @@
 .monitor-save-state { font-size: 13px; color: #627d98; margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .monitor-save-state .ant-tag { font-size: 13px; margin: 0; }
 .monitor-caption { font-size: 13px; color: #627d98; line-height: 1.6; margin: 10px 0 0; }
-.monitor-page .monitor-point-table .ant-table-cell { font-size: 14px; line-height: 1.5; padding: 10px 7px; overflow-wrap: anywhere; }
+.monitor-page .monitor-point-table .ant-table-cell { font-size: 14px; line-height: 1.5; padding: 10px 5px; overflow-wrap: anywhere; }
+.monitor-point-table .monitor-attempt-heading { white-space: nowrap; }
 .monitor-page .ant-tag { border-radius: 999px; }
 .monitor-point-table .ant-table-thead > tr > th, .monitor-recent .ant-table-thead > tr > th { font-weight: 600; white-space: normal; }
 .monitor-point-table .ant-tag, .monitor-recent .ant-tag { font-size: 13px; margin: 0; padding-inline: 7px; }
@@ -317,6 +318,7 @@
 .monitor-chart-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 0; font-size: 13px; color: #627d98; }
 .monitor-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .monitor-chart-legend i { width: 14px; height: 3px; border-radius: 2px; }
+.monitor-bend-chart { width: 100%; min-width: 0; height: 260px; margin-top: 12px; }
 .monitor-chart-empty { display: flex; flex-direction: column; justify-content: center; min-height: 230px; padding: 24px 16px; margin-top: 12px; border-left: 1px solid #dce5ed; border-bottom: 1px solid #dce5ed; background: repeating-linear-gradient(to top, transparent 0, transparent 49px, #edf2f7 50px); }
 .monitor-chart-empty .monitor-caption { text-align: center; }
 .monitor-chart-axis { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 12px; font-size: 13px; color: #526b83; }

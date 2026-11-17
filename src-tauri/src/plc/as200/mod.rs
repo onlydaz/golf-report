@@ -14,6 +14,9 @@ use std::{fmt, time::Duration};
 
 #[derive(Debug, Clone)]
 pub struct As200Config {
+    pub control_start: u16,
+    pub record_size: usize,
+    pub buffer_count: usize,
     pub address: String,
     pub unit_id: u8,
     // TODO kỹ thuật viên xác nhận ánh xạ D -> địa chỉ PDU; tài liệu đề xuất 0.
@@ -28,6 +31,8 @@ pub struct As200Config {
 pub enum As200Error {
     InvalidData(String),
     Transport(String),
+    /// A PLC response was received, but it rejected or violated FC03.
+    Protocol(String),
     Timeout,
     Unstable,
 }
@@ -36,6 +41,7 @@ impl fmt::Display for As200Error {
         match self {
             Self::InvalidData(detail) => write!(f, "Dữ liệu AS200 không hợp lệ: {detail}"),
             Self::Transport(detail) => write!(f, "Lỗi Modbus TCP AS200: {detail}"),
+            Self::Protocol(detail) => write!(f, "Lỗi phản hồi Modbus AS200: {detail}"),
             Self::Timeout => write!(f, "Hết thời gian kết nối/đọc AS200"),
             Self::Unstable => write!(f, "Buffer AS200 đang thay đổi; bỏ snapshot và thử lại"),
         }

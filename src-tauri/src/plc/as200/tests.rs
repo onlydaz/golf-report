@@ -3,6 +3,9 @@ use std::time::Duration;
 
 fn config(order: WordOrder) -> As200Config {
     As200Config {
+        control_start: 25000,
+        record_size: 240,
+        buffer_count: 2,
         address: "127.0.0.1:0".into(),
         unit_id: 1,
         modbus_address_offset: 0,
@@ -493,7 +496,7 @@ async fn loopback(cfg: &mut As200Config) -> tokio::net::TcpListener {
 }
 
 #[tokio::test]
-async fn tcp_fc03_exception_response_is_transport_error_and_reconnects() {
+async fn tcp_fc03_exception_response_is_protocol_error_and_reconnects() {
     let mut cfg = config(WordOrder::LowWordFirst);
     let listener = loopback(&mut cfg).await;
     let server = fake_fc03_server(listener, 2, |connection, request| {
@@ -506,7 +509,7 @@ async fn tcp_fc03_exception_response_is_transport_error_and_reconnects() {
     });
     let mut transport = ModbusTcpReader::new(cfg);
     match transport.read_holding_registers(25000, 2).await {
-        Err(As200Error::Transport(message)) => assert!(message.contains("exception"), "{message}"),
+        Err(As200Error::Protocol(message)) => assert!(message.contains("exception"), "{message}"),
         other => panic!("cần lỗi exception, nhận {other:?}"),
     }
     // Lỗi phải hủy kết nối cũ; lần sau mở kết nối mới (connection 1) và đọc được.
@@ -537,7 +540,7 @@ async fn tcp_fc03_wrong_unit_byte_count_function_or_short_data_is_rejected() {
         let mut transport = ModbusTcpReader::new(cfg);
         let result = transport.read_holding_registers(25000, 2).await;
         assert!(
-            matches!(result, Err(As200Error::Transport(_))),
+            matches!(result, Err(As200Error::Protocol(_))),
             "{fault}: {result:?}"
         );
         drop(transport);
@@ -613,5 +616,56 @@ async fn published_snapshot_over_tcp_never_reads_second_region() {
         assert_eq!(snapshot.buffer.unwrap().record.unwrap().record_seq, 1);
         drop(reader);
         assert!(server.await.unwrap().iter().all(|r| r[7] == 3));
+    }
+}
+
+#[tokio::test]
+async fn relocated_profile_reads_only_published_words_with_order_offset_and_chunk_limits() {
+    for order in [WordOrder::LowWordFirst, WordOrder::HighWordFirst] {
+        for offset in [-1, 0, 7] {
+            let mut cfg = config(order);
+            cfg.control_start = 26000;
+            cfg.modbus_address_offset = offset;
+            let mut memory = MemoryReader::new(order, 12);
+            memory.offset = 1000 + offset;
+            let mut reader = As200Reader::with_transport(cfg, memory);
+            let snapshot = reader.poll_published_record().await.unwrap();
+            assert_eq!(snapshot.buffer.unwrap().record.unwrap().record_seq, 11);
+            let first = (26000 + offset) as u16;
+            assert_eq!(
+                reader.transport.calls,
+                vec![
+                    (first, 20),
+                    (first + 20, 100),
+                    (first + 120, 100),
+                    (first + 220, 40),
+                    (first, 20),
+                    (first + 20, 100),
+                    (first + 120, 100),
+                    (first + 220, 40),
+                    (first, 20)
+                ]
+            );
+            assert!(
+                reader
+                    .transport
+                    .calls
+                    .iter()
+                    .all(|(address, count)| *count <= 100
+                        && u32::from(*address) + u32::from(*count) <= u32::from(first) + 260)
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn unsupported_profile_is_rejected_before_reading_registers() {
+    for (count, size) in [(3, 240), (2, 256), (2, 300)] {
+        let mut cfg = config(WordOrder::LowWordFirst);
+        cfg.buffer_count = count;
+        cfg.record_size = size;
+        let mut reader =
+            As200Reader::with_transport(cfg, MemoryReader::new(WordOrder::LowWordFirst, 2));
+        assert!(reader.poll_published_record().await.is_err());
+        assert!(reader.transport.calls.is_empty());
     }
 }

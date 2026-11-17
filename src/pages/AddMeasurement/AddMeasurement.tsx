@@ -4,7 +4,6 @@ import {
   Alert,
   Button,
   Card,
-  Collapse,
   Popconfirm,
   Space,
   Tag,
@@ -24,16 +23,15 @@ import {
   retryAs200Inbox,
 } from "../../services/as200Service";
 
-import MeasurementDetails from "../../components/measurement/MeasurementDetails";
 import "./AddMeasurement.css";
 import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, stopPlcCollection } from "../../services/plcConnectionService";
 import { reconnectAs200Plc } from "../../services/as200Service";
 
 import {
   getMeasurementById,
-  getMeasurements,
+  getMeasurementHistoryPage,
   getMeasurementStatistics,
-  type BackendMeasurement,
+  type MeasurementHistoryItem,
   type MeasurementDetail,
   type MeasurementStatistics,
 } from "../../services/measurementService";
@@ -207,7 +205,13 @@ function AddMeasurement() {
   const collectionInFlight = useRef(false);
   const [retryId, setRetryId] = useState<number | null>(null);
   const [messageApi, holder] = message.useMessage();
-  const [recent, setRecent] = useState<BackendMeasurement[]>([]);
+  const [recent, setRecent] = useState<MeasurementHistoryItem[]>([]);
+  const [storedLatest, setStoredLatest] = useState<MeasurementHistoryItem>();
+  const [recentTotal, setRecentTotal] = useState(0);
+  const [recentPagination, setRecentPagination] = useState<{ sku?: string; page: number }>({ page: 1 });
+  const [recentLoading, setRecentLoading] = useState(false);
+  const [recentError, setRecentError] = useState("");
+  const [chartRecords, setChartRecords] = useState<MeasurementHistoryItem[]>([]);
   const [statistics, setStatistics] = useState<{ productCode: string; value: MeasurementStatistics }>();
   const [monitorLoading, setMonitorLoading] = useState(false);
   const [monitorError, setMonitorError] = useState("");
@@ -219,27 +223,29 @@ function AddMeasurement() {
     ? status.latest.productCode : undefined;
   const skuStatistics = databaseConnected && currentSku && statistics?.productCode === currentSku
     ? statistics.value : undefined;
+  const recentPage = recentPagination.sku === currentSku ? recentPagination.page : 1;
 
   // Refresh stored data on the existing Worker's commit signal, not a second
   // polling timer. Read-only API calls do not receive or process PLC deliveries.
   useEffect(() => {
     let active = true;
     setStatistics(undefined);
-    if (!databaseConnected) {
+    setChartRecords([]);
+    if (!databaseConnected || !currentSku) {
       setMonitorLoading(false);
-      setMonitorError("Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
+      setMonitorError(databaseConnected ? "" : "Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
       return;
     }
     setMonitorLoading(true); setMonitorError("");
     void (async () => {
       try {
-        const response = await getMeasurements({ page: 1, pageSize: 12 });
+        const [response, stats] = await Promise.all([
+          getMeasurementHistoryPage({ page: 1, pageSize: 30, productCode: currentSku }),
+          getMeasurementStatistics({ productCode: currentSku }),
+        ]);
         if (!active) return;
-        setRecent(response.items);
-        if (currentSku) {
-          const stats = await getMeasurementStatistics({ productCode: currentSku });
-          if (active) setStatistics({ productCode: currentSku, value: stats });
-        }
+        setChartRecords(response.items);
+        setStatistics({ productCode: currentSku, value: stats });
       } catch {
         if (active) setMonitorError("Không tải được dữ liệu giám sát đã lưu. Vui lòng thử làm mới.");
       } finally { if (active) setMonitorLoading(false); }
@@ -248,13 +254,33 @@ function AddMeasurement() {
   }, [databaseConnected, status?.lastSavedId, currentSku, refreshIndex]);
 
   useEffect(() => {
+    let active = true;
+    setRecent([]); setRecentTotal(0); setRecentError("");
+    if (!databaseConnected) {
+      setRecentLoading(false);
+      setRecentError("Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
+      return;
+    }
+    setRecentLoading(true);
+    void getMeasurementHistoryPage({ page: recentPage, pageSize: 6, productCode: currentSku })
+      .then(response => {
+        if (!active) return;
+        setRecent(response.items); setRecentTotal(response.total);
+        if (recentPage === 1) setStoredLatest(response.items[0]);
+      })
+      .catch(() => { if (active) setRecentError("Không tải được các gậy gần nhất. Vui lòng thử làm mới."); })
+      .finally(() => { if (active) setRecentLoading(false); });
+    return () => { active = false; };
+  }, [databaseConnected, status?.lastSavedId, currentSku, recentPage, refreshIndex]);
+
+  useEffect(() => {
     if (status?.enabled && status.connection === "CONNECTED" && !status.pauseReason) {
       setCollectionError("");
     }
   }, [status]);
 
   const latest = status?.latest;
-  const displayed = latest ?? recent[0];
+  const displayed = latest ?? storedLatest;
   const stoppedWithPendingData = status?.state === "STOPPED" && status.message.includes("dữ liệu chưa lưu");
   const safelyStopped = status?.state === "STOPPED" && !status.enabled && !stoppedWithPendingData;
   const collectionLabel = collectionAction ? collectionAction === "stop" ? "Đang dừng" : "Đang kết nối lại"
@@ -367,7 +393,7 @@ function AddMeasurement() {
     status.ackStatus !== "FAILED" && status.ackStatus !== "RECONCILIATION_REQUIRED" &&
     /Hết thời gian PostgreSQL|pool|database|inbox thất bại|Không lưu được journal|Journal lỗi/i.test(status.message) &&
     ["ERROR", "FAILED"].includes(status.state);
-  const committedId = latest ? latest.measurementId : recent[0]?.id;
+  const committedId = latest ? latest.measurementId : storedLatest?.id;
 
   const [detail, setDetail] = useState<MeasurementDetail>();
   const [detailError, setDetailError] = useState("");
@@ -422,7 +448,7 @@ function AddMeasurement() {
 
   const displayStatus = getPlcDisplayStatus(status, error);
   const activeDetail = detail && detail.id === committedId ? detail : undefined;
-  const receivedTime = latest?.receivedAt ?? recent[0]?.measuredAt;
+  const receivedTime = latest?.receivedAt ?? storedLatest?.measuredAt;
 
   return (
     <div className="monitor-page">
@@ -459,7 +485,7 @@ function AddMeasurement() {
       <Card className="section-card add-measurement-results">
         <div className="monitor-current-heading">
           <h2>Gậy vừa kiểm tra · {displayed ? `#${displayed.clubNumber}` : "Chưa có dữ liệu"}</h2>
-          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Load Butt {formatDecimal(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} g / Tip {formatDecimal(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} g</span>
+          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt {formatDecimal(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} g / Tip {formatDecimal(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} g</span>
         </div>
         <div className="add-measurement-result-grid">
           {(["BUTT", "TIP", "OVERALL"] as const).map((station) => {
@@ -478,13 +504,8 @@ function AddMeasurement() {
         </Tag></div>}
         {detailError && <Alert type="error" showIcon message={detailError} />}
         <CurrentPointTable detail={activeDetail} loading={detailLoading} />
-        <p className="monitor-caption">Điểm NG được đo lại tối đa 4 lần; hiển thị lần đo quyết định.</p>
-        {activeDetail && <Collapse className="monitor-full-detail" items={[{ key: "attempts", label: "Xem tất cả lượt đo và thông tin bản ghi", children: <>
-          <p className="monitor-caption">SKU {displayed?.productCode} · RecordSeq {displayed?.recordSeq} · TotalCount {displayed?.totalCount ?? "—"} · Phép đo #{committedId}</p>
-          <MeasurementDetails data={activeDetail} qcLabels showGeneralInformation={false} />
-        </> }]} />}
       </Card>
-      <BendComparison />
+      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError} />
       </div>
 
       {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && !duplicateStorageNotice && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
@@ -565,7 +586,8 @@ function AddMeasurement() {
         </Card>
       )}
 
-      <RecentMeasurements records={recent} detail={activeDetail} loading={monitorLoading} error={monitorError}
+      <RecentMeasurements records={recent} loading={recentLoading} error={recentError}
+        page={recentPage} total={recentTotal} onPageChange={page => setRecentPagination({ sku: currentSku, page })}
         onRefresh={() => setRefreshIndex((value) => value + 1)} />
 
     </div>

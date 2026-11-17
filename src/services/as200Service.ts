@@ -19,6 +19,14 @@ export interface As200Latest {
 }
 
 export interface As200Status {
+  readTelemetry?: { date: string; observedSince: string; readErrors: number; disconnects: number } | null;
+  controlSnapshot?: { heartbeat: number; total_count: number; data_ready: number; pc_read_count: number; pc_read_done: number } | null;
+  publishedRecordSeq?: number | null;
+  connectedAt?: string | null;
+  lastReadAt?: string | null;
+  lastReadMs?: number | null;
+  lastError?: string | null;
+  connectionEvents?: { at: string; message: string }[];
   manualRetryResults: { inboxId: number; state: "PENDING" | "WAITING" | "APPLIED" | "REJECTED"; error: string | null }[];
   blockedInboxCount: number;
   blockedInboxIds: number[];

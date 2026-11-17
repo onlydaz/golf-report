@@ -2,6 +2,173 @@ use super::*;
 use crate::plc::as200::reader::BufferSnapshot;
 
 #[tokio::test]
+async fn read_only_source_can_close_only_after_receipts_without_advancing_ack() {
+    let dir = TestDirectory::new();
+    let mut cfg = config();
+    cfg.read_only = true;
+    cfg.ack_enabled = false;
+    let engine = Engine::open(cfg, dir.0.join("capture.json"), WorkerState::default()).unwrap();
+    engine
+        .capture_published_snapshot(published_snapshot(1, 1))
+        .await
+        .unwrap();
+    let mut journal = engine.journal.lock().await.clone();
+    assert!(journal.read_only_closed().is_err());
+    journal.deliveries[0].inbox_id = Some(42);
+    journal.deliveries[0].terminal = true;
+    journal.read_only_closed().unwrap(); // DB read-back remains mandatory in verify_source_closed.
+    assert_eq!(journal.published_ack.as_ref().unwrap().accepted, 0);
+    assert!(journal.published_ack.as_ref().unwrap().intent.is_none());
+    assert!(
+        journal.closed(false).is_err(),
+        "ACK-enabled closure must still require the real ACK checkpoint"
+    );
+    journal.last_total = Some(2);
+    assert!(
+        journal.read_only_closed().is_err(),
+        "Queued/unseen records must block switching"
+    );
+    journal.last_total = Some(1);
+    journal.pause = Some("RESET".into());
+    assert!(journal.read_only_closed().is_err());
+}
+
+#[test]
+fn telemetry_uses_vietnam_day_and_preserves_disconnect_episode_across_midnight() {
+    let mut status = WorkerStatus::default();
+    assert!(status.read_telemetry.is_none());
+    let before = DateTime::parse_from_rfc3339("2026-11-16T16:59:59Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    status.observe_read(before, None);
+    status.connection = "CONNECTED".into();
+    status.observe_read(before, Some(&As200Error::Timeout));
+    status.connection = "DISCONNECTED".into();
+    status.observe_read(before, Some(&As200Error::Timeout));
+    let telemetry = status.read_telemetry.as_ref().unwrap();
+    assert_eq!((telemetry.read_errors, telemetry.disconnects), (2, 1));
+    let after = before + chrono::Duration::seconds(2);
+    status.observe_read(after, Some(&As200Error::Timeout));
+    let telemetry = status.read_telemetry.as_ref().unwrap();
+    assert_eq!(telemetry.date.to_string(), "2026-11-17");
+    assert_eq!((telemetry.read_errors, telemetry.disconnects), (1, 0));
+    assert_eq!(
+        telemetry.observed_since,
+        after - chrono::Duration::seconds(1)
+    );
+    status.observe_read(after, None);
+    status.connection = "CONNECTED".into();
+    status.observe_read(after, Some(&As200Error::Protocol("FC03 exception".into())));
+    status.observe_read(after, Some(&As200Error::Unstable));
+    assert_eq!(status.read_telemetry.as_ref().unwrap().disconnects, 0);
+    assert_eq!(status.read_telemetry.as_ref().unwrap().read_errors, 2);
+    status.observe_read(after, Some(&As200Error::Timeout));
+    assert_eq!(status.read_telemetry.as_ref().unwrap().disconnects, 1);
+}
+
+#[tokio::test]
+async fn telemetry_loopback_idle_loss_retry_recovery_and_operator_stop() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let dir = TestDirectory::new();
+    let mut cfg = config();
+    cfg.address = address.to_string();
+    let state = WorkerState::default();
+    let engine = Engine::open(cfg, dir.0.join("capture.json"), state.clone()).unwrap();
+    // Only two FC03 control reads. No record read and no write command.
+    async fn idle(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        for _ in 0..2 {
+            let mut request = [0; 12];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[7], 3);
+            assert_eq!(u16::from_be_bytes([request[8], request[9]]), 25000);
+            assert_eq!(u16::from_be_bytes([request[10], request[11]]), 20);
+            let mut response = request[..7].to_vec();
+            response[4..6].copy_from_slice(&43_u16.to_be_bytes());
+            response.extend([3, 40]);
+            for word in [1_u16, 240, 2]
+                .into_iter()
+                .chain(std::iter::repeat_n(0, 17))
+            {
+                response.extend(word.to_be_bytes());
+            }
+            socket.write_all(&response).await.unwrap();
+        }
+    }
+    let server = tokio::spawn(idle(listener));
+    engine.read_snapshot().await.unwrap();
+    server.await.unwrap();
+    {
+        let status = state.status.read().await;
+        assert_eq!(status.control_snapshot.as_ref().unwrap().total_count, 0);
+        assert_eq!(status.published_record_seq, None); // Never substitute TotalCount for unread RecordSeq.
+        let telemetry = status.read_telemetry.as_ref().unwrap();
+        assert_eq!((telemetry.read_errors, telemetry.disconnects), (0, 0));
+    }
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 12];
+        socket.read_exact(&mut request).await.unwrap();
+        socket
+            .write_all(&[request[0], request[1], 0, 0, 0, 3, 1, 0x83, 2])
+            .await
+            .unwrap();
+    });
+    assert!(engine.read_snapshot().await.is_err());
+    server.await.unwrap();
+    assert_eq!(state.status.read().await.connection, "CONNECTED");
+    assert_eq!(
+        state
+            .status
+            .read()
+            .await
+            .read_telemetry
+            .as_ref()
+            .unwrap()
+            .disconnects,
+        0
+    );
+    for _ in 0..2 {
+        assert!(engine.read_snapshot().await.is_err());
+    }
+    assert_eq!(
+        state
+            .status
+            .read()
+            .await
+            .read_telemetry
+            .as_ref()
+            .unwrap()
+            .disconnects,
+        1
+    );
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let server = tokio::spawn(idle(listener));
+    engine.read_snapshot().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        state
+            .status
+            .read()
+            .await
+            .read_telemetry
+            .as_ref()
+            .unwrap()
+            .disconnects,
+        1
+    );
+    state.stopping.store(true, Ordering::SeqCst);
+    assert!(engine.read_snapshot().await.is_err());
+    let status = state.status.read().await;
+    let telemetry = status.read_telemetry.as_ref().unwrap();
+    assert_eq!((telemetry.read_errors, telemetry.disconnects), (3, 1));
+}
+
+#[tokio::test]
 async fn stop_waits_for_the_collection_task_and_keeps_the_operator_marker() {
     let dir = TestDirectory::new();
     let file = dir.0.join("as200_config.toml");
@@ -1110,4 +1277,82 @@ async fn postgres_prompt13_retry_fairness_backoff_manual_and_restart() {
     println!(
         "PASS SQL retry source={source}: FAILED=60 PROCESSED=4 measurement=4; new rows progress, backoff/restart/manual retry verified; no ACK write invoked"
     );
+}
+
+#[tokio::test]
+async fn runtime_layout_binding_and_read_only_never_bypass_pending_ack() {
+    let dir = TestDirectory::new();
+    let cfg = config();
+    let baseline = Engine::published_binding(&cfg);
+    let mut changed = cfg.clone();
+    changed.control_start = 26000;
+    assert_ne!(Engine::published_binding(&changed), baseline);
+    assert!(
+        Engine::open(
+            changed.clone(),
+            dir.0.join("unapproved.json"),
+            WorkerState::default()
+        )
+        .is_err()
+    );
+    changed.read_only = true;
+    changed.ack_enabled = false;
+    let reader = Engine::open(
+        changed,
+        dir.0.join("read-only.json"),
+        WorkerState::default(),
+    )
+    .unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:1/not_used")
+        .unwrap();
+    // This boundary rejects a write before any database or socket operation.
+    assert!(
+        reader
+            .published_ack_step(published_snapshot(1, 1), &pool)
+            .await
+            .is_err()
+    );
+    reader
+        .capture_published_snapshot(published_snapshot(1, 1))
+        .await
+        .unwrap();
+    assert!(!reader.journal.lock().await.pending_ack());
+    let mut pending = reader.journal.lock().await.clone();
+    let progress = pending.published_ack.as_mut().unwrap();
+    progress.intent = Some(PublishedAckIntent {
+        target: 1,
+        inbox_id: 123,
+        raw_registers: pending.deliveries[0].input.raw_registers.clone(),
+        phase: PublishedAckPhase::DoneWriteUncertain,
+        observed_done_high: false,
+    });
+    pending.deliveries[0].inbox_id = Some(123);
+    reader.persist(&pending).unwrap();
+    let path = reader.path.clone();
+    let cfg = reader.config.clone();
+    drop(reader);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(Engine::open(cfg, path.clone(), WorkerState::default()).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn disabled_auto_reconnect_waits_without_reading_or_losing_the_worker() {
+    let dir = TestDirectory::new();
+    let mut cfg = config();
+    cfg.auto_reconnect = false;
+    let state = WorkerState::default();
+    state.status.write().await.connection = "DISCONNECTED".into();
+    let engine = Engine::open(cfg, dir.0.join("capture.json"), state.clone()).unwrap();
+    let handle = tokio::spawn(engine.collection_loop(DatabaseState::default()));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!handle.is_finished());
+    assert_eq!(state.status.read().await.state, "DISABLED"); // No DB/PLC iteration attempted.
+    state.stopping.store(true, Ordering::SeqCst);
+    state.reconnect_now.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
 }

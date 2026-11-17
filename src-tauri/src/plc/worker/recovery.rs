@@ -63,6 +63,38 @@ impl Engine {
 }
 
 impl Journal {
+    /// Read-only collection never advances the ACK checkpoint. Closing it needs
+    /// saved receipts for every observed record, not a fabricated PLC ACK.
+    pub(super) fn read_only_closed(&self) -> Result<(), String> {
+        let progress = self
+            .published_ack
+            .as_ref()
+            .ok_or("Thiếu ACK progress v4.")?;
+        let highest = self
+            .deliveries
+            .iter()
+            .map(|d| d.input.record_seq)
+            .max()
+            .unwrap_or(progress.accepted);
+        if self.pending_ack()
+            || self.pause.is_some()
+            || !self.quarantine.is_empty()
+            || !self.retries.is_empty()
+            || self
+                .manual_retries
+                .iter()
+                .any(|r| matches!(r.state.as_str(), "PENDING" | "WAITING"))
+            || self.last_total != Some(highest)
+            || self
+                .deliveries
+                .iter()
+                .any(|d| !d.terminal || d.inbox_id.is_none())
+        {
+            return Err("Nguồn chỉ đọc còn bản ghi chưa lưu đủ hoặc ACK/cảnh báo cần đối chiếu; chưa thể chuyển nguồn.".into());
+        }
+        Ok(())
+    }
+
     // Only an already closed epoch may isolate its reset diagnostic when switching.
     // The reset stays in this journal and must be confirmed on return to this source.
     fn closed_reset(&self) -> bool {
@@ -131,8 +163,26 @@ impl WorkerState {
         lock.try_lock()
             .map_err(|_| "Journal vẫn đang được Worker khác sử dụng.".to_string())?;
         let journal = Journal::load(&path, config)?;
-        journal.closed(for_reset)?;
+        if config.read_only {
+            journal.read_only_closed()?;
+        } else {
+            journal.closed(for_reset)?;
+        }
         verify_history(config, &journal, pool).await?;
+        if config.read_only {
+            for delivery in &journal.deliveries {
+                processed_receipt(config, delivery, pool).await?;
+            }
+            let prefix: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id JOIN measurements m ON m.id=i.measurement_id AND m.source_id=i.source_id AND m.session_id=i.session_id AND m.record_seq=i.record_seq WHERE s.source_key=$1 AND i.session_id=$2 AND i.record_seq BETWEEN 1 AND $3 AND i.processing_status='PROCESSED' AND i.processed_at IS NOT NULL")
+                .bind(&config.source_key).bind(&journal.session_id).bind(journal.last_total)
+                .fetch_one(pool).await.map_err(|_| "Không thể đối chiếu receipt nguồn chỉ đọc.".to_string())?;
+            if prefix != i64::from(journal.last_total.unwrap_or(0)) {
+                return Err(
+                    "Nguồn chỉ đọc thiếu receipt PROCESSED liên tiếp; chưa thể chuyển nguồn."
+                        .into(),
+                );
+            }
+        }
         let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND (i.processing_status <> 'PROCESSED' OR i.measurement_id IS NULL OR i.processed_at IS NULL)")
             .bind(&config.source_key).fetch_one(pool).await.map_err(|e| e.to_string())?;
         if pending != 0 {

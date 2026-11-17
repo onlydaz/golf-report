@@ -14,7 +14,7 @@ use crate::{
     repositories::{InboxRepository, SourceRepository},
     services::InboxService,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{
@@ -89,7 +89,32 @@ pub struct LatestRecord {
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConnectionEvent {
+    pub at: DateTime<Utc>,
+    pub message: String,
+}
+
+/// In-memory observations only; never restored from a journal or inferred from UI polling.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadTelemetry {
+    pub date: NaiveDate,
+    pub observed_since: DateTime<Utc>,
+    pub read_errors: u64,
+    pub disconnects: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerStatus {
+    pub read_telemetry: Option<ReadTelemetry>,
+    pub control_snapshot: Option<as200::model::PlcControl>,
+    pub published_record_seq: Option<i32>,
+    pub connected_at: Option<DateTime<Utc>>,
+    pub last_read_at: Option<DateTime<Utc>>,
+    pub last_read_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub connection_events: Vec<ConnectionEvent>,
     pub manual_retry_results: Vec<ManualRetryRequest>,
     pub retry_diagnostics: Vec<String>,
     pub blocked_inbox_ids: Vec<i64>,
@@ -115,6 +140,14 @@ pub struct WorkerStatus {
 impl Default for WorkerStatus {
     fn default() -> Self {
         Self {
+            read_telemetry: None,
+            control_snapshot: None,
+            published_record_seq: None,
+            connected_at: None,
+            last_read_at: None,
+            last_read_ms: None,
+            last_error: None,
+            connection_events: Vec::new(),
             manual_retry_results: Vec::new(),
             blocked_inbox_ids: Vec::new(),
             retry_diagnostics: Vec::new(),
@@ -140,6 +173,52 @@ impl Default for WorkerStatus {
         }
     }
 }
+impl WorkerStatus {
+    fn telemetry_day(now: DateTime<Utc>) -> NaiveDate {
+        now.with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap())
+            .date_naive()
+    }
+
+    fn rotate_telemetry(&mut self, now: DateTime<Utc>) {
+        if let Some(telemetry) = &mut self.read_telemetry {
+            let date = Self::telemetry_day(now);
+            if telemetry.date != date {
+                let midnight = date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(FixedOffset::east_opt(7 * 3600).unwrap())
+                    .single()
+                    .unwrap()
+                    .with_timezone(&Utc);
+                *telemetry = ReadTelemetry {
+                    date,
+                    observed_since: midnight,
+                    read_errors: 0,
+                    disconnects: 0,
+                };
+            }
+        }
+    }
+
+    fn observe_read(&mut self, now: DateTime<Utc>, error: Option<&As200Error>) {
+        self.rotate_telemetry(now);
+        let telemetry = self.read_telemetry.get_or_insert_with(|| ReadTelemetry {
+            date: Self::telemetry_day(now),
+            observed_since: now,
+            read_errors: 0,
+            disconnects: 0,
+        });
+        // An unstable snapshot is an expected concurrent PLC update, not a failed read.
+        if error.is_some_and(|e| !matches!(e, As200Error::Unstable)) {
+            telemetry.read_errors = telemetry.read_errors.saturating_add(1);
+        }
+        if error.is_some_and(|e| matches!(e, As200Error::Transport(_) | As200Error::Timeout))
+            && self.connection == "CONNECTED"
+        {
+            telemetry.disconnects = telemetry.disconnects.saturating_add(1);
+        }
+    }
+}
 #[derive(Clone, Default)]
 pub struct WorkerState {
     stopping: Arc<AtomicBool>,
@@ -158,6 +237,15 @@ pub struct WorkerState {
     reconnect_waiters: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
 }
 impl WorkerState {
+    pub(super) async fn applied_config(&self) -> Option<SimulatorConfig> {
+        self.engine
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|e| e.upgrade())
+            .map(|e| e.config.clone())
+    }
+
     // Caller holds settings_gate through the manual operation, preventing a
     // concurrent collection start. Do not infer safety from enabled alone.
     pub(super) async fn ensure_register_writes_stopped(&self) -> Result<(), String> {
@@ -331,10 +419,25 @@ impl Engine {
             "ERROR"
         }
         .into();
+        status.last_error = Some(message.clone());
+        if status
+            .connection_events
+            .last()
+            .is_none_or(|e| e.message != message)
+        {
+            status.connection_events.push(ConnectionEvent {
+                at: Utc::now(),
+                message: message.clone(),
+            });
+            if status.connection_events.len() > 60 {
+                status.connection_events.remove(0);
+            }
+        }
         status.message = message;
     }
 
     async fn read_snapshot(&self) -> Result<PublishedRecordSnapshot, String> {
+        let started = std::time::Instant::now();
         match As200Reader::new(self.config.reader())
             .poll_published_record()
             .await
@@ -353,15 +456,47 @@ impl Engine {
                     })
                     .observe(snapshot.control.heartbeat, std::time::Instant::now());
                 let mut status = self.state.status.write().await;
+                if !self.state.stopping.load(Ordering::SeqCst) {
+                    let diagnostic = (!snapshot.diagnostics.is_empty()).then(|| {
+                        As200Error::InvalidData("Snapshot có chẩn đoán bản ghi không hợp lệ".into())
+                    });
+                    status.observe_read(Utc::now(), diagnostic.as_ref());
+                }
+                if status.connection != "CONNECTED" {
+                    status.connected_at = Some(Utc::now());
+                    status.connection_events.push(ConnectionEvent {
+                        at: Utc::now(),
+                        message: format!(
+                            "PLC {} · Unit {}: đã đọc snapshot ổn định",
+                            self.config.address, self.config.unit_id
+                        ),
+                    });
+                    if status.connection_events.len() > 60 {
+                        status.connection_events.remove(0);
+                    }
+                }
+                status.control_snapshot = Some(snapshot.control.clone());
+                status.published_record_seq = snapshot
+                    .buffer
+                    .as_ref()
+                    .and_then(|b| b.record.as_ref())
+                    .map(|r| r.record_seq);
+                status.last_read_at = Some(Utc::now());
+                status.last_read_ms = Some(started.elapsed().as_millis() as u64);
                 status.connection = "CONNECTED".into();
                 status.plc_health = health.into();
                 Ok(snapshot)
             }
             Err(error) => {
+                let mut status = self.state.status.write().await;
+                if !self.state.stopping.load(Ordering::SeqCst) {
+                    status.observe_read(Utc::now(), Some(&error));
+                }
                 if matches!(error, As200Error::Transport(_) | As200Error::Timeout) {
-                    let mut status = self.state.status.write().await;
                     status.connection = "DISCONNECTED".into();
                     status.plc_health = "DISCONNECTED".into();
+                } else if matches!(error, As200Error::InvalidData(_) | As200Error::Protocol(_)) {
+                    status.plc_health = "INVALID_DATA".into();
                 }
                 Err(error.to_string())
             }
@@ -377,6 +512,12 @@ impl Engine {
                 return Err(format!("Journal v4 đang dừng bảo vệ dữ liệu: {pause}."));
             }
             let snapshot = self.read_snapshot().await?;
+            if self.config.read_only {
+                self.capture_published_snapshot(snapshot).await?;
+                self.flush(pool).await?;
+                self.state.status.write().await.ack_status = "DISABLED";
+                return Ok(());
+            }
             self.published_ack_step(snapshot, pool).await?;
             let mut journal = self.journal.lock().await;
             let progress = journal
@@ -427,7 +568,11 @@ impl Engine {
                 return Err(format!("{error}; {persist_error}"));
             }
             drop(journal);
-            self.state.status.write().await.ack_status = "RECONCILIATION_REQUIRED";
+            self.state.status.write().await.ack_status = if self.config.read_only {
+                "DISABLED"
+            } else {
+                "RECONCILIATION_REQUIRED"
+            };
             self.error(error.clone()).await;
         }
         result
@@ -439,7 +584,17 @@ impl Engine {
                 break;
             }
             let waiters = std::mem::take(&mut *self.state.reconnect_waiters.lock().await);
-            let result = tokio::time::timeout(Duration::from_secs(8), async {
+            if !self.config.auto_reconnect
+                && waiters.is_empty()
+                && self.state.status.read().await.connection == "DISCONNECTED"
+            {
+                tokio::select! {
+                    _ = self.state.reconnect_now.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+                }
+                continue;
+            }
+            let result = tokio::time::timeout(Duration::from_millis(self.config.timeout_ms.saturating_mul(12).saturating_add(8000)), async {
                 let pool = database.pool().await?;
                 self.poll_and_ack_published(&pool).await
             }).await.unwrap_or_else(|_| Err("Hết thời gian đọc/lưu; giữ receipt và ACK intent để phục hồi, không phát lại lệnh chưa rõ kết quả.".into()));
@@ -542,7 +697,13 @@ impl WorkerState {
             config.0.mode, config.0.address, config.0.unit_id, config.0.ack_enabled
         );
         {
+            *self.heartbeat.lock().unwrap() = None;
             let mut status = self.status.write().await;
+            status.control_snapshot = None;
+            status.published_record_seq = None;
+            status.connected_at = None;
+            status.last_read_at = None;
+            status.last_read_ms = None;
             status.enabled = true;
             status.address = config.0.address.clone();
             status.unit_id = config.0.unit_id;
@@ -616,7 +777,9 @@ pub async fn get_as200_worker_status(
     state: tauri::State<'_, WorkerState>,
 ) -> Result<WorkerStatus, String> {
     state.fresh_health().await;
-    Ok(state.status.read().await.clone())
+    let mut status = state.status.write().await;
+    status.rotate_telemetry(Utc::now());
+    Ok(status.clone())
 }
 
 #[tauri::command]

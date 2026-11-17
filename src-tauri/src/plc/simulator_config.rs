@@ -19,6 +19,11 @@ pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
         && config.word_order == StoredWordOrder::Low
         && config.modbus_address_offset == 0
         && !config.pc_heartbeat_enabled
+        && !config.read_only
+        && config.control_start == super::as200::map::CONTROL_BASE
+        && config.layout_profile == "as200-published-v1"
+        && config.buffer_count == super::as200::map::BUFFER_COUNT
+        && config.record_size == super::as200::map::RECORD_SIZE
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +41,12 @@ pub struct SessionTransition {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SimulatorConfig {
+    pub layout_profile: String,
+    pub control_start: u16,
+    pub buffer_count: usize,
+    pub record_size: usize,
+    pub auto_reconnect: bool,
+    pub read_only: bool,
     pub technical_setup_confirmed: bool,
     pub plc_heartbeat_timeout_ms: Option<u64>,
     pub pc_heartbeat_enabled: bool,
@@ -63,6 +74,12 @@ pub struct SimulatorConfig {
 impl Default for SimulatorConfig {
     fn default() -> Self {
         Self {
+            layout_profile: "as200-published-v1".into(),
+            control_start: super::as200::map::CONTROL_BASE,
+            buffer_count: super::as200::map::BUFFER_COUNT,
+            record_size: super::as200::map::RECORD_SIZE,
+            auto_reconnect: true,
+            read_only: false,
             technical_setup_confirmed: false,
             plc_heartbeat_timeout_ms: None,
             pc_heartbeat_enabled: false,
@@ -108,6 +125,7 @@ impl SimulatorConfig {
 
     /// Transport/read-only checks do not grant collection or write capabilities.
     pub fn validate_read(&self) -> Result<(), String> {
+        self.validate_layout()?;
         let address: std::net::SocketAddr = self
             .address
             .parse()
@@ -116,15 +134,51 @@ impl SimulatorConfig {
             || !(1..=247).contains(&self.unit_id)
             || !(100..=30000).contains(&self.timeout_ms)
             || !matches!(self.mode.as_str(), "simulator" | "plc" | "modbus")
-            || super::as200::map::modbus_address(25000, self.modbus_address_offset).is_none()
-            || super::as200::map::modbus_address(25499, self.modbus_address_offset).is_none()
+            || super::as200::map::modbus_address(self.control_start, self.modbus_address_offset)
+                .is_none()
+            || super::as200::map::modbus_address(self.memory_end()?, self.modbus_address_offset)
+                .is_none()
         {
             return Err("Thông số kết nối đọc không hợp lệ".into());
         }
         Ok(())
     }
+    pub fn memory_end(&self) -> Result<u16, String> {
+        let length = self
+            .record_size
+            .checked_mul(self.buffer_count)
+            .and_then(|v| v.checked_add(super::as200::map::CONTROL_SIZE))
+            .ok_or("Dung lượng vùng nhớ PLC vượt phạm vi")?;
+        u16::try_from(
+            usize::from(self.control_start)
+                .checked_add(length.saturating_sub(1))
+                .ok_or("Vùng nhớ PLC vượt phạm vi")?,
+        )
+        .map_err(|_| "Vùng nhớ PLC vượt D65535".into())
+    }
+    pub fn validate_layout(&self) -> Result<(), String> {
+        if self.layout_profile != "as200-published-v1" {
+            return Err(
+                "Layout PLC chưa được hỗ trợ; chỉ có profile AS200 Published v1 đã xác minh."
+                    .into(),
+            );
+        }
+        if self.buffer_count != super::as200::map::BUFFER_COUNT {
+            return Err("Profile AS200 Published v1 chỉ xác minh 2 buffer do PLC quản lý; chưa hỗ trợ số buffer khác.".into());
+        }
+        if self.record_size != super::as200::map::RECORD_SIZE {
+            return Err("Profile AS200 Published v1 chỉ xác minh 240 WORD; 256/300 WORD cần Register Map và quy tắc lưu raw tương ứng.".into());
+        }
+        self.memory_end()?;
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
         self.validate_read()?;
+        if self.read_only
+            && (self.ack_enabled || self.pc_heartbeat_enabled || self.allow_plc_heartbeat_write)
+        {
+            return Err("Chế độ chỉ đọc không cho phép ACK hoặc ghi heartbeat.".into());
+        }
         if self.mode == "modbus" && !self.technical_setup_confirmed {
             return Err("Chưa xác nhận thiết lập kỹ thuật; chưa cho phép thu dữ liệu".into());
         }
@@ -203,6 +257,9 @@ impl SimulatorConfig {
     }
     pub fn reader(&self) -> As200Config {
         As200Config {
+            control_start: self.control_start,
+            record_size: self.record_size,
+            buffer_count: self.buffer_count,
             address: self.address.clone(),
             unit_id: self.unit_id,
             modbus_address_offset: self.modbus_address_offset,
@@ -391,5 +448,60 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.allow_plc_connection = false;
         assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+    #[test]
+    fn profile_defaults_translation_bounds_and_write_scope() {
+        let mut c = SimulatorConfig {
+            source_key: "fixture".into(),
+            mode: "modbus".into(),
+            technical_setup_confirmed: true,
+            ack_protocol: Some("as200".into()),
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+        assert_eq!(c.memory_end().unwrap(), 25499);
+        c.control_start = 26000;
+        assert_eq!(c.memory_end().unwrap(), 26499);
+        assert_eq!(c.reader().control_start, 26000);
+        assert!(!ack_scope_allows(&c));
+        c.modbus_address_offset = -1;
+        c.word_order = StoredWordOrder::High;
+        assert!(c.validate_read().is_ok());
+        assert_eq!(c.reader().word_order, WordOrder::HighWordFirst);
+        assert_eq!(c.reader().modbus_address_offset, -1);
+        for (count, size) in [
+            (1, 240),
+            (3, 240),
+            (2, 256),
+            (2, 300),
+            (usize::MAX, usize::MAX),
+        ] {
+            c.buffer_count = count;
+            c.record_size = size;
+            assert!(c.validate_layout().is_err());
+        }
+        c.buffer_count = 2;
+        c.record_size = 240;
+        c.control_start = 65036;
+        c.modbus_address_offset = 0;
+        assert!(c.validate_read().is_ok());
+        c.control_start += 1;
+        assert!(c.validate_read().is_err());
+        c.control_start = 0;
+        c.modbus_address_offset = -1;
+        assert!(c.validate_read().is_err());
+        c.control_start = 25000;
+        c.modbus_address_offset = 0;
+        c.word_order = StoredWordOrder::Low;
+        assert!(ack_scope_allows(&c));
+        c.read_only = true;
+        c.ack_enabled = true;
+        assert!(c.validate().is_err());
+        assert!(!ack_scope_allows(&c));
     }
 }

@@ -1,7 +1,5 @@
 //! Công cụ chỉ đọc AS200, không chạy Tauri, PostgreSQL hay ACK.
-use golf_report_lib::as200::{
-    As200Config, WordOrder, model::PlcStickRecord, reader::As200Reader,
-};
+use golf_report_lib::as200::{As200Config, WordOrder, model::PlcStickRecord, reader::As200Reader};
 use std::time::Duration;
 
 fn record_output(record: &PlcStickRecord, raw: bool) {
@@ -52,6 +50,9 @@ fn record_output(record: &PlcStickRecord, raw: bool) {
 
 async fn run() -> Result<(), String> {
     let mut config = As200Config {
+        control_start: 25000,
+        record_size: 240,
+        buffer_count: 2,
         // Mặc định chỉ dành cho simulator; không khẳng định thông số của PLC thật.
         address: "127.0.0.1:1503".into(),
         unit_id: 1,

@@ -87,6 +87,12 @@ impl Engine {
         snapshot: PublishedRecordSnapshot,
         pool: &PgPool,
     ) -> Result<(), String> {
+        if self.config.read_only
+            || !self.config.ack_enabled
+            || !simulator_config::ack_scope_allows(&self.config)
+        {
+            return Err("ACK bị khóa: cấu hình chỉ đọc hoặc chưa được xác minh.".into());
+        }
         let saved = self.journal.lock().await.clone();
         saved.validate(&self.config)?;
         if saved.pause.is_some() {
