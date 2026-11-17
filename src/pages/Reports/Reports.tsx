@@ -7,7 +7,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { useEffect, useRef, useState } from "react";
 import {
-  Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Bar, BarChart, Brush, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import { useNavigate } from "react-router-dom";
 import PageHeader from "../../components/PageHeader";
@@ -16,11 +16,11 @@ import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import {
   getMeasurementStatistics, getMeasurementQualityStatistics, getMeasurementReport, getMeasurements, getMeasurementSkus,
   type BackendMeasurement, type MeasurementListRequest, type MeasurementStatistics,
-  type MeasurementQualityStatistics, type PointQualityStatistics, type PointSummaryStatistics,
+  type MeasurementQualityStatistics, type PointSummaryStatistics,
 } from "../../services/measurementService";
 import { createCsvBytes, createExcelBytes } from "../../utils/as200Export";
-import { buildReportTables, formatDecimal } from "../../utils/as200Report";
-import { formatReportTime, reportDateBoundary, vietnamNow } from "../../utils/reportTime";
+import { buildReportTables, formatDecimal, isBusinessPoint } from "../../utils/as200Report";
+import { formatReportTime, reportDateBoundary, REPORT_TIME_ZONE, vietnamNow } from "../../utils/reportTime";
 import "./Reports.css";
 
 type ResultFilter = "OK" | "NG" | "UNMEASURED" | undefined;
@@ -28,7 +28,6 @@ type Period = "today" | "week" | "custom";
 const defaultRange = (): [Dayjs, Dayjs] => [vietnamNow().subtract(6, "day"), vietnamNow()];
 const numeric = (value: string | null) => value == null || !Number.isFinite(Number(value))
   ? "—" : Number(value).toLocaleString("vi-VN", { maximumSignificantDigits: 9 });
-const pointLabel = (point: PointQualityStatistics) => `${point.productCode} · ${point.station} P${point.pointNumber} · ${formatDecimal(point.position)} mm`;
 
 function Reports() {
   const navigate = useNavigate();
@@ -144,12 +143,9 @@ function Reports() {
     finally { setExporting(false); }
   };
 
-  const points = quality?.points ?? [];
-  const topNg = [...points].filter(point => point.ng > 0).sort((a, b) => b.ng - a.ng).slice(0, 12)
-    .map(point => ({ ...point, label: pointLabel(point),
-      rate: stats?.totalMeasurements ? 100 * point.ng / stats.totalMeasurements : null }));
+  const points = (quality?.points ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber));
   // Each measurement belongs to one SKU/position at a given station/point.
-  // Combine those groups for this card; keep the chart's detailed groups unchanged.
+  // Combine SKU/position groups by station/point; each record contributes once per point.
   const ngByPoint = new Map<string, { station: string; pointNumber: number; ng: number }>();
   for (const point of points) {
     const key = `${point.station}-${point.pointNumber}`;
@@ -159,24 +155,55 @@ function Reports() {
   }
   const mostNg = stats?.totalNg ? [...ngByPoint.values()].filter(point => point.ng > 0).sort((a, b) => b.ng - a.ng)[0] : undefined;
   const daily = stats?.daily.map(item => ({ ...item, rate: item.total ? 100 * item.ok / item.total : null })) ?? [];
-  const spanDays = query.filters.measuredFrom && query.filters.measuredTo
-    ? dayjs(query.filters.measuredTo).diff(dayjs(query.filters.measuredFrom), "day") : daily.length;
-  const timeUnit = spanDays > 180 ? "month" : spanDays > 60 ? "week" : "day";
-  // Only daily aggregates come to the UI; large date ranges are combined for legibility.
-  const grouped = new Map<string, { date: string; ok: number; ng: number }>();
-  for (const item of daily) {
-    const key = dayjs(item.date).startOf(timeUnit).format("YYYY-MM-DD");
-    const entry = grouped.get(key) ?? { date: key, ok: 0, ng: 0 };
-    entry.ok += item.ok; entry.ng += item.ng; grouped.set(key, entry);
-  }
-  const histogram = quality?.buttHistogram?.map((bin, index) => ({ ...bin,
+  const halfHour = (() => {
+    if (!quality?.halfHour) return [];
+    const step = 30 * 60 * 1000;
+    const values = new Map(quality.halfHour.map(item => [Date.parse(item.at), item]));
+    const first = quality.halfHour[0]?.at;
+    const last = quality.halfHour[quality.halfHour.length - 1]?.at;
+    const start = Math.floor(Date.parse(query.filters.measuredFrom ?? first ?? "") / step) * step;
+    const end = query.filters.measuredTo ? Date.parse(query.filters.measuredTo) : last ? Date.parse(last) + step : NaN;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+    return Array.from({ length: Math.ceil((end - start) / step) }, (_, index) => {
+      const at = start + index * step;
+      const value = values.get(at);
+      return { at: new Date(at).toISOString(), ok: value?.ok ?? 0, ng: value?.ng ?? 0 };
+    });
+  })();
+  const topNg = quality && stats ? ([
+    ["BUTT", 1, 150], ["BUTT", 2, 300], ["BUTT", 3, 450], ["BUTT", 4, 600], ["TIP", 1, 80],
+  ] as const).map(([station, pointNumber, demoPosition]) => {
+    const samples = points.filter(point => point.station === station && point.pointNumber === pointNumber);
+    const ng = samples.reduce((sum, point) => sum + point.ng, 0);
+    const positions = [...new Set(samples.flatMap(point => point.position == null ? [] : [point.position]))]
+      .sort((a, b) => Number(a) - Number(b));
+    const position = positions.length ? positions.map(formatDecimal).join(" · ") : quality.demoLimits ? String(demoPosition) : "—";
+    const rate = stats.totalMeasurements ? 100 * ng / stats.totalMeasurements : 0;
+    return { station, pointNumber, ng, rate, position, positionLabel: positions.length > 1 ? `${positions.length} vị trí` : `${position} mm`,
+      label: `${station} · P${pointNumber}`, annotation: `${ng} (${rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%)` };
+  }).sort((a, b) => b.ng - a.ng) : [];
+  const demoLimits = quality?.demoLimits;
+  const demoCpk = (() => {
+    const summary = quality?.buttSummary;
+    if (!demoLimits || !summary || summary.count < 2 || summary.mean == null || summary.stddev == null) return null;
+    const lower = Number(demoLimits.lower), upper = Number(demoLimits.upper);
+    const mean = Number(summary.mean), deviation = Number(summary.stddev);
+    if (![lower, upper, mean, deviation].every(Number.isFinite) || upper <= lower || deviation <= 0) return null;
+    return Math.min((upper - mean) / (3 * deviation), (mean - lower) / (3 * deviation));
+  })();
+  const histogram = demoLimits ? (quality?.demoHistogram ?? []).map(bin => ({ ...bin, midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
+    label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
+    bounds: `${bin.lowerInclusive ? "[" : "("}${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${bin.upperInclusive ? "]" : ")"} mm`,
+  })) : quality?.buttHistogram?.map((bin, index) => ({ ...bin, zone: "UNKNOWN", midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
     label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
     bounds: `[${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${index === quality.buttHistogram.length - 1 ? "]" : ")"} mm`,
   })) ?? [];
   const cards = [
-    ["Tổng số gậy", stats?.totalMeasurements, "blue"], ["Tổng OK", stats?.totalOk, "green"],
-    ["Tổng NG", stats?.totalNg, "red"], ["Tỷ lệ OK", stats ? `${stats.passRate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%` : undefined, "green"],
-    ["NG Butt", stats?.buttNg, "red"], ["NG Tip", stats?.tipNg, "red"],
+    ["Tổng số gậy", stats?.totalMeasurements, "blue", undefined],
+    ["Tổng OK", stats?.totalOk, "green", stats
+      ? `Tỷ lệ OK ${stats.passRate.toLocaleString("vi-VN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%` : "Tỷ lệ OK —"],
+    ["Tổng NG", stats?.totalNg, "red", stats
+      ? `Tỷ lệ NG ${(stats.totalMeasurements ? 100 * stats.totalNg / stats.totalMeasurements : 0).toLocaleString("vi-VN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%` : "Tỷ lệ NG —"],
   ] as const;
   const pointColumns: ColumnsType<PointSummaryStatistics> = [
     { title: "Điểm đo", width: 165, render: (_, point) => `${point.station} · P${point.pointNumber} (${formatDecimal(point.position)} mm)` },
@@ -244,45 +271,53 @@ function Reports() {
       </div>
     </Card>
     {error && <Alert type="error" showIcon title={error} />}
-    <div className="report-stat-grid">{cards.map(([label, value, tone]) => <Card key={label} className={`report-stat report-stat-${tone}`}>
+    <div className="report-stat-grid">{cards.map(([label, value, tone, subtitle]) => <Card key={label} className={`report-stat report-stat-${tone}`}>
       <span>{label}</span><strong>{loading ? <Spin size="small" /> : typeof value === "number" ? value.toLocaleString("vi-VN") : value ?? "—"}</strong>
-    </Card>)}</div>
-    {quality && stats && <div className="reports-extra-stats">
-      <Card><span>NG nhiều nhất tại</span>
-        <strong>{mostNg ? `${mostNg.station} · P${mostNg.pointNumber}` : "Chưa có"}</strong>
-        <small>{mostNg?.ng.toLocaleString("vi-VN") ?? "0"} gậy · {mostNg && stats.totalNg ? (100 * mostNg.ng / stats.totalNg).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng NG</small>
+      {subtitle && <small>{subtitle}</small>}
+    </Card>)}
+      <Card className="report-stat"><span>NG nhiều nhất tại</span>
+        <strong>{loading ? <Spin size="small" /> : quality && stats ? mostNg ? `${mostNg.station} · P${mostNg.pointNumber}` : "Chưa có" : "—"}</strong>
+        <small>{quality && stats ? <>{mostNg?.ng.toLocaleString("vi-VN") ?? "0"} gậy · {mostNg && stats.totalNg ? (100 * mostNg.ng / stats.totalNg).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng NG</> : "—"}</small>
       </Card>
-      <Card><span>Gậy phải đo lại (≥ 2 lần)</span>
-        <strong>{stats.totalMeasurements ? quality.retestedClubs.toLocaleString("vi-VN") : "0"}</strong>
-        <small>{stats.totalMeasurements ? (100 * quality.retestedClubs / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng gậy</small>
+      <Card className="report-stat"><span>Gậy phải đo lại (≥ 2 lần)</span>
+        <strong>{loading ? <Spin size="small" /> : quality && stats ? stats.totalMeasurements ? quality.retestedClubs.toLocaleString("vi-VN") : "0" : "—"}</strong>
+        <small>{quality && stats ? <>{stats.totalMeasurements ? (100 * quality.retestedClubs / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng gậy</> : "—"}</small>
       </Card>
-    </div>}
+    </div>
     <div className="reports-chart-grid">
-      <Card className="section-card" title={`Số lượng OK / NG theo ${timeUnit === "month" ? "tháng" : timeUnit === "week" ? "tuần (từ Chủ nhật)" : "ngày"}`}>
-        {grouped.size ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={[...grouped.values()]}>
-          <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="date" tick={{ fontSize: 13 }} tickFormatter={value => dayjs(value).format("DD/MM")} /><YAxis allowDecimals={false} width={45} />
-          <Tooltip /><Legend /><Bar dataKey="ok" name="OK (gậy)" fill="#23844b" /><Bar dataKey="ng" name="NG (gậy)" fill="#cf3c48" />
+      <Card className="section-card" title="Số lượng OK / NG theo 30 phút">
+        {halfHour.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart key={JSON.stringify(query.filters)} data={halfHour}>
+          <CartesianGrid vertical={false} stroke="#edf2f7" />
+          <XAxis dataKey="at" tick={{ fontSize: 13 }} minTickGap={32} interval="preserveStartEnd"
+            tickFormatter={value => dayjs(value).tz(REPORT_TIME_ZONE).format("DD/MM HH:mm")} />
+          <YAxis allowDecimals={false} width={45} />
+          <Tooltip labelFormatter={value => `${dayjs(String(value)).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")}–${dayjs(String(value)).tz(REPORT_TIME_ZONE).add(30, "minute").format("HH:mm")}`} />
+          <Legend /><Bar dataKey="ok" stackId="quality" name="OK (gậy)" fill="#23844b" />
+          <Bar dataKey="ng" stackId="quality" name="NG (gậy)" fill="#cf3c48" />
+          {halfHour.length > 96 && <Brush dataKey="at" height={22} startIndex={Math.max(0, halfHour.length - 96)} endIndex={halfHour.length - 1}
+            tickFormatter={value => dayjs(value).tz(REPORT_TIME_ZONE).format("DD/MM HH:mm")} />}
         </BarChart></ResponsiveContainer></div> : empty}
       </Card>
-      <Card className="section-card" title="NG theo trạm và điểm đo">
-        <div className="reports-stations">{stats?.stationResults.map(station => <div key={station.station}>
-          <b>{station.station.toUpperCase()}</b><span>{station.ng} gậy NG · {stats.totalMeasurements ? (station.ng * 100 / stats.totalMeasurements).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng gậy</span>
-        </div>)}</div>
-        {topNg.length ? <div className="report-chart report-ng-chart" style={{ height: Math.max(336, topNg.length * 40) }}><ResponsiveContainer width="100%" height="100%"><BarChart data={topNg} layout="vertical" margin={{ left: 0, right: 25 }}>
+      <Card className="section-card" title="NG theo công đoạn / điểm đo">
+        {topNg.length ? <div className="report-chart report-ng-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={topNg} layout="vertical" margin={{ left: 0, right: 80 }}>
           <CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} />
-          <YAxis type="category" dataKey="label" width={145} interval={0} tick={({ x, y, payload }) => {
+          <YAxis type="category" dataKey="label" width={108} interval={0} tick={({ x, y, payload }) => {
             const point = topNg.find(item => item.label === payload.value);
             return point ? <text x={Number(x) - 4} y={Number(y)} textAnchor="end" fill="#526b83" fontSize={13}>
-              <title>{point.label}</title>
-              <tspan x={Number(x) - 4} dy={-5}>{point.productCode.length > 17 ? `${point.productCode.slice(0, 16)}…` : point.productCode}</tspan>
-              <tspan x={Number(x) - 4} dy={16}>{point.station} · P{point.pointNumber} · {formatDecimal(point.position)} mm</tspan>
+              <tspan x={Number(x) - 4} dy={-5}>{point.label}</tspan>
+              <tspan x={Number(x) - 4} dy={16}>{point.positionLabel}</tspan>
             </text> : <g />;
           }} />
-          <Tooltip formatter={(value, _name, item) => [
-            `${value} gậy · ${item.payload.rate == null ? "—" : item.payload.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 }) + "%"} tổng gậy (${stats?.totalMeasurements.toLocaleString("vi-VN") ?? "—"} gậy)`, "NG",
-          ]} />
-          <Bar dataKey="ng" name="Số gậy NG" fill="#cf3c48" />
+          <Tooltip content={({ active, payload }) => {
+            const point = payload?.[0]?.payload;
+            return active && point ? <div className="report-tooltip"><b>{point.label}</b>
+              <div>Vị trí: {point.position} mm</div><div>{point.ng} gậy NG</div>
+              <div>{point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}% tổng gậy trong bộ lọc ({stats?.totalMeasurements.toLocaleString("vi-VN")} gậy)</div>
+            </div> : null;
+          }} />
+          <Bar dataKey="ng" name="Số gậy NG" fill="#cf3c48"><LabelList dataKey="annotation" position="right" fontSize={13} fill="#526b83" /></Bar>
         </BarChart></ResponsiveContainer></div> : empty}
+        {topNg.length > 0 && <small className="report-distribution-summary">Tỷ lệ trên tổng số gậy trong bộ lọc; một gậy có thể NG tại nhiều điểm.</small>}
       </Card>
       <Card className="section-card" title="Tỷ lệ OK theo ngày">
         {daily.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={daily}>
@@ -299,15 +334,39 @@ function Reports() {
       <Card className="section-card" title="Phân bố độ cong BUTT (tất cả điểm)">
         {histogram.length ? <>
           <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={histogram}>
-            <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="label" tick={{ fontSize: 13 }} interval="preserveStartEnd" label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />
-            <YAxis allowDecimals={false} width={65} label={{ value: "Số phép đo", angle: -90, position: "insideLeft" }} /><Tooltip labelFormatter={(_label, payload) => payload?.[0]?.payload.bounds ?? ""} /><Bar dataKey="count" name="Số phép đo" fill="#3987c9" />
+            <CartesianGrid vertical={false} stroke="#edf2f7" />
+            {demoLimits ? <XAxis type="number" dataKey="midpoint" domain={["auto", "auto"]} tick={{ fontSize: 13 }}
+              tickFormatter={value => Number(value).toLocaleString("vi-VN", { maximumFractionDigits: 2 })}
+              label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />
+              : <XAxis dataKey="label" tick={{ fontSize: 13 }} interval="preserveStartEnd" label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />}
+            <YAxis allowDecimals={false} width={65} label={{ value: "Số phép đo", angle: -90, position: "insideLeft" }} />
+            {demoLimits && <>
+              <ReferenceLine x={Number(demoLimits.lower)} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
+                label={{ value: "0,00 (DEMO)", position: "insideTopRight", fontSize: 13 }} />
+              <ReferenceLine x={Number(demoLimits.upper)} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
+                label={{ value: "2,00 (DEMO)", position: "insideTopLeft", fontSize: 13 }} />
+            </>}
+            <Tooltip content={({ active, payload }) => {
+              const bin = payload?.[0]?.payload;
+              return active && bin ? <div className="report-tooltip"><b>{bin.bounds}</b><div>{bin.count} phép đo</div>
+                <div>{!demoLimits ? "Chưa có giới hạn được xác minh" : bin.zone === "WITHIN" ? "Trong giới hạn DEMO" : "Vượt giới hạn DEMO"}</div>
+              </div> : null;
+            }} />
+            <Bar dataKey="count" name="Số phép đo" fill="#3987c9" maxBarSize={40}>
+              {histogram.map((bin, index) => <Cell key={index} fill={demoLimits && bin.zone !== "WITHIN" ? "#cf3c48" : "#3987c9"} />)}
+            </Bar>
           </BarChart></ResponsiveContainer></div>
+          {quality?.buttSummary && <small className="report-distribution-summary">
+            Trung bình: {numeric(quality.buttSummary.mean)} mm · Độ lệch chuẩn mẫu: {numeric(quality.buttSummary.stddev)} mm
+            {demoLimits ? " · Giới hạn DEMO 0,00–2,00 mm" : ""}
+            {demoLimits ? ` · Cpk DEMO: ${demoCpk == null ? "—" : demoCpk.toLocaleString("vi-VN", { maximumFractionDigits: 3 })}` : ""}
+          </small>}
         </> : empty}
       </Card>
     <Card className="section-card" title="Tổng hợp theo điểm đo">
       <Table<PointSummaryStatistics> key={JSON.stringify(query.filters)} className="reports-point-summary" tableLayout="fixed"
         rowKey={point => JSON.stringify([point.station, point.pointNumber, point.position])}
-        columns={pointColumns} dataSource={quality?.pointSummary ?? []} loading={loading} size="small" scroll={{ x: 680 }}
+        columns={pointColumns} dataSource={(quality?.pointSummary ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber))} loading={loading} size="small" scroll={{ x: 680 }}
         pagination={{ pageSize: 10, showSizeChanger: false, showTotal: value => `${value} nhóm điểm đo` }} locale={{ emptyText: empty }} />
     </Card>
     </div>

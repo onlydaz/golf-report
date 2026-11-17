@@ -113,3 +113,30 @@ pub async fn get_measurement_history_page(
     crate::repositories::MeasurementRepository::history_page(&pool, &request.unwrap_or_default())
         .await
 }
+
+#[tauri::command]
+pub async fn get_plc_raw_snapshots(
+    state: State<'_, DatabaseState>,
+    limit: Option<i64>,
+) -> Result<Vec<crate::models::PlcRawSnapshot>, String> {
+    let pool = state.pool().await?;
+    let rows = crate::repositories::InboxRepository::raw_snapshots(&pool, limit.unwrap_or(20)).await?;
+    rows.into_iter()
+        .map(|row| {
+            let words: Vec<u16> = serde_json::from_value(row.raw_registers)
+                .map_err(|e| format!("Không đọc được raw PLC Inbox #{}: {e}", row.id))?;
+            let zero = words.iter().all(|word| *word == 0);
+            Ok(crate::models::PlcRawSnapshot {
+                id: row.id,
+                received_at: row.received_at,
+                record_seq: row.record_seq,
+                total_count: row.total_count,
+                word_count: words.len(),
+                non_zero_words: words.iter().filter(|word| **word != 0).count(),
+                raw_registers: words,
+                kind: if zero { "ZERO".into() } else { "UNDECODED".into() },
+                processing_status: row.processing_status,
+            })
+        })
+        .collect()
+}

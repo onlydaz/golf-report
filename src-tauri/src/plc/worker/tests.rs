@@ -2,35 +2,45 @@ use super::*;
 use crate::plc::as200::reader::BufferSnapshot;
 
 #[tokio::test]
-async fn read_only_source_can_close_only_after_receipts_without_advancing_ack() {
-    let dir = TestDirectory::new();
-    let mut cfg = config();
-    cfg.read_only = true;
-    cfg.ack_enabled = false;
-    let engine = Engine::open(cfg, dir.0.join("capture.json"), WorkerState::default()).unwrap();
-    engine
-        .capture_published_snapshot(published_snapshot(1, 1))
-        .await
-        .unwrap();
-    let mut journal = engine.journal.lock().await.clone();
-    assert!(journal.read_only_closed().is_err());
-    journal.deliveries[0].inbox_id = Some(42);
-    journal.deliveries[0].terminal = true;
-    journal.read_only_closed().unwrap(); // DB read-back remains mandatory in verify_source_closed.
-    assert_eq!(journal.published_ack.as_ref().unwrap().accepted, 0);
-    assert!(journal.published_ack.as_ref().unwrap().intent.is_none());
-    assert!(
-        journal.closed(false).is_err(),
-        "ACK-enabled closure must still require the real ACK checkpoint"
-    );
-    journal.last_total = Some(2);
-    assert!(
-        journal.read_only_closed().is_err(),
-        "Queued/unseen records must block switching"
-    );
-    journal.last_total = Some(1);
-    journal.pause = Some("RESET".into());
-    assert!(journal.read_only_closed().is_err());
+async fn single_plc_reset_preserves_session_raw_and_checkpoint_across_restart() {
+    for read_only in [true, false] {
+        let dir = TestDirectory::new();
+        let path = dir.0.join("capture.json");
+        let mut cfg = config();
+        cfg.read_only = read_only;
+        cfg.ack_enabled = !read_only;
+        let engine = Engine::open(cfg.clone(), path.clone(), WorkerState::default()).unwrap();
+        engine
+            .capture_published_snapshot(published_snapshot(1, 1))
+            .await
+            .unwrap();
+        let before = engine.journal.lock().await.clone();
+        let mut reset = published_snapshot(0, 0);
+        reset.control.data_ready = 0;
+        reset.buffer = None;
+        if read_only {
+            assert!(engine.capture_published_snapshot(reset).await.is_err());
+        } else {
+            // Closed lazy pool proves the reset guard precedes DB processing and any ACK write.
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .unwrap();
+            pool.close().await;
+            assert!(engine.published_ack_step(reset, &pool).await.is_err());
+        }
+        drop(engine);
+        let restored = Engine::open(cfg, path, WorkerState::default()).unwrap();
+        let journal = restored.journal.lock().await;
+        assert!(journal.pause.is_some());
+        assert_eq!(journal.session_id, before.session_id);
+        assert_eq!(journal.last_total, before.last_total);
+        assert_eq!(
+            journal.deliveries[0].input.raw_registers,
+            before.deliveries[0].input.raw_registers
+        );
+        assert_eq!(journal.published_ack.as_ref().unwrap().accepted, 0);
+        assert!(journal.published_ack.as_ref().unwrap().intent.is_none());
+    }
 }
 
 #[test]
@@ -574,7 +584,7 @@ async fn published_ack_phase_persist_failure_blocks_further_writes() {
 }
 
 #[test]
-fn source_switch_receipt_proof_uses_database_precision_and_requires_real_processed_state() {
+fn processed_receipt_proof_uses_database_precision_and_requires_real_processed_state() {
     let mut row = mock_inbox(1, false);
     row.processing_status = "PROCESSED".into();
     row.measurement_id = Some(1);
@@ -1024,58 +1034,6 @@ async fn heartbeat_observation_is_read_only_and_stale_health_blocks_writes() {
     assert!(state.fresh_health().await);
     state.status.write().await.plc_health = "DISCONNECTED".into();
     assert!(!state.fresh_health().await);
-}
-
-#[tokio::test]
-async fn closed_reset_stays_with_its_source_and_never_releases_pending_data_or_intent() {
-    let dir = TestDirectory::new();
-    let engine = Engine::open(config(), dir.0.join("reset.json"), WorkerState::default()).unwrap();
-    let mut journal = engine.journal.lock().await.clone();
-    let raw = published_snapshot(2, 2).buffer.unwrap().raw_registers;
-    let receipt = Delivery {
-        input: InboxInput {
-            source_id: 0,
-            confirmed_session_id: journal.session_id.clone(),
-            ingest_key: "closed-anchor".into(),
-            record_seq: 2,
-            total_count: Some(2),
-            buffer_index: 0,
-            raw_registers: raw.clone(),
-            word_order: config().word_order,
-            received_at: Utc::now(),
-        },
-        inbox_id: Some(42),
-        terminal: true,
-    };
-    let progress = journal.published_ack.as_mut().unwrap();
-    progress.accepted = 2;
-    progress.confirmed_receipt = Some(receipt);
-    progress.intent = Some(PublishedAckIntent {
-        target: 2,
-        inbox_id: 42,
-        raw_registers: raw,
-        phase: PublishedAckPhase::AckConfirmed,
-        observed_done_high: true,
-    });
-    journal.last_total = Some(2);
-    journal.pause = Some("RESET".into());
-    journal.validate(&config()).unwrap();
-    let before = serde_json::to_value(&journal).unwrap();
-    assert!(journal.closed(true).is_ok());
-    assert!(journal.closed(false).is_err());
-    assert_eq!(before, serde_json::to_value(&journal).unwrap());
-    journal.last_total = Some(3);
-    assert!(journal.closed(true).is_err());
-    journal.last_total = Some(2);
-    journal
-        .published_ack
-        .as_mut()
-        .unwrap()
-        .intent
-        .as_mut()
-        .unwrap()
-        .phase = PublishedAckPhase::DoneWriteUncertain;
-    assert!(journal.closed(true).is_err());
 }
 
 struct SqlFaultBackend<'a> {

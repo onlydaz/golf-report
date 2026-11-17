@@ -1,5 +1,5 @@
 use super::{As200Config, As200Error, decode, map, model::*};
-use std::{future::Future, net::SocketAddr};
+use std::{future::Future, net::IpAddr};
 use tokio::time::timeout;
 use tokio_modbus::{
     Request, Response, Slave,
@@ -20,23 +20,17 @@ pub trait HoldingRegisterReader {
 pub struct ModbusTcpReader {
     config: As200Config,
     ctx: Option<Context>,
+    local_ip: Option<IpAddr>,
 }
 impl ModbusTcpReader {
     pub fn new(config: As200Config) -> Self {
-        Self { config, ctx: None }
+        Self { config, ctx: None, local_ip: None }
     }
 
     async fn exchange(&mut self, address: u16, count: u16) -> Result<Vec<u16>, As200Error> {
         if self.ctx.is_none() {
-            let socket: SocketAddr = self.config.address.parse().map_err(|_| {
-                As200Error::Transport(format!(
-                    "Địa chỉ PLC phải là IP:port dạng số: {}",
-                    self.config.address
-                ))
-            })?;
-            let ctx = tcp::connect_slave(socket, Slave(self.config.unit_id))
-                .await
-                .map_err(|e| As200Error::Transport(e.to_string()))?;
+            let stream = super::connect_tcp(&self.config.address, self.local_ip, self.config.timeout).await?;
+            let ctx = tcp::attach_slave(stream, Slave(self.config.unit_id));
             self.ctx = Some(ctx);
         }
         let ctx = self.ctx.as_mut().expect("ctx vừa được tạo");
@@ -85,9 +79,17 @@ impl HoldingRegisterReader for ModbusTcpReader {
             )));
         }
         let duration = self.config.timeout;
-        let result = timeout(duration, self.exchange(address, count))
+        let mut result = timeout(duration, self.exchange(address, count))
             .await
             .unwrap_or(Err(As200Error::Timeout));
+        if matches!(&result, Err(As200Error::Timeout)) {
+            eprintln!("PLC_READ state=TIMEOUT endpoint={} local_ip={:?} stage={} timeout_ms={}",
+                self.config.address, self.local_ip, if self.ctx.is_some() { "FC03" } else { "TCP_CONNECT" }, duration.as_millis());
+            if self.ctx.is_none() && self.local_ip.is_some() {
+                result = Err(As200Error::Transport(format!("Hết thời gian kết nối TCP PLC {}, IP nguồn {:?}. {}",
+                    self.config.address, self.local_ip, super::ROUTE_HELP)));
+            }
+        }
         // Sau lỗi/timeout, socket có thể chứa response dở. Hủy kết nối, nối lại ở lần gọi sau.
         if result.is_err() {
             self.ctx = None;
@@ -98,6 +100,8 @@ impl HoldingRegisterReader for ModbusTcpReader {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
+    /// Payload toàn 0: giữ raw; không suy diễn thành measurement.
+    ZeroTestRecord,
     InvalidRecord {
         buffer_index: usize,
         error: String,
@@ -115,13 +119,21 @@ pub struct BufferSnapshot {
     pub record: Option<PlcStickRecord>,
 }
 /// Snapshot ổn định của vùng công bố Bản ghi 1.
-/// Không mang nghĩa dữ liệu mới, đã lưu hoặc được phép ACK; caller phải kiểm tra diagnostics.
+/// Diagnostics chỉ quyết định khả năng giải mã measurement; ACK cần receipt raw và handshake.
 #[derive(Debug, Clone)]
 pub struct PublishedRecordSnapshot {
     pub control: PlcControl,
     /// None khi DataReady=0 đã được đọc lại ổn định; khi đó không đọc vùng bản ghi.
     pub buffer: Option<BufferSnapshot>,
     pub diagnostics: Vec<Diagnostic>,
+}
+impl PublishedRecordSnapshot {
+    pub fn is_zero_test(&self) -> bool {
+        self.control.data_ready == 1 && self.buffer.as_ref().is_some_and(|buffer| {
+            buffer.buffer_index == 0 && buffer.raw_registers.len() == map::RECORD_SIZE
+                && buffer.raw_registers.iter().all(|word| *word == 0)
+        })
+    }
 }
 pub struct As200Reader<T = ModbusTcpReader> {
     config: As200Config,
@@ -130,6 +142,10 @@ pub struct As200Reader<T = ModbusTcpReader> {
 impl As200Reader<ModbusTcpReader> {
     pub fn new(config: As200Config) -> Self {
         Self::with_transport(config.clone(), ModbusTcpReader::new(config))
+    }
+    pub fn with_local_ip(mut self, local_ip: Option<IpAddr>) -> Self {
+        self.transport.local_ip = local_ip;
+        self
     }
 }
 impl<T: HoldingRegisterReader> As200Reader<T> {
@@ -177,7 +193,10 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
             .await?;
         decode::control(&raw, self.config.word_order)
     }
-    /// Raw Bản ghi 1; caller must surround this with stable control/raw checks.
+    /// Theo xác nhận kỹ thuật PLC: PC chỉ đọc Bản ghi 1 khi DataReady=1;
+    /// PLC chịu trách nhiệm công bố và quản lý toàn bộ buffer vật lý.
+    /// Không chọn vùng theo WriteIdx/LastIdx. Caller phải kiểm tra control/raw ổn định.
+    /// Xác nhận vùng đọc này không thay thế việc nghiệm thu trình tự ACK Count/Done.
     pub async fn read_published_words(&mut self) -> Result<Vec<u16>, As200Error> {
         self.read_range(
             self.config
@@ -189,7 +208,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         .await
     }
     /// Đọc riêng D25020..D25259 khi DataReady=1, không đọc buffer index 1.
-    /// Dùng lại decoder/validation, không dùng hoặc cập nhật tracker hai buffer.
+    /// PLC quản lý buffer vật lý; PC không ghi WriteIdx/LastIdx hoặc chuyển buffer.
     /// DataReady có thể giữ mức 1 và RecordSeq có thể nhỏ hơn TotalCount.
     /// Đây chỉ là snapshot quan sát; không xác nhận nguồn/phiên, lưu dữ liệu hay ACK.
     pub async fn poll_published_record(&mut self) -> Result<PublishedRecordSnapshot, As200Error> {
@@ -226,7 +245,10 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         }
 
         let mut diagnostics = Vec::new();
-        let record = if raw[map::record::STATUS] & 1 == 0 {
+        let record = if raw.iter().all(|word| *word == 0) {
+            diagnostics.push(Diagnostic::ZeroTestRecord);
+            None // Keep all 240 words. Version/Status/sequence are not invented.
+        } else if raw[map::record::STATUS] & 1 == 0 {
             diagnostics.push(Diagnostic::InvalidRecord {
                 buffer_index: 0,
                 error: "DataReady=1 nhưng Bản ghi 1 chưa có Status bit0 hợp lệ".into(),

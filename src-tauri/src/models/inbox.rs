@@ -46,6 +46,19 @@ pub struct InboxRecord {
     pub error_message: Option<String>,
     pub processed_at: Option<DateTime<Utc>>,
 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcRawSnapshot {
+    pub id: i64,
+    pub received_at: DateTime<Utc>,
+    pub record_seq: i32,
+    pub total_count: Option<i64>,
+    pub word_count: usize,
+    pub non_zero_words: usize,
+    pub raw_registers: Vec<u16>,
+    pub kind: String,
+    pub processing_status: String,
+}
 #[derive(Debug, Clone, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcSource {

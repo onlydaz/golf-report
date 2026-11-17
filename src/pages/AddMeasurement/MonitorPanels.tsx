@@ -1,20 +1,21 @@
 ﻿import { Alert, Button, Card, Empty, Select, Spin, Table } from "antd";
 import { useNavigate } from "react-router-dom";
 import { useState } from "react";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import type { ReactNode } from "react";
+import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ResultTag } from "../../components/measurement/MeasurementDetails";
 import type { BackendMeasurement, MeasurementDetail, MeasurementHistoryItem, MeasurementStatistics } from "../../services/measurementService";
-import { formatDecimal, isUnmeasuredPoint } from "../../utils/as200Report";
+import { displayPointResult, formatDecimal, isBusinessPoint, isUnmeasuredPoint, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime } from "../../utils/reportTime";
 
-export function ProductionSummary({ productCode, statistics, loading }: {
-  productCode?: string; statistics?: MeasurementStatistics; loading: boolean;
+export function ProductionSummary({ productCode, statistics, loading, skuEditor }: {
+  productCode?: string; statistics?: MeasurementStatistics; loading: boolean; skuEditor?: ReactNode;
 }) {
   const count = (value: number | undefined) => loading && productCode ? <Spin size="small" /> : value?.toLocaleString("vi-VN") ?? "—";
   return <>
     <Card className="section-card monitor-sku">
       <div className="monitor-kicker">SKU đang chạy</div>
-      <strong className="monitor-sku-value">{productCode || "—"}</strong>
+      {skuEditor ?? <strong className="monitor-sku-value">{productCode || "—"}</strong>}
     </Card>
     <Card className="section-card monitor-count monitor-count-ok"><div className="monitor-kicker">OK</div>
       <strong>{count(statistics?.totalOk)}</strong><small>{statistics ? `${statistics.passRate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}% tổng số gậy` : "Chưa có thống kê"}</small>
@@ -35,6 +36,7 @@ export function ProductionSummary({ productCode, statistics, loading }: {
 }
 
 export function decisionBend(row: MeasurementHistoryItem, station: "BUTT" | "TIP", pointNumber: number) {
+  if (!isBusinessPoint(station, pointNumber)) return null;
   return row.decisionPoints.find(point => point.measurementId === row.id
     && point.station === station && point.pointNumber === pointNumber)?.bend ?? null;
 }
@@ -44,26 +46,47 @@ export function buildBendSeries(records: MeasurementHistoryItem[], productCode: 
   return [...new Map(records.filter(row => row.productCode === productCode).map(row => [row.id, row])).values()]
     .sort((a, b) => Date.parse(b.measuredAt) - Date.parse(a.measuredAt) || b.id - a.id)
     .slice(0, 30).reverse().map(row => {
-      const points = [1, 2, 3, 4].map(point => {
+      const points = stationPointNumbers(station).map(point => {
         const value = decisionBend(row, station, point);
         return value != null && value.trim() !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
       });
-      return { id: row.id, clubNumber: row.clubNumber, measuredAt: row.measuredAt, recordSeq: row.recordSeq,
-        p1: points[0], p2: points[1], p3: points[2], p4: points[3] };
+      return { id: row.id, sourceId: row.sourceId, clubNumber: row.clubNumber, measuredAt: row.measuredAt, recordSeq: row.recordSeq,
+        p1: points[0] ?? null, p2: points[1] ?? null, p3: points[2] ?? null, p4: points[3] ?? null };
     });
 }
 
-export function BendComparison({ records, productCode, loading, error }: {
-  records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string;
+// Display-only defaults for the Python DEMO fixture. Never inferred from measured values.
+const simulatorDemoSettings = {
+  BUTT: { load: 500, pushDist: 10, bendMin: 0, bendMax: 2, positions: [150, 300, 450, 600] },
+  TIP: { load: 200, pushDist: 8, bendMin: 0, bendMax: 2, positions: [80] },
+} as const;
+
+export function BendComparison({ records, productCode, loading, error, simulatorSourceId }: {
+  records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string; simulatorSourceId?: number;
 }) {
   const [station, setStation] = useState<"BUTT" | "TIP">("BUTT");
   const series = buildBendSeries(records, productCode, station);
+  // A dedicated new SKU avoids reinterpreting older TEST-AS200 fixtures with different samples.
+  // Mixed-source history must not receive a shared DEMO limit, even with the same SKU.
+  const demo = productCode === "DEMO-AS200" && simulatorSourceId != null && series.length > 0
+    && series.every(row => row.sourceId === simulatorSourceId) ? simulatorDemoSettings[station] : undefined;
+  const decimal = (value: number) => value.toLocaleString("vi-VN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const keys = ["p1", "p2", "p3", "p4"] as const;
+  const excess = (value: number) => demo ? Math.max(demo.bendMin - value, value - demo.bendMax, 0) : null;
+  const colors = ["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].slice(0, stationPointNumbers(station).length);
   const hasBend = series.some(row => [row.p1, row.p2, row.p3, row.p4].some(value => value != null));
   return <Card className="section-card monitor-bend" title="Độ cong thực tế · 30 gậy gần nhất"
     extra={<Select aria-label="Trạm biểu đồ độ cong" value={station} onChange={setStation}
       options={[{ value: "BUTT", label: "Trạm BUTT" }, { value: "TIP", label: "Trạm TIP" }]} />}>
-    <div className="monitor-chart-settings"><span>Lực đè cài đặt <b>—</b></span><span>Giới hạn độ cong <b>—</b></span><span>Vị trí cài đặt <b>—</b></span></div>
-    <div className="monitor-chart-legend" aria-label="Chú giải điểm đo">{["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].map((color, i) => <span key={color}><i style={{ background: color }} />Điểm {i + 1}</span>)}</div>
+    <div className="monitor-chart-settings">
+      <span>Lực đè cài đặt<b>{demo ? demo.load : "—"}</b></span>
+      <span>Khoảng cách đẩy<b>{demo ? decimal(demo.pushDist) : "—"}</b></span>
+      <span>Giới hạn độ cong<b>{demo ? `${decimal(demo.bendMin)} – ${decimal(demo.bendMax)}` : "—"}</b></span>
+      <span>Vị trí điểm đo<b>{demo ? demo.positions.join(" · ") : "—"}</b></span>
+    </div>
+    <div className="monitor-chart-legend" aria-label="Chú giải điểm đo">{colors.map((color, i) => <span key={color}><i style={{ background: color }} />Điểm {i + 1}</span>)}
+      {demo && <span><i className="monitor-limit-dot" />Vượt giới hạn (NG)</span>}
+    </div>
     {error && <Alert type="error" showIcon title={error} />}
     <Spin spinning={loading}>
       {hasBend ? <div className="monitor-bend-chart"><ResponsiveContainer width="100%" height="100%">
@@ -71,13 +94,39 @@ export function BendComparison({ records, productCode, loading, error }: {
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="id" tickFormatter={id => `#${series.find(row => row.id === id)?.clubNumber ?? "—"}`} />
           <YAxis width={65} label={{ value: "Độ cong (mm)", angle: -90, position: "insideLeft" }} />
-          <Tooltip labelFormatter={id => {
-            const row = series.find(item => item.id === Number(id));
-            return row ? `#${row.clubNumber} · ${formatReportTime(row.measuredAt)} · RecordSeq ${row.recordSeq}` : "";
-          }} formatter={value => `${formatDecimal(value == null ? null : String(value))} mm`} />
-          {["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].map((color, i) =>
-            <Line key={color} type="linear" dataKey={`p${i + 1}`} name={`${station} · Điểm ${i + 1}`} stroke={color}
-              connectNulls={false} dot={{ r: 3 }} activeDot={{ r: 5 }} isAnimationActive={false} />)}
+          {demo && <>
+            <ReferenceLine y={demo.bendMin} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
+              label={{ value: `Dưới ${decimal(demo.bendMin)}`, position: "insideBottomRight", fill: "#b42318", fontSize: 13 }} />
+            <ReferenceLine y={demo.bendMax} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
+              label={{ value: `Trên ${decimal(demo.bendMax)}`, position: "insideTopRight", fill: "#b42318", fontSize: 13 }} />
+          </>}
+          <Tooltip content={({ active, label }) => {
+            const row = series.find(item => item.id === Number(label));
+            if (!active || !row) return null;
+            return <div className="monitor-bend-tooltip"><strong>{station} · Gậy #{row.clubNumber}</strong>
+              <div>{formatReportTime(row.measuredAt)} · RecordSeq {row.recordSeq}</div>
+              <div>Giới hạn: {demo ? `${decimal(demo.bendMin)} – ${decimal(demo.bendMax)} mm (DEMO)` : "Chưa có dữ liệu cài đặt"}</div>
+              {colors.map((color, i) => {
+                const value = row[keys[i]];
+                const exceeded = value != null ? excess(value) : null;
+                return <div key={keys[i]} style={{ color: exceeded != null && exceeded > 0 ? "#d92d20" : color }}>
+                  {station} · P{i + 1}: {value != null ? `${decimal(value)} mm` : "—"}
+                  {demo && value != null && exceeded != null && exceeded > 0
+                    ? ` · Vượt ${value < demo.bendMin ? "dưới" : "trên"} ${decimal(exceeded)} mm` : ""}
+                </div>;
+              })}
+            </div>;
+          }} />
+          {colors.map((color, i) => {
+            const dot = ({ cx, cy, value }: { cx?: number; cy?: number; value?: number | null }) => {
+              if (cx == null || cy == null || value == null || !Number.isFinite(value)) return <g />;
+              const ng = (excess(value) ?? 0) > 0;
+              return <circle key={`${i}-${cx}-${cy}`} cx={cx} cy={cy} r={ng ? 5 : 3}
+                fill={ng ? "#d92d20" : color} stroke={ng ? "white" : color} strokeWidth={ng ? 2 : 1} />;
+            };
+            return <Line key={color} type="linear" dataKey={keys[i]} name={`${station} · Điểm ${i + 1}`} stroke={color}
+              connectNulls={false} dot={dot} activeDot={dot} isAnimationActive={false} />;
+          })}
         </LineChart>
       </ResponsiveContainer></div> : <div className="monitor-chart-empty">
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={productCode ? `Chưa có dữ liệu độ cong đã lưu cho trạm ${station}` : "Chưa xác định SKU đang hiển thị"} />
@@ -89,9 +138,9 @@ export function BendComparison({ records, productCode, loading, error }: {
 
 export function CurrentPointTable({ detail, loading }: { detail?: MeasurementDetail; loading: boolean }) {
   const rows = (["BUTT", "TIP"] as const).flatMap(type => detail?.stations.filter(station => station.stationType === type).flatMap(station =>
-    [...station.points].sort((a, b) => a.pointNumber - b.pointNumber).map(point => {
+    station.points.filter(point => isBusinessPoint(type, point.pointNumber)).sort((a, b) => a.pointNumber - b.pointNumber).map(point => {
       const decision = point.attempts.find(attempt => attempt.attemptNumber === point.decideAttempt);
-      return { ...point, key: `${type}-${point.id}`, station: type, load: isUnmeasuredPoint(point) ? null : station.load,
+      return { ...point, result: displayPointResult(station, point), key: `${type}-${point.id}`, station: type, load: isUnmeasuredPoint(point) ? null : station.load,
         pushDist: decision?.pushDist, bend: decision?.bend };
     })
   ) ?? []);
@@ -103,7 +152,7 @@ export function CurrentPointTable({ detail, loading }: { detail?: MeasurementDet
       { title: "Khoảng cách đẩy (mm)", dataIndex: "pushDist", render: formatDecimal, width: "17%" },
       { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: "14%" },
       { title: <span className="monitor-attempt-heading">Số<br />lần đo</span>, dataIndex: "attemptCount", align: "center", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 54 },
-      { title: "Kết quả", dataIndex: "result", render: (result, row) => isUnmeasuredPoint(row) ? "—" : <ResultTag result={result} qcLabels />, width: "13%" },
+      { title: "Kết quả", dataIndex: "result", render: result => <ResultTag result={result} qcLabels />, width: "13%" },
     ]} />;
 }
 
@@ -113,7 +162,7 @@ export function RecentMeasurements({ records, loading, error, onRefresh, page, t
 }) {
   const navigate = useNavigate();
   const bends = (row: MeasurementHistoryItem, type: "BUTT" | "TIP") =>
-    [1, 2, 3, 4].map(point => formatDecimal(decisionBend(row, type, point))).join(" / ");
+    stationPointNumbers(type).map(point => formatDecimal(decisionBend(row, type, point))).join(" / ");
   return <Card className="section-card monitor-recent" title="Các gậy gần nhất"
     extra={<div className="monitor-recent-actions"><Button type="text" size="small" loading={loading} onClick={onRefresh}>Làm mới</Button><Button type="link" size="small" onClick={() => navigate("/measurements")}>Xem toàn bộ lịch sử →</Button></div>}>
     {error && <Alert type="error" showIcon title={error} className="add-measurement-alert" />}
@@ -125,7 +174,7 @@ export function RecentMeasurements({ records, loading, error, onRefresh, page, t
         { title: "Thời gian", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
         { title: "Số gậy", dataIndex: "clubNumber", render: value => `#${value}`, width: 80 },
         { title: "BUTT P1 / P2 / P3 / P4 (mm)", render: (_, row) => bends(row, "BUTT"), width: 260 },
-        { title: <span title="Độ cong các điểm TIP theo thứ tự điểm, không tự gộp thành một giá trị">TIP (mm)</span>, render: (_, row) => bends(row, "TIP"), width: 190 },
+        { title: <span title="Độ cong TIP P1 tại lượt đo quyết định">TIP (mm)</span>, render: (_, row) => bends(row, "TIP"), width: 112 },
         ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({ title, dataIndex, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />, width: 85 })),
       ]} />
   </Card>;

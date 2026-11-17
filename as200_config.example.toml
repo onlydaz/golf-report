@@ -1,34 +1,43 @@
-# Technical reference only. The QC screen creates endpoint-only settings in AppData.
-# "Lưu và kết nối" reads and validates the AS200 snapshot, then hydrates runtime
-# defaults and creates an internal source identity in PostgreSQL.
-# This is an example address, never an automatically selected device.
-mode = "modbus"
+# One environment loaded from TOML on app restart. No endpoint selection in the UI.
+# Stop collection and exit the app before changing environments. Preserve the old Journal.
+# Python Simulator: use the environment values below:
+# address = "127.0.0.1:1503"
+# unit_id = 1
+# source_key = "golf-report-simulator"
+# confirmed_session_id = "simulator-test-01"
+# journal_path = "local-runtime/simulator/capture.json"
+# Loopback requires the simulator identity/path and a session starting "simulator-".
+# Remote PLC uses the production identity/path and a non-simulator session.
+# Reuse each environment's existing session when returning; never replace it to bypass RESET.
+# Other parameters below apply to both environments. ACK remains independently opt-in.
+# LOW/offset/timing are the current profile, not proof of Ladder validation.
 enabled = false
+mode = "modbus"
+address = "192.168.1.5:502"
+# Optional source IP assigned to the laptop Ethernet adapter; omit for OS selection.
+# plc_local_ip = "192.168.1.100"
+# Source binding does not force the Windows route. Check route/interface metrics if needed.
+unit_id = 1
+source_key = "golf-report-plc-01"
+confirmed_session_id = "golf-report-plc-01-initial"
+journal_path = "local-runtime/capture.json"
+layout_profile = "as200-published-v1"
+control_start = 25000
+buffer_count = 2
+record_size = 240
+word_order = "LOW"
+modbus_address_offset = 0
+timeout_ms = 2000
+poll_interval_ms = 500
+retry_interval_ms = 2000
+max_queue = 128
+plc_heartbeat_timeout_ms = 5000
+auto_reconnect = true
+read_only = true
+allow_plc_connection = true
 technical_setup_confirmed = false
-address = "192.0.2.10:502"
-unit_id = 7
 ack_enabled = false
+# Set these write-related options only after independent protocol/permission verification.
+ack_protocol = "as200"
 pc_heartbeat_enabled = false
-allow_plc_connection = false
 allow_plc_heartbeat_write = false
-
-# These values are runtime defaults applied automatically after the endpoint and
-# the approved AS200 snapshot are accepted. Users do not edit them.
-# The source/session identity is derived internally from the endpoint.
-# word_order = "LOW" # Verify on the actual device, do not copy blindly.
-# modbus_address_offset = 0 # Verify D-register to PDU mapping.
-# source_key = "TECHNICIAN-CONFIRMED-STABLE-SOURCE"
-# confirmed_session_id = "TECHNICIAN-CONFIRMED-SESSION"
-# plc_heartbeat_timeout_ms = 5000 # Example only; agree timing with PLC technician.
-# journal_path = "as200_capture_journal.json"
-
-# The release is approved once by the PLC engineer for the company's AS200
-# register-map/ACK scope. FC03 alone never grants ACK permission: the app also
-# requires stable control counters, two valid 240-WORD buffers, and all
-# Journal/Inbox/Neon recovery guards to pass.
-# PC heartbeat additionally requires pc_heartbeat_enabled=true and allow_plc_heartbeat_write=true.
-# Do not enable writes until commissioning. Existing ACK evidence/session guards still apply.
-
-# Legacy mode="simulator"/"plc" configurations remain readable without automatic conversion.
-# Existing Journal/Inbox/ACK intent guards remain authoritative and are never
-# cleared by the connection screen.

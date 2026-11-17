@@ -1,9 +1,23 @@
 import { formatReportTime } from "./reportTime";
-import type { MeasurementDetail, MeasurementPoint } from "../services/measurementService";
+import type { MeasurementDetail, MeasurementPoint, MeasurementStation } from "../services/measurementService";
+
+export function stationPointNumbers(station: "TIP" | "BUTT"): readonly number[] {
+  return station === "TIP" ? [1] : [1, 2, 3, 4];
+}
+
+export function isBusinessPoint(station: string, pointNumber: number): boolean {
+  return Number.isInteger(pointNumber) && pointNumber >= 1
+    && (station === "TIP" ? pointNumber === 1 : station === "BUTT" && pointNumber <= 4);
+}
+
+export function displayPointResult(station: Pick<MeasurementStation, "result" | "pointCount">, point: MeasurementPoint) {
+  return station.result === "NG" && point.pointNumber > station.pointCount && isUnmeasuredPoint(point)
+    ? "SKIPPED" as const : point.result;
+}
 
 // Old records may contain padding position=0. Only a wholly unused point is empty;
 // do not hide conflicting attempts or a nonzero position behind a display placeholder.
-export function isUnmeasuredPoint(point: MeasurementPoint): boolean {
+export function isUnmeasuredPoint(point: Pick<MeasurementPoint, "attemptCount" | "decideAttempt" | "attempts" | "position"> & { result: string }): boolean {
   return ["UNMEASURED", "SKIPPED"].includes(String(point.result))
     && point.attemptCount === 0 && point.decideAttempt == null && point.attempts.length === 0
     && (point.position == null || Number(point.position) === 0);
@@ -53,12 +67,12 @@ export function buildReportTables(records: MeasurementDetail[]) {
 
   const points = records.flatMap(item =>
     item.stations.flatMap(station =>
-      station.points.map(point => ({
+      station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber)).map(point => ({
         "Measurement ID": item.id,
         StationType: station.stationType,
         PointNumber: point.pointNumber,
         "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
-        Result: point.result,
+        Result: displayPointResult(station, point),
         AttemptCount: point.attemptCount,
         DecideAttempt: point.decideAttempt ?? "",
       }))
@@ -67,7 +81,7 @@ export function buildReportTables(records: MeasurementDetail[]) {
 
   const attempts = records.flatMap(item =>
     item.stations.flatMap(station =>
-      station.points.flatMap(point =>
+      station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber)).flatMap(point =>
         point.attempts.map(attempt => ({
           "Measurement ID": item.id,
           StationType: station.stationType,

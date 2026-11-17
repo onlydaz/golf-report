@@ -24,6 +24,11 @@
 .history-table .ant-table-thead > tr > th { color: #334e68; font-weight: 600; white-space: normal; }
 .history-table .ant-tag { margin-inline-end: 0; font-size: 13px; }
 .history-table .ant-btn-link { padding-inline: 0; white-space: nowrap; font-size: 14px; }
+.measurement-history-page .history-detail-table .ant-table-cell { padding: 10px 14px; font-size: 14px; line-height: 1.5; text-align: center; font-variant-numeric: tabular-nums; }
+.measurement-history-page .history-detail-table .ant-table-thead > tr > th { font-size: 14px; font-weight: 600; }
+.measurement-history-page .history-detail-table .ant-table-tbody > tr > td { height: 50px; }
+.history-detail-table .ant-tag { padding-inline: 6px; line-height: 20px; }
+.history-detail-table .ant-btn-link { height: 28px; font-size: 14px; }
 .history-sku-table .history-sku-selected > td, .history-sku-table .history-sku-selected:hover > td { background: #edf6ff; }
 .history-sku-table .history-sku-selected > td:first-child { box-shadow: inset 3px 0 #1769aa; font-weight: 600; }
 @media (max-width: 1450px) {

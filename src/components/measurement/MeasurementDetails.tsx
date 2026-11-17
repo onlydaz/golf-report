@@ -1,5 +1,5 @@
 import { formatReportTime } from "../../utils/reportTime";
-import { Card, Descriptions, Empty, Table, Tag } from "antd";
+import { Alert, Card, Descriptions, Empty, Table, Tag } from "antd";
 
 import type {
   MeasurementDetail,
@@ -7,13 +7,13 @@ import type {
   MeasurementResult,
 } from "../../services/measurementService";
 
-import { formatDecimal, isUnmeasuredPoint } from "../../utils/as200Report";
+import { displayPointResult, formatDecimal, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
 
 export function ResultTag({
   result,
   qcLabels = false,
 }: {
-  result?: MeasurementResult | null;
+  result?: MeasurementResult | "SKIPPED" | null;
   qcLabels?: boolean;
 }) {
   return (
@@ -102,6 +102,8 @@ export default function MeasurementDetails({
               <Empty description="Chưa có dữ liệu trạm" />
             ) : (
               <>
+                {type === "TIP" && station.points.some(point => !isBusinessPoint(type, point.pointNumber) && !isUnmeasuredPoint(point)) &&
+                  <Alert type="warning" showIcon title="Dữ liệu TIP cũ có điểm ngoài P1. Giữ nguyên dữ liệu trong database để kỹ thuật đối chiếu; các điểm này không tính vào nghiệp vụ TIP hiện tại." />}
                 <Descriptions
                   className="station-summary"
                   column={{ xs: 1, sm: 2, lg: 4 }}
@@ -139,7 +141,7 @@ export default function MeasurementDetails({
                   size="small"
                   rowKey="id"
                   pagination={false}
-                  dataSource={[...station.points].sort(
+                  dataSource={station.points.filter(point => isBusinessPoint(type, point.pointNumber)).sort(
                     (a, b) => a.pointNumber - b.pointNumber
                   )}
                   scroll={{ x: 1040 }}
@@ -160,9 +162,9 @@ export default function MeasurementDetails({
                     {
                       title: "Kết quả",
                       dataIndex: "result",
-                      render: (value: MeasurementResult, point) => isUnmeasuredPoint(point) ? "—" : (
+                      render: (_: MeasurementResult, point) => (
                         <ResultTag
-                          result={value}
+                          result={displayPointResult(station, point)}
                           qcLabels={qcLabels}
                         />
                       ),
@@ -222,21 +224,21 @@ export default function MeasurementDetails({
                             title: "Lượt đo",
                             dataIndex: "attemptNumber",
                             align: "center",
-                            width: 100,
+                            width: "20%",
                           },
                           {
                             title: "PushDist (mm)",
                             dataIndex: "pushDist",
                             render: formatDecimal,
                             align: "right",
-                            width: 150,
+                            width: "40%",
                           },
                           {
                             title: "Bend (mm)",
                             dataIndex: "bend",
                             render: formatDecimal,
                             align: "right",
-                            width: 150,
+                            width: "40%",
                           },
                         ]}
                       />

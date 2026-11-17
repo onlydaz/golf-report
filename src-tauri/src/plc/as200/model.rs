@@ -98,7 +98,8 @@ impl PlcStickRecord {
         }
         Ok(()) // Zero and non-one starting counters are not rejected.
     }
-    /// Quy tắc điểm/lượt và kết quả theo Excel AS200, dùng chung cho mọi nguồn.
+    /// Quy trình máy đã xác nhận: TIP P1 tại A; BUTT P1–P4 tại H/G/F/E.
+    /// Giữ đủ bốn slot raw mỗi trạm theo Register Map, không coi slot TIP dư là điểm đo.
     /// Không kiểm tra ngưỡng số đo, quan hệ StickNo/sequence hoặc các bit status chưa chốt.
     pub fn validate_workflow(&self) -> Result<(), String> {
         if self.product_code.trim().is_empty()
@@ -106,11 +107,11 @@ impl PlcStickRecord {
         {
             return Err("ProductCode missing or contains invalid characters".into());
         }
-        for (name, station) in [("TIP", &self.tip), ("BUTT", &self.butt)] {
+        for (name, station, point_limit) in [("TIP", &self.tip, 1), ("BUTT", &self.butt, 4)] {
             let measured = match station.result {
-                PlcResult::Ok if station.point_count == 4 && station.ng_point == 0 => 4,
+                PlcResult::Ok if station.point_count == point_limit && station.ng_point == 0 => point_limit as usize,
                 PlcResult::Ng
-                    if (1..=4).contains(&station.ng_point)
+                    if (1..=point_limit).contains(&station.ng_point)
                         && station.point_count == station.ng_point =>
                 {
                     station.point_count as usize
@@ -123,6 +124,13 @@ impl PlcStickRecord {
                 }
             };
             for (index, point) in station.points.iter().enumerate() {
+                if index >= point_limit as usize
+                    && (point.result != PlcResult::Unmeasured || point.attempt_count != 0
+                        || point.decide_attempt != 0 || point.position != 0.0
+                        || point.attempts.iter().any(|a| a.push_dist != 0.0 || a.bend != 0.0))
+                {
+                    return Err(format!("AS200_WORKFLOW: {name} P{} chứa dữ liệu ngoài quy trình; giữ raw để đối chiếu, không ACK", index + 1));
+                }
                 let expected = if index >= measured {
                     PlcResult::Unmeasured
                 } else if station.result == PlcResult::Ng && index + 1 == measured {

@@ -11,6 +11,50 @@ use crate::{
 use bigdecimal::BigDecimal;
 use sqlx::PgPool;
 
+pub(crate) const RAW_UNDECODED_KEY: &str = "raw-published-v1:";
+pub(crate) const LEGACY_RAW_ZERO_KEY: &str = "raw-zero-test-v1:";
+pub(crate) const LEGACY_RAW_INVALID_KEY: &str = "raw-invalid-v1:";
+pub(crate) const RAW_UNINITIALIZED_KEY: &str = "raw-uninitialized-v1:";
+
+// TotalCount identifies the publication; RecordSeq in the raw words is never rewritten.
+pub(crate) fn raw_ack_prefix(session: &str) -> String {
+    format!("{RAW_UNDECODED_KEY}ack:{}:{session}:", session.len())
+}
+
+pub(crate) fn validate_operator_sku(sku: &str) -> Result<(), String> {
+    if sku.is_empty() || sku.len() > 50 || sku != sku.trim()
+        || !sku.bytes().all(|b| (32..=126).contains(&b))
+    {
+        return Err("SKU cần 1–50 ký tự ASCII in được, không có khoảng trắng ở đầu/cuối.".into());
+    }
+    Ok(())
+}
+
+// The immutable delivery key is already persisted in both Journal and Inbox.
+// Carry the assigned SKU there without altering raw PLC words or the DB schema.
+pub(crate) fn sku_delivery_key(sku: &str, nonce: i64, sequence: i32) -> Result<String, String> {
+    validate_operator_sku(sku)?;
+    let encoded: String = sku.bytes().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("published-sku-v1:{encoded}:{nonce}:{sequence}"))
+}
+
+pub(crate) fn assigned_sku(key: &str, sequence: i32) -> Result<Option<String>, String> {
+    let Some(rest) = key.strip_prefix("published-sku-v1:") else { return Ok(None); };
+    let parts: Vec<_> = rest.split(':').collect();
+    if parts.len() != 3 || parts[0].len() % 2 != 0 || !parts[0].is_ascii()
+        || parts[1].parse::<i64>().is_err() || parts[2].parse::<i32>().ok() != Some(sequence)
+    {
+        return Err("SKU delivery không hợp lệ; giữ nguyên Inbox/Journal để đối chiếu.".into());
+    }
+    let bytes = (0..parts[0].len()).step_by(2)
+        .map(|i| u8::from_str_radix(&parts[0][i..i + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "SKU delivery lỗi mã hóa; không tự thay bằng SKU hiện hành.".to_string())?;
+    let sku = String::from_utf8(bytes).map_err(|_| "SKU delivery lỗi ký tự.".to_string())?;
+    validate_operator_sku(&sku)?;
+    Ok(Some(sku))
+}
+
 pub fn real32_numeric(value: f32) -> Result<BigDecimal, String> {
     if !value.is_finite() {
         return Err("REAL32 NaN/Infinity không thể lưu như phép đo".into());
@@ -30,7 +74,11 @@ fn result(value: PlcResult) -> MeasurementResult {
 }
 fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput, String> {
     let mut points = Vec::new();
-    for (index, point) in value.points.iter().enumerate() {
+    let point_limit = match &station_type {
+        StationType::Tip => 1,
+        StationType::Butt => 4,
+    };
+    for (index, point) in value.points.iter().take(point_limit).enumerate() {
         let mut attempts = Vec::new();
         for attempt in point.attempts.iter().take(point.attempt_count as usize) {
             attempts.push(AttemptInput {
@@ -49,7 +97,7 @@ fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput
                 Some(i32::from(point.decide_attempt))
             },
             // Workflow validation already proved unused slots contain no data.
-            // Keep all four point identities, but do not store padding zero as a measurement.
+            // Keep only business point identities (TIP 1, BUTT 4); padding is not a measurement.
             position: if index < value.point_count as usize && point.attempt_count > 0 {
                 Some(real32_numeric(point.position)?)
             } else {
@@ -68,6 +116,13 @@ fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput
     })
 }
 pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String> {
+    if inbox.ingest_key.starts_with(RAW_UNDECODED_KEY)
+        || inbox.ingest_key.starts_with(LEGACY_RAW_ZERO_KEY)
+        || inbox.ingest_key.starts_with(LEGACY_RAW_INVALID_KEY)
+        || inbox.ingest_key.starts_with(RAW_UNINITIALIZED_KEY)
+    {
+        return Err("Raw đã nhận nhưng chưa giải mã đủ; giữ nguyên bản ghi, không tạo measurement hoặc receipt ACK.".into());
+    }
     let session = inbox
         .session_id
         .as_ref()
@@ -96,7 +151,7 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
         confirmed_session_id: session.clone(),
         record_seq: record.record_seq,
         total_count: inbox.total_count,
-        product_code: record.product_code,
+        product_code: assigned_sku(&inbox.ingest_key, inbox.record_seq)?.unwrap_or(record.product_code),
         club_number: record.stick_no,
         measured_at: inbox.received_at,
         overall_result: result(record.overall_result),
@@ -139,6 +194,13 @@ impl InboxService {
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
         SourceRepository::lock(&mut tx, source).await?;
         let inbox = InboxRepository::lock(&mut tx, id).await?;
+        if inbox.ingest_key.starts_with(RAW_UNDECODED_KEY)
+            || inbox.ingest_key.starts_with(LEGACY_RAW_ZERO_KEY)
+            || inbox.ingest_key.starts_with(LEGACY_RAW_INVALID_KEY)
+            || inbox.ingest_key.starts_with(RAW_UNINITIALIZED_KEY)
+        {
+            return Err("Không gán phiên đo cho raw chưa giải mã; chỉ delivery hợp lệ mới được xử lý thành measurement.".into());
+        }
         if let Some(existing) = inbox.session_id {
             if existing == session {
                 tx.commit().await.map_err(|e| e.to_string())?;

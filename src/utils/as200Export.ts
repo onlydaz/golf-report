@@ -3,7 +3,7 @@ import ExcelJS from "exceljs";
 import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
-import { buildReportTables, isUnmeasuredPoint } from "./as200Report";
+import { buildReportTables, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
 
 type ExportValue = string | number;
 type ExportRow = Record<string, ExportValue>;
@@ -75,10 +75,11 @@ export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[])
       if (!item.stations.length) return [base];
       return item.stations.flatMap(station => {
         const stationRow = { ...base, StationType: station.stationType, "Station Load (g)": station.load, "Station Result": station.result };
-        if (!station.points.length) return [stationRow];
-        return station.points.flatMap(point => {
+        const points = station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber));
+        if (!points.length) return [stationRow];
+        return points.flatMap(point => {
           const pointRow = { ...stationRow, PointNumber: point.pointNumber, "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
-            Result: point.result, AttemptCount: point.attemptCount, DecideAttempt: point.decideAttempt ?? "" };
+            Result: displayPointResult(station, point), AttemptCount: point.attemptCount, DecideAttempt: point.decideAttempt ?? "" };
           return point.attempts.length ? point.attempts.map(attempt => ({ ...pointRow,
             AttemptNumber: attempt.attemptNumber, "PushDist (mm)": attempt.pushDist ?? "", "Bend (mm)": attempt.bend ?? "",
           })) : [pointRow];

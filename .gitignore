@@ -31,3 +31,5 @@ as200_capture_journal.*.backup.json
 as200_capture_journal.json
 as200_capture_journal.tmp
 as200_capture_journal.lock
+/plc-connection-events.json
+/plc-connection-events.*.tmp

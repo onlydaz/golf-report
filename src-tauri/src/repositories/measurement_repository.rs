@@ -657,7 +657,7 @@ impl MeasurementRepository {
         let list = Self::list(pool, request).await?;
         let ids: Vec<_> = list.items.iter().map(|m| m.id).collect();
         // One bounded query for decision values on this page, not one request per club.
-        let points: Vec<HistoryDecisionPoint> = sqlx::query_as("SELECT s.measurement_id,s.station_type AS station,p.point_number,CASE WHEN p.attempt_count>0 AND p.result IN ('OK','NG') THEN a.bend ELSE NULL END AS bend FROM measurement_stations s JOIN measurement_points p ON p.station_id=s.id LEFT JOIN measurement_attempts a ON a.point_id=p.id AND a.attempt_number=p.decide_attempt AND p.decide_attempt BETWEEN 1 AND p.attempt_count WHERE s.measurement_id=ANY($1) ORDER BY s.measurement_id,s.station_type,p.point_number")
+        let points: Vec<HistoryDecisionPoint> = sqlx::query_as("SELECT s.measurement_id,s.station_type AS station,p.point_number,CASE WHEN p.attempt_count>0 AND p.result IN ('OK','NG') THEN a.bend ELSE NULL END AS bend FROM measurement_stations s JOIN measurement_points p ON p.station_id=s.id LEFT JOIN measurement_attempts a ON a.point_id=p.id AND a.attempt_number=p.decide_attempt AND p.decide_attempt BETWEEN 1 AND p.attempt_count WHERE s.measurement_id=ANY($1) AND ((s.station_type='TIP' AND p.point_number=1) OR (s.station_type='BUTT' AND p.point_number BETWEEN 1 AND 4)) ORDER BY s.measurement_id,s.station_type,p.point_number")
             .bind(&ids).fetch_all(pool).await.map_err(|e| e.to_string())?;
         let mut grouped = std::collections::HashMap::<i64, Vec<HistoryDecisionPoint>>::new();
         for point in points {
@@ -688,10 +688,17 @@ impl MeasurementRepository {
         pool: &PgPool,
         request: &MeasurementListRequest,
     ) -> Result<MeasurementQualityStatistics, String> {
-        let mut q = QueryBuilder::<Postgres>::new("WITH filtered AS (SELECT m.id,m.product_code");
+        let mut q = QueryBuilder::<Postgres>::new("WITH filtered AS (SELECT m.id,m.product_code,m.measured_at,m.overall_result,(m.product_code='DEMO-AS200' AND EXISTS(SELECT 1 FROM plc_sources ps WHERE ps.id=m.source_id AND ps.source_key='golf-report-simulator')) AS simulator_demo");
         q.push(JOINS);
         filter(&mut q, request);
-        q.push(r#"), samples AS (
+        q.push(r#"), half_hour AS (
+            SELECT to_timestamp(floor(extract(epoch FROM measured_at)/1800)*1800) AS at,
+                count(*) FILTER(WHERE overall_result='OK') AS ok,
+                count(*) FILTER(WHERE overall_result='NG') AS ng
+            FROM filtered GROUP BY 1
+        ), demo_scope AS (
+            SELECT count(*)>0 AND coalesce(bool_and(simulator_demo),false) AS valid FROM filtered
+        ), samples AS (
             SELECT m.id AS measurement_id,m.product_code,s.station_type AS station,
                 p.point_number,p.position,p.result,p.attempt_count,s.load,a.push_dist,a.bend
             FROM filtered m
@@ -701,9 +708,11 @@ impl MeasurementRepository {
                 AND a.attempt_number=p.decide_attempt
                 AND p.decide_attempt BETWEEN 1 AND p.attempt_count
             WHERE p.attempt_count>0 AND p.result IN ('OK','NG')
+                AND ((s.station_type='TIP' AND p.point_number=1)
+                    OR (s.station_type='BUTT' AND p.point_number BETWEEN 1 AND 4))
         ), grouped AS (
             SELECT product_code,station,point_number,position,count(*) AS measured,
-                count(*) FILTER(WHERE result='NG') AS ng,
+                count(DISTINCT measurement_id) FILTER(WHERE result='NG') AS ng,
                 count(*) FILTER(WHERE attempt_count>1) AS retested,
                 avg(load)::text AS load_avg,avg(push_dist)::text AS push_dist_avg,
                 count(bend) AS bend_count,min(bend) AS bend_min,avg(bend) AS bend_avg,
@@ -730,13 +739,36 @@ impl MeasurementRepository {
             SELECT bend FROM samples
             WHERE station='BUTT' AND point_number BETWEEN 1 AND 4 AND bend IS NOT NULL
         ), butt_range AS (
-            SELECT count(*) AS amount,min(bend) AS lo,max(bend) AS hi FROM butt_samples
+            SELECT count(*) AS amount,min(bend) AS lo,max(bend) AS hi,
+                avg(bend)::text AS mean,stddev_samp(bend)::text AS stddev FROM butt_samples
         ), butt_bins AS (
             SELECT CASE WHEN r.hi=r.lo THEN 0 ELSE
                 least(9,greatest(0,floor((s.bend-r.lo)*10/nullif(r.hi-r.lo,0))::int)) END AS bin,
                 count(*) AS amount
             FROM butt_samples s CROSS JOIN butt_range r GROUP BY bin
+        ), demo_binned AS (
+            SELECT CASE WHEN r.hi=r.lo THEN 0 ELSE
+                least(9,greatest(0,floor((s.bend-r.lo)*10/nullif(r.hi-r.lo,0))::int)) END AS bin,
+                CASE WHEN s.bend<0 THEN 'BELOW' WHEN s.bend>2 THEN 'ABOVE' ELSE 'WITHIN' END AS zone,
+                count(*) AS amount
+            FROM butt_samples s CROSS JOIN butt_range r
+            WHERE (SELECT valid FROM demo_scope) GROUP BY bin,zone
+        ), demo_intervals AS (
+            SELECT b.*,r.hi,
+                CASE WHEN r.lo=r.hi THEN r.lo ELSE r.lo+(r.hi-r.lo)*b.bin/10 END AS bin_lo,
+                CASE WHEN r.lo=r.hi THEN r.hi ELSE r.lo+(r.hi-r.lo)*(b.bin+1)/10 END AS bin_hi
+            FROM demo_binned b CROSS JOIN butt_range r
         ) SELECT jsonb_build_object(
+            'halfHour',coalesce((SELECT jsonb_agg(jsonb_build_object('at',at,'ok',ok,'ng',ng) ORDER BY at) FROM half_hour),'[]'::jsonb),
+            'demoLimits',CASE WHEN (SELECT valid FROM demo_scope) THEN jsonb_build_object('lower','0','upper','2') ELSE NULL END,
+            'demoHistogram',coalesce((SELECT jsonb_agg(jsonb_build_object(
+                'lower',(CASE WHEN zone='BELOW' THEN bin_lo WHEN zone='WITHIN' THEN greatest(bin_lo,0) ELSE greatest(bin_lo,2) END)::text,
+                'upper',(CASE WHEN zone='ABOVE' THEN bin_hi WHEN zone='WITHIN' THEN least(bin_hi,2) ELSE least(bin_hi,0) END)::text,
+                'count',amount,'zone',zone,
+                'lowerInclusive',zone<>'ABOVE' OR bin_lo>2,
+                'upperInclusive',(zone='WITHIN' AND bin_hi>=2) OR (bin_hi=hi AND NOT(zone='BELOW' AND bin_hi>=0))
+                ) ORDER BY bin,CASE zone WHEN 'BELOW' THEN 0 WHEN 'WITHIN' THEN 1 ELSE 2 END) FROM demo_intervals),'[]'::jsonb),
+            'buttSummary',(SELECT jsonb_build_object('count',amount,'mean',mean,'stddev',stddev) FROM butt_range),
             'retestedClubs',(SELECT count(DISTINCT measurement_id) FROM samples WHERE attempt_count>1),
             'buttHistogram',coalesce((SELECT jsonb_agg(jsonb_build_object(
                 'lower',(CASE WHEN r.lo=r.hi THEN r.lo ELSE r.lo+(r.hi-r.lo)*bins.n/10 END)::text,

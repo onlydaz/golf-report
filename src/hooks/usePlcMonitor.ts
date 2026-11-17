@@ -28,7 +28,7 @@ export function getPlcDisplayStatus(status: As200Status | undefined, error: stri
     || status.pcHeartbeatStatus === "FAILED" || status.latest?.saveState === "FAILED" || status.blockedInboxCount > 0
     || status.enabled && (disconnected || status.plcHealth === "STALE" || status.plcHealth === "INVALID_DATA")
   );
-  const collectionLabel = failed ? "Có lỗi" : !status ? "Chưa xác định" : status.state === "STOPPING" ? "Đang dừng"
+  const collectionLabel = failed ? "Có lỗi" : status?.state === "RAW_UNDECODED" ? "Đã nhận raw, chờ giải mã" : !status ? "Chưa xác định" : status.state === "STOPPING" ? "Đang dừng"
     : !status?.enabled ? "Đã dừng" : verified ? "Đang thu dữ liệu" : "Chờ xác minh / kết nối";
   return { verified, failed, plcLabel, collectionLabel,
     plcColor: verified ? "green" : error || disconnected || invalid ? "red" : "default",

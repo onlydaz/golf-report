@@ -267,6 +267,12 @@
 .monitor-kicker { color: #486581; font-size: 17px; font-weight: 600; margin-bottom: 8px; letter-spacing: .03em; }
 .monitor-sku { order: 1; }
 .monitor-sku-value { display: block; font-size: 20px; color: #243b53; overflow-wrap: anywhere; line-height: 1.25; }
+.monitor-sku-editor { margin-top: 6px; min-width: 0; }
+.monitor-sku-editor .ant-input-affix-wrapper { padding: 7px 10px; border-radius: 8px; }
+.monitor-sku-editor .ant-input { font-size: 18px; font-weight: 600; }
+.monitor-sku-editor .ant-input-suffix { color: #627d98; }
+.monitor-sku-error { display: block; margin-top: 6px; color: #b42318; font-size: 13px; line-height: 1.4; }
+.monitor-sku-notice { display: block; margin-top: 6px; color: #19764d; font-size: 13px; line-height: 1.4; }
 .monitor-count small { font-size: 13px; line-height: 1.5; display: block; color: #627d98; margin: 7px 0 0; }
 .monitor-top-grid .add-measurement-plc-card { order: 2; margin-bottom: 0; }
 .monitor-count-ok { order: 3; background: #19764d; border-color: #19764d; }
@@ -312,12 +318,14 @@
 .monitor-full-detail .measurement-details { display: flex; flex-direction: column; gap: 12px; }
 .monitor-page .ant-card-head { min-height: 46px; padding-inline: 16px; }
 .monitor-page .ant-card-head-title { font-size: 18px; font-weight: 600; white-space: normal; }
-.monitor-chart-settings { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; }
-.monitor-chart-settings > span { background: #eef3f7; border-radius: 6px; padding: 8px; font-size: 13px; color: #627d98; }
-.monitor-chart-settings b { display: block; color: #334e68; margin-top: 3px; }
-.monitor-chart-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 0; font-size: 13px; color: #627d98; }
-.monitor-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
-.monitor-chart-legend i { width: 14px; height: 3px; border-radius: 2px; }
+.monitor-chart-settings { display: grid; grid-template-columns: minmax(80px,.9fr) minmax(90px,1fr) minmax(105px,1.1fr) minmax(145px,1.5fr); gap: 4px; overflow-x: auto; }
+.monitor-chart-settings > span { min-width: 0; background: #eef3f7; border-radius: 6px; padding: 6px; font-size: 13px; line-height: 1.45; color: #627d98; }
+.monitor-chart-settings b { display: block; color: #334e68; margin-top: 3px; font-size: 13px; white-space: nowrap; }
+.monitor-chart-legend { display: flex; flex-wrap: nowrap; gap: 10px; margin: 14px 0 0; padding-bottom: 4px; overflow-x: auto; font-size: 13px; color: #627d98; }
+.monitor-chart-legend span { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; white-space: nowrap; }
+.monitor-chart-legend i { flex-shrink: 0; width: 14px; height: 3px; border-radius: 2px; }
+.monitor-chart-legend .monitor-limit-dot { width: 9px; height: 9px; border-radius: 50%; background: #d92d20; }
+.monitor-bend-tooltip { max-width: 310px; padding: 10px 12px; background: white; border: 1px solid #dce5ed; border-radius: 8px; font-size: 13px; line-height: 1.7; color: #334e68; box-shadow: 0 3px 12px #102a4314; }
 .monitor-bend-chart { width: 100%; min-width: 0; height: 260px; margin-top: 12px; }
 .monitor-chart-empty { display: flex; flex-direction: column; justify-content: center; min-height: 230px; padding: 24px 16px; margin-top: 12px; border-left: 1px solid #dce5ed; border-bottom: 1px solid #dce5ed; background: repeating-linear-gradient(to top, transparent 0, transparent 49px, #edf2f7 50px); }
 .monitor-chart-empty .monitor-caption { text-align: center; }

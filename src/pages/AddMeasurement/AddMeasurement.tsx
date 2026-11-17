@@ -9,11 +9,12 @@ import {
   Tag,
   message,
   InputNumber,
+  Input,
 } from "antd";
 
 import { useEffect, useState } from "react";
 import { useRef } from "react";
-import { PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
+import { EditOutlined, LoadingOutlined, PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
 import { getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
 import PageHeader from "../../components/PageHeader";
 import { BendComparison, CurrentPointTable, ProductionSummary, RecentMeasurements } from "./MonitorPanels";
@@ -24,7 +25,7 @@ import {
 } from "../../services/as200Service";
 
 import "./AddMeasurement.css";
-import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, stopPlcCollection } from "../../services/plcConnectionService";
+import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, saveOperatorSku, stopPlcCollection } from "../../services/plcConnectionService";
 import { reconnectAs200Plc } from "../../services/as200Service";
 
 import {
@@ -37,6 +38,12 @@ import {
 } from "../../services/measurementService";
 
 function displayNotice(notice: string, fallback: string): string {
+  if (/^(?:PUBLISHED_DATA:\s*)?Bản ghi PLC chưa hoàn chỉnh hoặc lỗi giải mã:/.test(notice)) {
+    return notice.replace(/^PUBLISHED_DATA:\s*/, "");
+  }
+  if (/raw chưa giải mã|raw chính thức|RAW_UNDECODED/i.test(notice)) {
+    return notice.replace(/^PUBLISHED_DATA:\s*/, "");
+  }
   if (notice.startsWith("Chưa thiết lập kết nối")) return "Chưa thiết lập kết nối. Vào Kết nối PLC để nhập thông tin thiết bị đo.";
   if (/Cần kỹ thuật xác nhận thông số|Chưa xác nhận thiết lập kỹ thuật/.test(notice)) return "Chưa bật ghi nhận kết quả đo.";
   if (/SESSION_REQUEST_CANCELLED/.test(notice)) { return "Đã hủy yêu cầu đổi phiên và giữ nguyên dữ liệu, trạng thái xác nhận của phiên cũ."; }
@@ -203,6 +210,50 @@ function AddMeasurement() {
   const [collectionError, setCollectionError] = useState("");
   const [collectionAction, setCollectionAction] = useState<"stop" | "start" | "reconnect" | null>(null);
   const collectionInFlight = useRef(false);
+  const [skuDraft, setSkuDraft] = useState("");
+  const [skuSaving, setSkuSaving] = useState(false);
+  const [skuError, setSkuError] = useState("");
+  const [skuNotice, setSkuNotice] = useState("");
+  const [savedSku, setSavedSku] = useState<string>();
+  const skuInFlight = useRef(false);
+  const defaultSkuAttempted = useRef(false);
+  useEffect(() => {
+    setSavedSku(settings?.operatorSku ?? undefined);
+    setSkuDraft(settings?.operatorSku ?? "");
+  }, [settings?.operatorSku]);
+  const skuLocked = !settings || !status || !!status.enabled || status.connection === "CONNECTED"
+    || status?.state === "STOPPING" || !!collectionAction || skuSaving;
+  const persistSku = async (draft = skuDraft) => {
+    const value = draft.trim();
+    if (!value) throw "Nhập mã SKU trước khi kết nối PLC.";
+    if (value !== savedSku) {
+      const saved = await saveOperatorSku(value);
+      setSavedSku(saved.operatorSku ?? undefined);
+    }
+    setSkuDraft(value);
+  };
+  const saveSku = async (draft = skuDraft) => {
+    if (skuLocked || skuInFlight.current || collectionInFlight.current) return;
+    if (draft.trim() === savedSku) { setSkuDraft(savedSku); return; }
+    skuInFlight.current = true; setSkuSaving(true); setSkuError(""); setSkuNotice("");
+    try {
+      await persistSku(draft);
+      setSkuNotice("Đã lưu SKU.");
+      await refreshWorker().catch(() => undefined);
+    }
+    catch (reason) {
+      setSkuDraft(savedSku ?? "");
+      setSkuError(plcConnectionError(reason, "Không thể lưu SKU; cần ngắt kết nối an toàn và xử lý dữ liệu đang chờ."));
+    }
+    finally { skuInFlight.current = false; setSkuSaving(false); }
+  };
+  useEffect(() => {
+    if (!settings || settings.operatorSku || savedSku || skuDraft.trim() || skuLocked || !databaseConnected || defaultSkuAttempted.current) return;
+    // The default uses the same backend Journal/Inbox/ACK checks as a QC edit.
+    // A failed safety check leaves operator_sku unchanged and shows the reason.
+    defaultSkuAttempted.current = true;
+    void saveSku("GOLD-X1");
+  }, [settings, savedSku, skuDraft, skuLocked, databaseConnected]);
   const [retryId, setRetryId] = useState<number | null>(null);
   const [messageApi, holder] = message.useMessage();
   const [recent, setRecent] = useState<MeasurementHistoryItem[]>([]);
@@ -216,11 +267,7 @@ function AddMeasurement() {
   const [monitorLoading, setMonitorLoading] = useState(false);
   const [monitorError, setMonitorError] = useState("");
   const [refreshIndex, setRefreshIndex] = useState(0);
-  const currentSku = status?.latest
-    && status.latest.sourceKey === status.sourceKey
-    && status.latest.sessionId === status.sessionId
-    && status.latest.productCode.trim()
-    ? status.latest.productCode : undefined;
+  const currentSku = savedSku || undefined;
   const skuStatistics = databaseConnected && currentSku && statistics?.productCode === currentSku
     ? statistics.value : undefined;
   const recentPage = recentPagination.sku === currentSku ? recentPagination.page : 1;
@@ -290,7 +337,7 @@ function AddMeasurement() {
           : status.connection === "DISCONNECTED" ? "Mất kết nối PLC"
             : status.enabled && status.connection === "CONNECTED" ? "Đang thu" : status.enabled ? "Đang kết nối lại" : "Chưa bắt đầu";
   const changeCollection = async (action: "stop" | "start" | "reconnect") => {
-    if (collectionInFlight.current) return;
+    if (collectionInFlight.current || skuInFlight.current) return;
     collectionInFlight.current = true;
     setCollectionAction(action);
     setCollectionError("");
@@ -298,11 +345,14 @@ function AddMeasurement() {
       if (action === "stop") await stopPlcCollection();
       else if (action === "reconnect") await reconnectAs200Plc();
       else {
+        // Without a saved SKU, backend may still allow recovery of old deliveries.
+        // It rejects new collection until QC has safely saved a SKU.
+        if (skuDraft.trim() || settings?.operatorSku) await persistSku();
         const current = await getPlcConnectionSettings();
-        if (!current.configured || !current.endpoint || current.restartRequired) {
+        if (!current.configured || !current.endpoint) {
           throw "Chưa có cấu hình kết nối có thể tiếp tục an toàn.";
         }
-        await connectPlcCollection(current.endpoint, current.revision);
+        await connectPlcCollection();
       }
       const next = await refreshWorker();
       if (action === "reconnect" && (next.connection !== "CONNECTED" || next.pauseReason)) {
@@ -347,6 +397,8 @@ function AddMeasurement() {
       systemNotice = "Cần kỹ thuật đối chiếu xác nhận từ PLC. Dữ liệu chờ được giữ nguyên.";
     } else if (status.ackStatus === "FAILED") {
       systemNotice = "Chưa nhận được xác nhận đã đọc từ PLC. Vui lòng liên hệ kỹ thuật nếu cảnh báo kéo dài.";
+    } else if (status.state === "RAW_UNDECODED") {
+      systemNotice = status.message;
     } else if (["ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || status.pauseReason) {
       systemNotice = displayNotice(status.message, states[status.state] ?? "Có lỗi cần kiểm tra.");
     } else if (latest?.saveState === "FAILED") {
@@ -458,7 +510,17 @@ function AddMeasurement() {
 
       <div className="monitor-top-grid">
       <ProductionSummary productCode={currentSku}
-        statistics={skuStatistics} loading={monitorLoading} />
+        statistics={skuStatistics} loading={monitorLoading}
+        skuEditor={<div className="monitor-sku-editor">
+          <Input value={skuDraft} placeholder="Nhập mã SKU" maxLength={50} aria-label="SKU QC đang chạy"
+            disabled={skuLocked} status={skuError ? "error" : undefined}
+            suffix={skuSaving ? <LoadingOutlined spin /> : <EditOutlined />}
+            onChange={event => { setSkuDraft(event.target.value); setSkuNotice(""); }}
+            onPressEnter={event => { if (!event.nativeEvent.isComposing) void saveSku(); }}
+            onBlur={() => void saveSku()} />
+          {skuError && <span className="monitor-sku-error" role="alert">{skuError}</span>}
+          {!skuError && skuNotice && <span className="monitor-sku-notice" role="status">{skuNotice}</span>}
+        </div>} />
       <Card className="section-card add-measurement-plc-card">
         <div className="add-measurement-plc-main">
           <div className="add-measurement-plc-copy">
@@ -471,7 +533,7 @@ function AddMeasurement() {
               <Button danger icon={<PauseCircleOutlined />} loading={collectionAction === "stop"} disabled={!!collectionAction} onClick={() => void changeCollection("stop")}>Dừng thu dữ liệu</Button>}
             {status?.enabled && status.connection === "DISCONNECTED" && !status.pauseReason &&
               <Button icon={<WifiOutlined />} loading={collectionAction === "reconnect"} disabled={!!collectionAction} onClick={() => void changeCollection("reconnect")}>Kết nối lại PLC</Button>}
-            {safelyStopped && settings?.configured && settings.endpoint && !settings.restartRequired &&
+            {safelyStopped && settings?.configured && settings.endpoint &&
               <Button type="primary" icon={<PlayCircleOutlined />} loading={collectionAction === "start"} disabled={!!collectionAction} onClick={() => void changeCollection("start")}>Bắt đầu thu dữ liệu</Button>}
           </div>
         </div>
@@ -505,9 +567,17 @@ function AddMeasurement() {
         {detailError && <Alert type="error" showIcon message={detailError} />}
         <CurrentPointTable detail={activeDetail} loading={detailLoading} />
       </Card>
-      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError} />
+      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError}
+        simulatorSourceId={status?.sourceKey === "golf-report-simulator"
+          && settings?.endpoint.ip === "127.0.0.1" && settings.endpoint.port === 1503
+          && !!activeDetail && activeDetail.productCode === currentSku ? activeDetail.sourceId : undefined} />
       </div>
 
+      {status?.rawCapture && <Alert
+        className="add-measurement-plc-error" type={status.ackStatus === "ACKNOWLEDGED" ? "info" : "warning"} showIcon
+        message={`Đã lưu raw 240 WORD vào Inbox #${status.rawCapture.inboxId}; chưa tạo measurement. ${status.ackStatus === "ACKNOWLEDGED" ? "PLC đã xác nhận ACK." : status.ackStatus === "DISABLED" ? "ACK đã tắt." : "ACK đang chờ hoặc cần đối chiếu."}`}
+        description={<span title={status.rawCapture.rawRegisters.join(", ")}>D25020–D25259: {status.rawCapture.rawRegisters.join(", ")}. Raw chính thức được giữ để đối chiếu; không đi vào thống kê OK/NG khi chưa đủ cấu trúc.</span>}
+      />}
       {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && !duplicateStorageNotice && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
         type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
         showIcon

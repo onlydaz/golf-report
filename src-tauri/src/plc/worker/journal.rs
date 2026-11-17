@@ -8,6 +8,31 @@ pub(super) struct Delivery {
     pub(super) terminal: bool,
 }
 
+impl Delivery {
+    pub(super) fn raw_publication(&self) -> bool {
+        self.input.ingest_key.starts_with("raw-published-v1:ack:")
+    }
+
+    pub(super) fn ack_target(&self) -> i32 {
+        if self.raw_publication() {
+            self.input.total_count.and_then(|n| i32::try_from(n).ok()).unwrap_or(-1)
+        } else {
+            self.input.record_seq
+        }
+    }
+
+    fn belongs_to(&self, session: &Option<String>) -> bool {
+        if self.raw_publication() {
+            self.input.confirmed_session_id.is_none() && session.as_deref().is_some_and(|session| {
+                self.input.ingest_key == format!("{}{}",
+                    crate::services::inbox_service::raw_ack_prefix(session), self.ack_target())
+            })
+        } else {
+            self.input.confirmed_session_id == *session
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct QuarantinedRecord {
     #[serde(default)]
@@ -61,7 +86,7 @@ pub(super) struct Journal {
 pub(super) struct PublishedAckProgress {
     pub(super) binding: String,
     pub(super) accepted: i32,
-    /// Last confirmed, processed receipt: retained even after compacting deliveries.
+    /// Last committed raw receipt confirmed by PLC, retained after compaction.
     pub(super) confirmed_receipt: Option<Delivery>,
     /// ACK_CONFIRMED is retained until a subsequent prepared intent replaces it.
     pub(super) intent: Option<PublishedAckIntent>,
@@ -90,8 +115,8 @@ impl Journal {
             None if progress.accepted == 0 => {}
             Some(receipt)
                 if progress.accepted > 0
-                    && receipt.input.record_seq == progress.accepted
-                    && receipt.input.confirmed_session_id == self.session_id
+                    && receipt.ack_target() == progress.accepted
+                    && receipt.belongs_to(&self.session_id)
                     && receipt.input.buffer_index == 0
                     && receipt.inbox_id.is_some()
                     && receipt.input.word_order == config.word_order
@@ -104,9 +129,9 @@ impl Journal {
         }
         let mut seen = std::collections::HashSet::new();
         if self.deliveries.iter().any(|d| {
-            d.input.confirmed_session_id != self.session_id
-                || d.input.record_seq <= progress.accepted
-                || !seen.insert(d.input.record_seq)
+            !d.belongs_to(&self.session_id)
+                || d.ack_target() <= progress.accepted
+                || !seen.insert(d.ack_target())
         }) {
             return Err("Journal v4 có receipt trùng, sai phiên hoặc nằm trước checkpoint.".into());
         }
@@ -116,7 +141,7 @@ impl Journal {
             } else {
                 self.deliveries
                     .iter()
-                    .find(|d| d.input.record_seq == intent.target)
+                    .find(|d| d.ack_target() == intent.target)
             }
             .ok_or("ACK Bản ghi 1: intent thiếu receipt.")?;
             let expected = if intent.phase == PublishedAckPhase::AckConfirmed {
@@ -126,7 +151,7 @@ impl Journal {
             };
             if expected != Some(intent.target)
                 || receipt.inbox_id != Some(intent.inbox_id)
-                || receipt.input.record_seq != intent.target
+                || receipt.ack_target() != intent.target
                 || receipt.input.raw_registers != intent.raw_registers
                 || (intent.phase == PublishedAckPhase::AckConfirmed && !intent.observed_done_high)
                 || (intent.observed_done_high
@@ -220,7 +245,6 @@ impl Engine {
             || config.pc_heartbeat_enabled
             || config.allow_plc_heartbeat_write
             || config.confirmed_session_id.is_none()
-            || config.session_transition.is_some()
         {
             return Err("Published ACK cần cấu hình AS200 đã xác nhận, SourceKey/Session rõ ràng và tắt ghi PC Heartbeat. Không tự chuyển phiên hoặc cấp quyền ghi.".into());
         }
@@ -303,7 +327,8 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        std::fs::rename(tmp,&self.path).map_err(|e|format!("Không lưu được journal: {e}. Dữ liệu chưa vào inbox có nguy cơ mất khi ứng dụng đóng."))
+        replace_file(&tmp, &self.path)
+            .map_err(|e| format!("Không lưu được journal: {e}. Dữ liệu chưa vào inbox có nguy cơ mất khi ứng dụng đóng."))
     }
 
     pub(super) fn warn(journal: &mut Journal, message: String) {
@@ -325,5 +350,40 @@ impl Engine {
         }
         *journal = next;
         Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }

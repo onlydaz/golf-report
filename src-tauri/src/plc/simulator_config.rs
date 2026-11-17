@@ -27,18 +27,6 @@ pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionTransition {
-    pub previous_session_id: Option<String>,
-    // Preserve the legacy TOML key; Published ACK v4 rejects session_transition before collection.
-    #[serde(rename = "previous_total_count")]
-    pub _previous_total_count: Option<i32>,
-    pub previous_ack_count: i32,
-    pub expected_total_count: i32,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SimulatorConfig {
     pub layout_profile: String,
@@ -51,7 +39,6 @@ pub struct SimulatorConfig {
     pub plc_heartbeat_timeout_ms: Option<u64>,
     pub pc_heartbeat_enabled: bool,
     pub allow_plc_heartbeat_write: bool,
-    pub session_transition: Option<SessionTransition>,
     pub retry_max_attempts: u32,
     pub retry_max_delay_ms: u64,
     pub enabled: bool,
@@ -60,6 +47,7 @@ pub struct SimulatorConfig {
     pub ack_enabled: bool,
     pub ack_protocol: Option<String>,
     pub address: String,
+    pub plc_local_ip: Option<std::net::IpAddr>,
     pub unit_id: u8,
     pub source_key: String,
     pub confirmed_session_id: Option<String>,
@@ -70,6 +58,7 @@ pub struct SimulatorConfig {
     pub retry_interval_ms: u64,
     pub max_queue: usize,
     pub journal_path: Option<PathBuf>,
+    pub operator_sku: Option<String>,
 }
 impl Default for SimulatorConfig {
     fn default() -> Self {
@@ -84,7 +73,6 @@ impl Default for SimulatorConfig {
             plc_heartbeat_timeout_ms: None,
             pc_heartbeat_enabled: false,
             allow_plc_heartbeat_write: false,
-            session_transition: None,
             retry_max_attempts: 8,
             retry_max_delay_ms: 60000,
             enabled: false,
@@ -103,10 +91,59 @@ impl Default for SimulatorConfig {
             retry_interval_ms: 2000,
             max_queue: 128,
             journal_path: None,
+            operator_sku: None,
+            plc_local_ip: None,
         }
     }
 }
 impl SimulatorConfig {
+    /// Diagnostic only: passing configuration checks does not prove receipt/PLC ACK success.
+    pub(super) fn ack_config_block_reason(&self) -> Option<&'static str> {
+        if !self.ack_enabled {
+            Some("ack_enabled=false trong cấu hình đã nạp; sửa TOML không cập nhật Worker đang chạy, cần dừng thu và khởi động lại ứng dụng")
+        } else if self.read_only {
+            Some("read_only=true không cho phép ghi ACK")
+        } else if !self.technical_setup_confirmed {
+            Some("technical_setup_confirmed=false; chưa xác nhận thiết lập kỹ thuật")
+        } else if !self.allow_plc_connection {
+            Some("allow_plc_connection=false; chưa cấp quyền kết nối/ghi")
+        } else if self.confirmed_session_id.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            Some("confirmed_session_id chưa được cấu hình hợp lệ")
+        } else if self.pc_heartbeat_enabled || self.allow_plc_heartbeat_write {
+            Some("Published Record yêu cầu tắt mọi quyền ghi PC Heartbeat")
+        } else if self.ack_protocol.as_deref() != Some("as200") {
+            Some("ack_protocol chưa được xác nhận là as200")
+        } else if !ack_scope_allows(self) {
+            Some("ACK scope không phù hợp: cần mode=modbus, profile as200-published-v1, LOW, offset=0, D25000, 240 WORD và 2 buffer do PLC quản lý")
+        } else {
+            None
+        }
+    }
+
+    // Timing, source IP and a safely stopped operator SKU may be saved separately;
+    // identity, map and write permissions need an app restart.
+    pub(super) fn same_environment(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.unit_id == other.unit_id
+            && self.mode == other.mode
+            && self.source_key == other.source_key
+            && self.confirmed_session_id == other.confirmed_session_id
+            && self.journal_path == other.journal_path
+            && self.layout_profile == other.layout_profile
+            && self.control_start == other.control_start
+            && self.buffer_count == other.buffer_count
+            && self.record_size == other.record_size
+            && self.word_order == other.word_order
+            && self.modbus_address_offset == other.modbus_address_offset
+            && self.read_only == other.read_only
+            && self.ack_enabled == other.ack_enabled
+            && self.ack_protocol == other.ack_protocol
+            && self.allow_plc_connection == other.allow_plc_connection
+            && self.technical_setup_confirmed == other.technical_setup_confirmed
+            && self.pc_heartbeat_enabled == other.pc_heartbeat_enabled
+            && self.allow_plc_heartbeat_write == other.allow_plc_heartbeat_write
+    }
+
     /// Resolve runtime state relative to its owning configuration, including legacy defaults.
     pub(super) fn journal_file(&self, configuration: &Path) -> PathBuf {
         let journal = self
@@ -130,6 +167,9 @@ impl SimulatorConfig {
             .address
             .parse()
             .map_err(|_| "Address cần IP:port cụ thể")?;
+        if let Some(ip) = self.plc_local_ip {
+            super::as200::validate_local_ip(address, ip)?;
+        }
         if address.port() == 0
             || !(1..=247).contains(&self.unit_id)
             || !(100..=30000).contains(&self.timeout_ms)
@@ -174,12 +214,15 @@ impl SimulatorConfig {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.validate_read()?;
+        if let Some(sku) = &self.operator_sku {
+            crate::services::inbox_service::validate_operator_sku(sku)?;
+        }
         if self.read_only
             && (self.ack_enabled || self.pc_heartbeat_enabled || self.allow_plc_heartbeat_write)
         {
             return Err("Chế độ chỉ đọc không cho phép ACK hoặc ghi heartbeat.".into());
         }
-        if self.mode == "modbus" && !self.technical_setup_confirmed {
+        if self.mode == "modbus" && !self.technical_setup_confirmed && !self.read_only {
             return Err("Chưa xác nhận thiết lập kỹ thuật; chưa cho phép thu dữ liệu".into());
         }
         if self
@@ -196,19 +239,6 @@ impl SimulatorConfig {
             && (!self.allow_plc_heartbeat_write || !self.allow_plc_connection)
         {
             return Err("Chưa cho phép ghi PC_Heartbeat trên PLC thật".into());
-        }
-        if let Some(change) = &self.session_transition {
-            if self.confirmed_session_id.is_none()
-                || change.previous_session_id == self.confirmed_session_id
-                || change.reason.trim().is_empty()
-                || !(0..=2).contains(&change.expected_total_count)
-                || change.previous_ack_count < 0
-            {
-                return Err(
-                    "Đối chiếu phiên cần phiên mới, lý do và bộ đếm cụ thể (0..2 record đang chờ)"
-                        .into(),
-                );
-            }
         }
         if self.ack_enabled
             && !match self.mode.as_str() {
@@ -270,6 +300,9 @@ impl SimulatorConfig {
             timeout: Duration::from_millis(self.timeout_ms),
         }
     }
+    pub fn plc_reader(&self) -> super::as200::reader::As200Reader {
+        super::as200::reader::As200Reader::new(self.reader()).with_local_ip(self.plc_local_ip)
+    }
     pub fn heartbeat_timeout(&self) -> Option<Duration> {
         // 5 giây chỉ là policy fixture; không kế thừa ngưỡng này sang PLC thật.
         self.plc_heartbeat_timeout_ms
@@ -306,25 +339,25 @@ pub fn load(app_directory: Option<&Path>) -> Result<Option<(SimulatorConfig, Pat
         return Ok(None);
     };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("Đọc cấu hình AS200: {e}"))?;
-    let config = parse(&text)?;
+    let config = parse(&text).map_err(|error| {
+        eprintln!("AS200_CONFIG_REJECTED pid={} path={} reason={error}", std::process::id(), path.display());
+        error
+    })?;
     let journal = config.journal_file(&path);
+    let resolved_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    eprintln!(
+        "AS200_CONFIG_LOADED pid={} path={} address={} unit={} ack_enabled={} read_only={} technical_setup_confirmed={} allow_plc_connection={} source={} session={:?} journal={} ack_config_reason={}",
+        std::process::id(), resolved_path.display(), config.address, config.unit_id,
+        config.ack_enabled, config.read_only, config.technical_setup_confirmed,
+        config.allow_plc_connection, config.source_key, config.confirmed_session_id,
+        journal.display(), config.ack_config_block_reason().unwrap_or("Cấu hình ACK đủ điều kiện; vẫn phải xác minh Journal/Session, RESET, snapshot, heartbeat và receipt PROCESSED trước khi ghi")
+    );
     Ok(Some((config, journal)))
 }
 
-/// Read historical configuration without granting any former DEMO reset capability.
-/// All other unknown fields remain rejected when deserializing SimulatorConfig.
-pub(super) fn configuration_values(text: &str) -> Result<toml::Value, String> {
-    let mut values: toml::Value =
-        toml::from_str(text).map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
-    if let Some(table) = values.as_table_mut() {
-        table.remove("demo_device_id");
-        table.remove("demo_boundary_id");
-    }
-    Ok(values)
-}
-
 pub(super) fn parse(text: &str) -> Result<SimulatorConfig, String> {
-    let values = configuration_values(text)?;
+    let values: toml::Value =
+        toml::from_str(text).map_err(|e| format!("Cấu hình AS200 không hợp lệ: {e}"))?;
     let config: SimulatorConfig = values
         .clone()
         .try_into()

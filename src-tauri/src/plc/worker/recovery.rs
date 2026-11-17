@@ -1,6 +1,5 @@
-//! Restart and source switching use the same v4 receipt/checkpoint proof as ACK.
+//! Restart recovery verifies committed raw receipts and the v4 ACK checkpoint.
 use super::*;
-use std::path::Path;
 
 pub(super) async fn processed_receipt(
     config: &SimulatorConfig,
@@ -16,8 +15,38 @@ pub(super) async fn processed_receipt(
         .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
-    if key != config.source_key || !processed_receipt_matches(&row, &delivery.input) {
-        return Err("Receipt chưa PROCESSED hoặc source/session/raw không khớp; không ACK.".into());
+    let input = &delivery.input;
+    if key != config.source_key || row.session_id != input.confirmed_session_id
+        || row.ingest_key != input.ingest_key || row.record_seq != input.record_seq
+        || row.total_count != input.total_count || row.buffer_index != input.buffer_index
+        || row.word_order != input.word_order.as_str()
+        || row.received_at.timestamp_micros() != input.received_at.timestamp_micros()
+        || serde_json::to_value(&input.raw_registers).map_err(|e| e.to_string())? != row.raw_registers
+    {
+        return Err("Receipt PostgreSQL không khớp source/session/counter/raw; không ACK.".into());
+    }
+    if delivery.raw_publication() {
+        let session = config.confirmed_session_id.as_deref().ok_or("Thiếu Session.")?;
+        if row.ingest_key != format!("{}{}", crate::services::inbox_service::raw_ack_prefix(session), delivery.ack_target())
+            || row.session_id.is_some() || row.measurement_id.is_some() || row.processed_at.is_some()
+            || row.processing_status != "SESSION_UNCONFIRMED" || delivery.ack_target() <= 0
+        {
+            return Err("Receipt raw không khớp định danh công bố; không ACK.".into());
+        }
+        return Ok(row);
+    }
+    if !matches!(row.processing_status.as_str(), "PENDING" | "FAILED" | "PROCESSED") {
+        return Err("Inbox chưa có receipt thu dữ liệu hợp lệ; không ACK.".into());
+    }
+    // Decode/measurement failures do not undo the committed 240 WORD receipt.
+    if row.processing_status != "PROCESSED" {
+        if row.measurement_id.is_some() || row.processed_at.is_some() {
+            return Err("Trạng thái measurement/receipt mâu thuẫn; cần đối chiếu.".into());
+        }
+        return Ok(row);
+    }
+    if !processed_receipt_matches(&row, input) {
+        return Err("Receipt PROCESSED thiếu bằng chứng measurement; cần đối chiếu.".into());
     }
     let matching: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM measurements WHERE id=$1 AND source_id=$2 AND session_id=$3 AND record_seq=$4)",
@@ -43,12 +72,13 @@ async fn verify_history(
         processed_receipt(config, receipt, pool).await?;
     }
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id JOIN measurements m ON m.id=i.measurement_id AND m.source_id=i.source_id AND m.session_id=i.session_id AND m.record_seq=i.record_seq WHERE s.source_key=$1 AND i.session_id=$2 AND i.record_seq BETWEEN 1 AND $3 AND i.processing_status='PROCESSED' AND i.processed_at IS NOT NULL",
+        "SELECT count(DISTINCT target) FROM (SELECT i.record_seq::bigint AS target FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND i.session_id=$2 AND i.record_seq BETWEEN 1 AND $3 AND ((i.processing_status IN ('PENDING','FAILED') AND i.measurement_id IS NULL AND i.processed_at IS NULL) OR (i.processing_status='PROCESSED' AND i.processed_at IS NOT NULL AND EXISTS(SELECT 1 FROM measurements m WHERE m.id=i.measurement_id AND m.source_id=i.source_id AND m.session_id=i.session_id AND m.record_seq=i.record_seq))) UNION ALL SELECT i.total_count AS target FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND i.session_id IS NULL AND i.total_count BETWEEN 1 AND $3 AND i.ingest_key=$4 || i.total_count::text AND i.processing_status='SESSION_UNCONFIRMED' AND i.measurement_id IS NULL AND i.processed_at IS NULL AND i.buffer_index=0) receipts",
     ).bind(&config.source_key).bind(&journal.session_id).bind(progress.accepted)
+        .bind(crate::services::inbox_service::raw_ack_prefix(journal.session_id.as_deref().ok_or("Thiếu Session.")?))
         .fetch_one(pool).await.map_err(|e| e.to_string())?;
     if count != i64::from(progress.accepted) {
         return Err(
-            "Prefix đã ACK thiếu receipt PROCESSED trong PostgreSQL; giữ checkpoint để đối chiếu."
+            "Prefix đã ACK thiếu receipt raw đã commit trong PostgreSQL; giữ checkpoint để đối chiếu."
                 .into(),
         );
     }
@@ -60,284 +90,138 @@ impl Engine {
         let journal = self.journal.lock().await.clone();
         verify_history(&self.config, &journal, pool).await
     }
-}
 
-impl Journal {
-    /// Read-only collection never advances the ACK checkpoint. Closing it needs
-    /// saved receipts for every observed record, not a fabricated PLC ACK.
-    pub(super) fn read_only_closed(&self) -> Result<(), String> {
-        let progress = self
-            .published_ack
-            .as_ref()
-            .ok_or("Thiếu ACK progress v4.")?;
-        let highest = self
-            .deliveries
-            .iter()
-            .map(|d| d.input.record_seq)
-            .max()
-            .unwrap_or(progress.accepted);
-        if self.pending_ack()
-            || self.pause.is_some()
-            || !self.quarantine.is_empty()
-            || !self.retries.is_empty()
-            || self
-                .manual_retries
-                .iter()
-                .any(|r| matches!(r.state.as_str(), "PENDING" | "WAITING"))
-            || self.last_total != Some(highest)
-            || self
-                .deliveries
-                .iter()
-                .any(|d| !d.terminal || d.inbox_id.is_none())
-        {
-            return Err("Nguồn chỉ đọc còn bản ghi chưa lưu đủ hoặc ACK/cảnh báo cần đối chiếu; chưa thể chuyển nguồn.".into());
-        }
-        Ok(())
-    }
-
-    // Only an already closed epoch may isolate its reset diagnostic when switching.
-    // The reset stays in this journal and must be confirmed on return to this source.
-    fn closed_reset(&self) -> bool {
-        self.pause.as_deref() == Some("RESET")
-            && self.quarantine.is_empty()
-            && self
-                .published_ack
-                .as_ref()
-                .is_some_and(|p| p.accepted > 0 && self.last_total == Some(p.accepted))
-            && !self.pending_ack()
-    }
-
-    pub(super) fn closed(&self, allow_reset: bool) -> Result<(), String> {
-        let progress = self
-            .published_ack
-            .as_ref()
-            .ok_or("Thiếu ACK progress v4.")?;
-        if self.pending_ack() {
-            return Err(
-                "Máy đo còn ACK chưa có bằng chứng hoàn tất. Chưa thể chuyển kết nối.".into(),
-            );
-        }
-        if self.last_total.unwrap_or(0) != progress.accepted
-            || !self.deliveries.is_empty()
-            || !self.retries.is_empty()
-            || self
-                .manual_retries
-                .iter()
-                .any(|r| matches!(r.state.as_str(), "PENDING" | "WAITING"))
-        {
-            return Err(
-                "Máy đo còn dữ liệu chưa lưu/ACK đầy đủ; không tự bỏ qua hoặc tạo phiên mới."
-                    .into(),
-            );
-        }
-        if !(allow_reset && self.closed_reset())
-            && (self.pause.is_some() || !self.quarantine.is_empty())
-        {
-            return Err(
-                "Máy đo còn cảnh báo hoặc dữ liệu cách ly cần đối chiếu. Chưa thể chuyển kết nối."
-                    .into(),
-            );
-        }
+    // Only the old "ready + empty RAM" startup diagnostic is recoverable here.
+    // An intent (even Prepared), receipt, counter history or unknown diagnostic
+    // prevents this path. No reset, replacement session or ACK is performed.
+    pub(super) async fn try_resume_initial_raw_pause(
+        &self, snapshot: &PublishedRecordSnapshot, pool: &PgPool,
+    ) -> Result<(), String> {
+        let saved = {
+            let journal = self.journal.lock().await;
+            if journal.pause.as_deref() != Some("PUBLISHED_ACK_RECONCILIATION") { return Ok(()); }
+            journal.clone()
+        };
+        saved.validate(&self.config)?;
+        let progress = saved.published_ack.as_ref().ok_or("Thiếu ACK progress v4.")?;
+        if progress.accepted != 0 || progress.intent.is_some() || progress.confirmed_receipt.is_some()
+            || saved.last_total.is_some_and(|n| n != 0) || !saved.deliveries.is_empty()
+            || !saved.retries.is_empty() || !saved.manual_retries.is_empty() || !saved.previous_session_warnings.is_empty()
+            || saved.quarantine.is_empty()
+        { return Ok(()); }
+        let original = |error: &str| error.starts_with("PUBLISHED_DIAGNOSTIC:") && error.contains("Status bit0");
+        if !saved.quarantine.iter().any(|q| original(&q.error))
+            || saved.quarantine.iter().any(|q| {
+                q.source_key != self.config.source_key || q.session_id != saved.session_id
+                    || q.address != self.config.address || q.unit_id != self.config.unit_id
+                    || q.modbus_address_offset != self.config.modbus_address_offset || q.word_order != self.config.word_order
+                    || q.buffer_index != 0 || q.record_seq != Some(0) || q.total_count != 0
+                    || q.raw_registers.len() != as200::map::RECORD_SIZE || q.raw_registers.iter().any(|w| *w != 0)
+                    || !(original(&q.error) || q.error.starts_with("RAW_ZERO_TEST_PENDING:") || q.error.starts_with("RAW_ZERO_TEST_SAVED:")
+                        || q.error.starts_with("RAW_UNDECODED_PENDING:") || q.error.starts_with("RAW_UNDECODED_SAVED:"))
+                    || !q.control.as_ref().is_some_and(|c| c.format_version == 1 && c.record_size == 240 && c.buffer_count == 2
+                        && c.total_count == 0 && c.pc_read_count == 0 && c.pc_read_done == 0 && c.data_ready == 1)
+            })
+            || saved.warnings.iter().any(|w| !(w.starts_with("PUBLISHED_DIAGNOSTIC:")
+                || w.starts_with("PUBLISHED_ACK: PUBLISHED_DIAGNOSTIC:")
+                || w.starts_with("PUBLISHED_ACK: Journal v4 đang dừng bảo vệ dữ liệu:")
+                || w.starts_with("PUBLISHED_ACK: Đã lưu raw chưa giải mã; Journal vẫn dừng bảo vệ dữ liệu:")
+                || w.starts_with("PUBLISHED_DATA: Đã lưu raw chưa giải mã; Journal vẫn dừng bảo vệ dữ liệu:")
+                || w.starts_with("PUBLISHED_ACK: Đã lưu bản ghi thử nghiệm toàn 0; Journal vẫn dừng bảo vệ dữ liệu:")
+                || w.starts_with("PUBLISHED_DATA: Đã lưu bản ghi thử nghiệm toàn 0; Journal vẫn dừng bảo vệ dữ liệu:")))
+        { return Ok(()); }
+        let c = &snapshot.control;
+        let start = (c.data_ready == 0 && c.total_count == 0)
+            || (c.data_ready == 1 && (0..=1).contains(&c.total_count)
+                && snapshot.buffer.as_ref().is_some_and(|b| b.buffer_index == 0
+                    && b.raw_registers.len() == as200::map::RECORD_SIZE));
+        if c.format_version != 1 || c.record_size != 240 || c.buffer_count != 2
+            || c.pc_read_count != 0 || c.pc_read_done != 0 || !start
+        { return Ok(()); }
+        let history: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND NOT COALESCE((i.session_id IS NULL AND i.processing_status IN ('SESSION_UNCONFIRMED','RAW_UNDECODED') AND (i.ingest_key LIKE 'raw-zero-test-v1:%' OR i.ingest_key LIKE 'raw-published-v1:%') AND i.record_seq=0 AND i.total_count=0 AND i.buffer_index=0 AND i.word_order=$3 AND i.raw_registers=$2), false)) OR EXISTS(SELECT 1 FROM measurements m JOIN plc_sources s ON s.id=m.source_id WHERE s.source_key=$1)",
+        ).bind(&self.config.source_key).bind(serde_json::to_value(vec![0u16; as200::map::RECORD_SIZE]).map_err(|e| e.to_string())?)
+            .bind(self.config.word_order.as_str()).fetch_one(pool).await.map_err(|e| e.to_string())?;
+        if history { return Ok(()); }
+        let mut journal = self.journal.lock().await;
+        // published_gate serializes acquisition; also refuse concurrent retry work.
+        if !journal.retries.is_empty() || !journal.manual_retries.is_empty() || journal.pending_ack()
+            || !journal.deliveries.is_empty() || journal.pause != saved.pause
+        { return Ok(()); }
+        let mut next = journal.clone();
+        next.pause = None;
+        next.warnings.clear(); // Original diagnostic/control/raw remain in quarantine.
+        Self::warn(&mut next, "Đã đối chiếu lỗi thử toàn 0 lúc khởi tạo: không có receipt hoặc ACK đã gửi; giữ nguyên raw, Session và checkpoint.".into());
+        self.persist_published_transition(&mut journal, next)?;
+        drop(journal);
+        eprintln!("PLC_RECOVERY state=INITIAL_RAW_DIAGNOSTIC_RESOLVED endpoint={} total={} count=0 done=0 accepted=0 intent=none", self.config.address, c.total_count);
+        self.publish_journal().await?;
+        let mut status = self.state.status.write().await;
+        status.state = "WAITING".into();
+        status.last_error = None;
+        status.ack_status = if self.config.read_only { "DISABLED" } else { "WAITING" };
         Ok(())
     }
 }
 
 impl WorkerState {
-    pub(in crate::plc) async fn verify_source_closed(
-        &self,
-        file: &Path,
-        config: &SimulatorConfig,
-        pool: &PgPool,
-        for_reset: bool,
-        trace: &str,
-    ) -> Result<File, String> {
-        if self.status.read().await.enabled || !self.tasks.lock().await.is_empty() {
-            return Err("Chưa dừng xong thu dữ liệu.".into());
+    pub(in crate::plc) fn require_sku_or_recovery(config: &SimulatorConfig, path: &std::path::Path) -> Result<(), String> {
+        if config.operator_sku.is_some() { return Ok(()); }
+        if path.exists() {
+            let journal = Journal::load(path, config)?;
+            if !journal.deliveries.is_empty() || journal.pending_ack() { return Ok(()); }
         }
-        let path = config.journal_file(file);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))
-            .map_err(|_| "Không thể xác minh khóa Journal của máy đo.".to_string())?;
-        lock.try_lock()
-            .map_err(|_| "Journal vẫn đang được Worker khác sử dụng.".to_string())?;
-        let journal = Journal::load(&path, config)?;
-        if config.read_only {
-            journal.read_only_closed()?;
-        } else {
-            journal.closed(for_reset)?;
-        }
-        verify_history(config, &journal, pool).await?;
-        if config.read_only {
-            for delivery in &journal.deliveries {
-                processed_receipt(config, delivery, pool).await?;
-            }
-            let prefix: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id JOIN measurements m ON m.id=i.measurement_id AND m.source_id=i.source_id AND m.session_id=i.session_id AND m.record_seq=i.record_seq WHERE s.source_key=$1 AND i.session_id=$2 AND i.record_seq BETWEEN 1 AND $3 AND i.processing_status='PROCESSED' AND i.processed_at IS NOT NULL")
-                .bind(&config.source_key).bind(&journal.session_id).bind(journal.last_total)
-                .fetch_one(pool).await.map_err(|_| "Không thể đối chiếu receipt nguồn chỉ đọc.".to_string())?;
-            if prefix != i64::from(journal.last_total.unwrap_or(0)) {
-                return Err(
-                    "Nguồn chỉ đọc thiếu receipt PROCESSED liên tiếp; chưa thể chuyển nguồn."
-                        .into(),
-                );
-            }
-        }
-        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND (i.processing_status <> 'PROCESSED' OR i.measurement_id IS NULL OR i.processed_at IS NULL)")
-            .bind(&config.source_key).fetch_one(pool).await.map_err(|e| e.to_string())?;
-        if pending != 0 {
-            return Err("Máy đo còn Inbox chưa xử lý; chưa thể chuyển kết nối.".into());
-        }
-        switch_log(
-            trace,
-            "JOURNAL_CHECK",
-            "PASS",
-            "v4=true processed_prefix=true no_pending_ack=true",
-        );
-        Ok(lock)
+        Err("Chưa nhập SKU QC. Vào Giám sát, nhập và lưu SKU trước khi kết nối PLC.".into())
     }
 
-    pub(in crate::plc) async fn initialize_separate_journal(
-        config: SimulatorConfig,
-        path: PathBuf,
-    ) -> Result<(), String> {
-        if path.exists() || path.with_extension("lock").exists() {
-            return Err("Không được ghi đè Journal hoặc khóa cũ.".into());
-        }
-        // Callers prove a clean baseline and unused identity/session before this call.
-        let engine = Engine::open(config, path, WorkerState::default())?;
-        let mut journal = engine.journal.lock().await;
-        journal.last_total = Some(0);
-        engine.persist(&journal)
-    }
-
-    pub(in crate::plc) async fn verify_resume(
-        &self,
-        file: &Path,
-        config: &SimulatorConfig,
-        historical: bool,
-        database: &DatabaseState,
-        trace: &str,
-    ) -> Result<bool, String> {
-        let journal = Journal::load(&config.journal_file(file), config)?;
-        let pool = database.pool().await?;
-        verify_history(config, &journal, &pool).await?;
-        let mut reader = As200Reader::new(config.reader());
-        let snapshot = reader
-            .poll_published_record()
-            .await
-            .map_err(|e| e.to_string())?;
-        if journal
-            .last_total
-            .is_some_and(|previous| snapshot.control.total_count < previous)
-        {
-            // No new epoch while any receipt/intent/checkpoint is unresolved.
-            journal.closed(true)?;
-            let _lock = if !historical {
-                Some(
-                    self.verify_source_closed(file, config, &pool, true, trace)
-                        .await?,
-                )
-            } else {
-                None
-            };
-            super::super::connection_settings::read_new_baseline(config).await?;
-            return Ok(true); // Eligibility only; caller still asks for explicit reset confirmation.
-        }
-        if journal.pause.is_some() || !journal.quarantine.is_empty() {
-            return Err(
-                "Journal còn cảnh báo cần đối chiếu; không tự tiếp tục phiên hoặc bỏ qua dữ liệu."
-                    .into(),
-            );
-        }
-        if !snapshot.diagnostics.is_empty() {
-            return Err("Dữ liệu máy đo chưa hợp lệ; cần đối chiếu.".into());
-        }
-        // Pending v4 intents are recovered by observation, never replayed by settings.
-        if journal.pending_ack() {
-            return Ok(false);
-        }
-        let accepted = journal
-            .published_ack
-            .as_ref()
-            .ok_or("Thiếu checkpoint v4.")?
-            .accepted;
-        if snapshot.control.pc_read_count != accepted || snapshot.control.pc_read_done != 0 {
-            return Err(
-                "Checkpoint/Done trên máy đo không khớp Journal v4; chưa thể tiếp tục.".into(),
-            );
-        }
-        match snapshot.buffer.as_ref().and_then(|b| b.record.as_ref()) {
-            None if snapshot.control.data_ready == 0
-                && snapshot.control.total_count == accepted => {}
-            Some(record)
-                if snapshot.control.data_ready == 1
-                    && accepted.checked_add(1) == Some(record.record_seq) =>
-            {
-                if journal.deliveries.iter().any(|d| {
-                    d.input.record_seq == record.record_seq
-                        && d.input.raw_registers != record.raw_registers
-                }) {
-                    return Err(
-                        "Raw của cùng RecordSeq không khớp Journal; chưa thể tiếp tục.".into(),
-                    );
-                }
-            }
-            _ => return Err(
-                "Dữ liệu đang công bố có sequence gap hoặc không khớp checkpoint; cần đối chiếu."
-                    .into(),
-            ),
-        }
-        Ok(false)
-    }
-
-    pub(in crate::plc) async fn ensure_connection_edit_safe(
-        &self,
-        file: &Path,
-        config: &SimulatorConfig,
+    // Caller holds settings_gate until the configuration write finishes.
+    pub(in crate::plc) async fn verify_sku_change(
+        &self, directory: &std::path::Path, config: &SimulatorConfig, pool: &PgPool,
     ) -> Result<Option<File>, String> {
-        if self.status.read().await.enabled
-            || self
-                .engine
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|e| e.upgrade())
-                .is_some()
-        {
-            return Err("Worker chưa dừng an toàn.".into());
-        }
-        let path = config.journal_file(file);
-        if config.mode == "modbus"
-            && !config.technical_setup_confirmed
-            && !config.enabled
-            && !config.ack_enabled
-            && !config.pc_heartbeat_enabled
-            && config.source_key.is_empty()
-            && config.confirmed_session_id.is_none()
-            && config.journal_path.is_none()
-            && !path.exists()
-            && !path.with_extension("lock").exists()
-        {
+        self.ensure_register_writes_stopped().await.map_err(|_| "Chưa thể đổi SKU: cần ngắt kết nối và đợi Worker/ACK dừng hoàn toàn.".to_string())?;
+        let path = config.journal_file(&directory.join("as200_config.toml"));
+        if !path.exists() {
+            super::super::connection_settings::prepare_collection(directory, config, pool).await?;
+            // Startup may accept a first published record, but changing SKU may
+            // not relabel data already waiting on the PLC. Do not inspect stale RAM.
+            let snapshot = config.plc_reader().poll_published_record().await.map_err(|e| e.to_string())?;
+            let c = &snapshot.control;
+            if c.total_count != 0 || c.pc_read_count != 0 || c.pc_read_done != 0 || c.data_ready != 0 {
+                return Err("Chưa thể đổi SKU: PLC đã có dữ liệu hoặc checkpoint cần đối chiếu. Giữ SKU hiện có để tiếp nhận bản ghi chờ.".into());
+            }
             return Ok(None);
         }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))
-            .map_err(|e| e.to_string())?;
-        lock.try_lock().map_err(|e| e.to_string())?;
+        let lock = OpenOptions::new().read(true).write(true).open(path.with_extension("lock"))
+            .map_err(|_| "Không xác minh được khóa Journal; chưa đổi SKU.".to_string())?;
+        lock.try_lock().map_err(|_| "Journal đang được sử dụng; chưa đổi SKU.".to_string())?;
         let journal = Journal::load(&path, config)?;
-        journal.closed(false)?;
-        if journal
-            .published_ack
-            .as_ref()
-            .is_some_and(|p| p.accepted != 0)
-            || !journal.warnings.is_empty()
-            || !journal.previous_session_warnings.is_empty()
+        let accepted = journal.published_ack.as_ref().ok_or("Journal thiếu ACK progress.")?.accepted;
+        let prefix = crate::services::inbox_service::raw_ack_prefix(journal.session_id.as_deref().ok_or("Thiếu Session.")?);
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE s.source_key=$1 AND (i.processing_status<>'PROCESSED' OR i.measurement_id IS NULL OR i.processed_at IS NULL) AND NOT COALESCE((i.session_id IS NULL AND i.ingest_key=$2 || i.total_count::text AND i.total_count BETWEEN 1 AND $3 AND i.processing_status='SESSION_UNCONFIRMED' AND i.measurement_id IS NULL AND i.processed_at IS NULL),false))")
+            .bind(&config.source_key).bind(prefix).bind(i64::from(accepted)).fetch_one(pool).await
+            .map_err(|_| "Không đối chiếu được Inbox; chưa đổi SKU.".to_string())?;
+        if pending { return Err("Chưa thể đổi SKU: nguồn PLC còn Inbox hoặc raw chưa được đối chiếu ACK.".into()); }
+        if journal.pause.is_some() || journal.pending_ack() || !journal.deliveries.is_empty()
+            || !journal.retries.is_empty() || !journal.quarantine.is_empty()
+            || journal.manual_retries.iter().any(|r| matches!(r.state.as_str(), "PENDING" | "WAITING"))
+            || journal.last_total.is_some_and(|total| total != accepted)
         {
-            return Err("Journal có lịch sử; dùng luồng chuyển nguồn để đối chiếu, không sửa endpoint trực tiếp.".into());
+            return Err("Chưa thể đổi SKU: Journal còn dữ liệu, ACK chưa hoàn tất hoặc trạng thái cần đối chiếu. Kết nối lại để hoàn tất SKU cũ trước.".into());
         }
+        verify_history(config, &journal, pool).await?;
+        let mut reader = config.plc_reader();
+        let first = reader.poll_published_record().await.map_err(|e| format!("Không đọc được PLC để xác minh đổi SKU: {e}"))?;
+        let second = reader.poll_published_record().await.map_err(|e| format!("Không đọc lại được PLC để xác minh đổi SKU: {e}"))?;
+        for snapshot in [&first, &second] {
+            let c = &snapshot.control;
+            if !snapshot.diagnostics.is_empty() || snapshot.buffer.is_some() || c.data_ready != 0
+                || c.pc_read_done != 0 || c.pc_read_count != accepted || c.total_count != accepted
+            {
+                return Err("Chưa thể đổi SKU: PLC còn bản ghi chờ hoặc counter/ACK không khớp Journal. Không tự reset hay bỏ dữ liệu.".into());
+            }
+        }
+        // Both stable snapshots already prove an idle checkpoint. Old words in
+        // the published region have no meaning while DataReady=0.
         Ok(Some(lock))
     }
 }

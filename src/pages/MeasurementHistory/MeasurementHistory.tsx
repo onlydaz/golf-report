@@ -1,5 +1,5 @@
 import { EyeOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, DatePicker, Empty, InputNumber, Select, Spin, Table } from "antd";
+import { Alert, Button, Card, DatePicker, Empty, InputNumber, Select, Spin, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { Dayjs } from "dayjs";
 import { useEffect, useRef, useState } from "react";
@@ -9,10 +9,11 @@ import PageHeader from "../../components/PageHeader";
 import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import {
   getMeasurementHistoryPage, getMeasurementSkus, getMeasurementSkuSummary, getMeasurementStatistics,
+  getPlcRawSnapshots,
   type MeasurementHistoryItem, type MeasurementHistoryPage, type MeasurementListRequest,
-  type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics,
+  type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics, type PlcRawSnapshot,
 } from "../../services/measurementService";
-import { formatDecimal } from "../../utils/as200Report";
+import { formatDecimal, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime, reportDateBoundary } from "../../utils/reportTime";
 import "./MeasurementHistory.css";
 
@@ -37,6 +38,9 @@ function MeasurementHistory() {
   const [summaryError, setSummaryError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [statisticsError, setStatisticsError] = useState("");
+  const [rawSnapshots, setRawSnapshots] = useState<PlcRawSnapshot[]>([]);
+  const [rawSnapshotLoading, setRawSnapshotLoading] = useState(false);
+  const [rawSnapshotError, setRawSnapshotError] = useState("");
   const [filterError, setFilterError] = useState("");
   const [skuSearch, setSkuSearch] = useState({ text: "", page: 1 });
   const [skuOptions, setSkuOptions] = useState<string[]>([]);
@@ -93,6 +97,16 @@ function MeasurementHistory() {
 
   useEffect(() => {
     let active = true;
+    setRawSnapshotLoading(databaseConnected); setRawSnapshotError("");
+    if (!databaseConnected) { setRawSnapshots([]); return; }
+    void getPlcRawSnapshots().then(rows => { if (active) setRawSnapshots(rows); })
+      .catch(() => { if (active) setRawSnapshotError("Không thể tải lịch sử raw PLC."); })
+      .finally(() => { if (active) setRawSnapshotLoading(false); });
+    return () => { active = false; };
+  }, [databaseConnected, status?.lastSavedId, status?.rawCapture?.inboxId, reload]);
+
+  useEffect(() => {
+    let active = true;
     setDetails(undefined); setDetailError(""); setDetailLoading(databaseConnected && !!selectedSku);
     if (!databaseConnected || !selectedSku) return;
     void getMeasurementHistoryPage({ ...query.filters, productCode: selectedSku, page: selection.page, pageSize }).then(data => {
@@ -133,20 +147,33 @@ function MeasurementHistory() {
     { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.total), width: 110, align: "right" },
   ];
   const stationColumns = (station: "BUTT" | "TIP"): ColumnsType<MeasurementHistoryItem> => [
-    ...[1, 2, 3, 4].map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 112, align: "right" as const,
+    ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
       render: (_: unknown, row: MeasurementHistoryItem) => formatDecimal(row.decisionPoints.find(point => point.station === station && point.pointNumber === pointNumber)?.bend),
     })),
-    { title: `Lực ${station} (g)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatDecimal, width: 135, align: "right" },
+    { title: `Lực ${station} (g)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatDecimal, width: 120, align: "center" },
   ];
   const columns: ColumnsType<MeasurementHistoryItem> = [
-    { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, fixed: "left", render: formatReportTime },
-    { title: "Số gậy", dataIndex: "clubNumber", width: 90, fixed: "left", align: "center" },
-    { title: "BUTT", children: stationColumns("BUTT") }, { title: "TIP", children: stationColumns("TIP") },
+    { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, align: "center", render: formatReportTime },
+    { title: "Số gậy", dataIndex: "clubNumber", width: 90, align: "center" },
+    { title: "BUTT", align: "center", children: stationColumns("BUTT") }, { title: "TIP", align: "center", children: stationColumns("TIP") },
     ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
-      title, dataIndex, width: 95, align: "center" as const,
+      title, dataIndex, width: 90, align: "center" as const,
       render: (value: MeasurementHistoryItem["buttResult"]) => <ResultTag result={value} />,
     })),
-    { title: "", key: "action", width: 140, render: (_, row) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/measurements/${row.id}`)}>Xem chi tiết</Button> },
+    { title: "", key: "action", width: 150, align: "center", render: (_, row) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/measurements/${row.id}`)}>Xem chi tiết</Button> },
+  ];
+  const rawColumns: ColumnsType<PlcRawSnapshot> = [
+    { title: "Loại", dataIndex: "kind", width: 120, render: (kind: PlcRawSnapshot["kind"]) => <Tag color="blue">RAW · {kind}</Tag> },
+    { title: "Thời gian nhận", dataIndex: "receivedAt", width: 180, render: formatReportTime },
+    { title: "RecordSeq", dataIndex: "recordSeq", width: 110, align: "right" },
+    { title: "TotalCount", dataIndex: "totalCount", width: 110, align: "right", render: (value: number | null) => value ?? "—" },
+    { title: "Tổng WORD", dataIndex: "wordCount", width: 110, align: "right" },
+    { title: "WORD khác 0", dataIndex: "nonZeroWords", width: 125, align: "right" },
+    { title: "Inbox", dataIndex: "id", width: 90, align: "right" },
+    { title: "Trạng thái", dataIndex: "processingStatus", width: 150,
+      render: (value: string) => value === "SESSION_UNCONFIRMED" ? "Đã lưu raw, chưa giải mã" : value },
+    { title: "Giá trị D25020–D25259", dataIndex: "rawRegisters", width: 520,
+      render: (values: number[]) => <span title={values.join(", ")} style={{ display: "block", maxWidth: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" }}>{values.join(", ")}</span> },
   ];
   const shownFrom = detailPage?.total ? (selection.page - 1) * pageSize + 1 : 0;
   const shownTo = detailPage ? Math.min(selection.page * pageSize, detailPage.total) : 0;
@@ -187,11 +214,17 @@ function MeasurementHistory() {
         pagination={{ current: query.page, pageSize, total: skuPage?.total ?? 0, showSizeChanger: false, onChange: page => setQuery(current => ({ ...current, page })) }}
         scroll={{ x: 1110 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={summaryError ? "Chưa tải được tổng hợp SKU" : "Không có SKU phù hợp"} /> }} />
     </Card>
+    <Card className="section-card" title="Raw PLC đã nhận" extra={<span className="history-table-note">Bản ghi chính thức, tách khỏi Measurement khi chưa giải mã đủ</span>}>
+      {rawSnapshotError && <Alert type="error" showIcon title={rawSnapshotError} />}
+      <Table<PlcRawSnapshot> className="history-table" rowKey="id" columns={rawColumns} dataSource={rawSnapshots} loading={rawSnapshotLoading}
+        pagination={{ pageSize: 10, showSizeChanger: false }} scroll={{ x: 760 }}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={rawSnapshotError ? "Chưa tải được raw PLC" : "Chưa có raw PLC"} /> }} />
+    </Card>
     <Card className="section-card" title={selectedSku ? `Chi tiết gậy · ${selectedSku}` : "Chi tiết gậy"} extra={<span className="history-table-note">Hiển thị {shownFrom}–{shownTo} / {detailPage?.total ?? 0} gậy</span>}>
       {detailError && <Alert type="error" showIcon title={detailError} />}
-      <Table<MeasurementHistoryItem> className="history-table history-detail-table" rowKey="id" columns={columns} dataSource={detailPage?.items ?? []} loading={detailLoading}
+      <Table<MeasurementHistoryItem> className="history-table history-detail-table" size="small" rowKey="id" columns={columns} dataSource={detailPage?.items ?? []} loading={detailLoading}
         pagination={{ current: selection.page, pageSize, total: detailPage?.total ?? 0, showSizeChanger: false, onChange: page => setSelection(current => ({ ...current, page })) }}
-        scroll={{ x: 1880 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={detailError ? "Chưa tải được chi tiết gậy" : selectedSku ? "Không có gậy phù hợp" : "Chọn một SKU để xem chi tiết gậy"} /> }} />
+        scroll={{ x: 1450 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={detailError ? "Chưa tải được chi tiết gậy" : selectedSku ? "Không có gậy phù hợp" : "Chọn một SKU để xem chi tiết gậy"} /> }} />
     </Card>
   </div>;
 }

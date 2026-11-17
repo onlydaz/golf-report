@@ -26,7 +26,7 @@ pub(crate) fn application_directory() -> Result<std::path::PathBuf, String> {
     }
 }
 
-fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
+pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
     use std::{fs, fs::OpenOptions, io::Write};
     fn probe(dir: &std::path::Path) -> Result<(), String> {
         let first = dir.join(format!(
@@ -143,6 +143,7 @@ pub fn run() {
             let worker_database = database_state.clone();
             let config_dir = application_directory().and_then(|dir| {
                 check_plc_directory(&dir)?;
+                plc::connection_settings::ensure_config(&dir)?;
                 Ok(dir)
             });
             tauri::async_runtime::spawn(async move {
@@ -166,25 +167,24 @@ pub fn run() {
             commands::measurement_command::get_measurement_skus,
             commands::measurement_command::get_measurement_sku_summary,
             commands::measurement_command::get_measurement_history_page,
+            commands::measurement_command::get_plc_raw_snapshots,
             commands::measurement_command::get_measurement_report,
             plc::worker::get_as200_worker_status,
             plc::worker::reconnect_as200_plc,
-            plc::connection_settings::apply_plc_runtime_settings,
-            plc::connection_settings::save_plc_runtime_settings,
-            plc::connection_settings::test_plc_runtime_settings,
             plc::connection_settings::get_plc_connection_settings,
+            plc::connection_settings::save_plc_poll_interval,
+            plc::connection_settings::save_plc_connection_options,
+            plc::connection_settings::save_operator_sku,
             plc::connection_settings::stop_plc_collection,
+            plc::connection_settings::clear_plc_connection_log,
             plc::connection_settings::connect_plc_collection,
-            plc::connection_settings::connect_verified_plc,
             plc::connection_settings::test_plc_connection,
-            plc::connection_settings::update_plc_connection_settings,
-            plc::connection_settings::confirm_initial_plc_setup,
+            plc::connection_settings::read_plc_register_words,
             plc::register_access::get_plc_register_access,
             plc::register_access::get_plc_register_ui_enabled,
             plc::register_access::read_plc_register,
             plc::register_access::write_plc_register,
             plc::worker::retry_as200_inbox,
-            plc::worker::get_as200_retry_diagnostics,
             plc::worker::acknowledge_as200_buffer_gap
         ])
         .run(tauri::generate_context!())

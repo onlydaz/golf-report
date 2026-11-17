@@ -8,6 +8,8 @@ impl Engine {
         source_id: i64,
     ) -> Result<(), String> {
         if row.source_id != source_id
+            || crate::services::inbox_service::assigned_sku(&row.ingest_key, row.record_seq)?
+                != crate::services::inbox_service::assigned_sku(&input.ingest_key, input.record_seq)?
             || row.record_seq != input.record_seq
             || row.raw_registers
                 != serde_json::to_value(&input.raw_registers).map_err(|e| e.to_string())?
@@ -21,9 +23,28 @@ impl Engine {
     }
 
     pub(super) async fn row_status(&self, row: &InboxRecord) -> Result<(), String> {
+        if row.ingest_key.starts_with(crate::services::inbox_service::RAW_UNDECODED_KEY) {
+            let raw: Vec<u16> = serde_json::from_value(row.raw_registers.clone()).map_err(|e| e.to_string())?;
+            let mut status = self.state.status.write().await;
+            status.raw_capture = Some(RawCaptureStatus {
+                inbox_id: row.id, received_at: row.received_at,
+                total_count: row.total_count.and_then(|n| i32::try_from(n).ok()).ok_or("Raw thiếu TotalCount gốc.")?,
+                kind: if raw.iter().all(|w| *w == 0) { "ZERO" } else { "UNDECODED" },
+                raw_registers: raw,
+            });
+            status.state = "RAW_UNDECODED".into();
+            status.message = format!("Đã lưu nguyên trạng 240 WORD vào Inbox #{}; chưa tạo measurement. Trạng thái ACK hiển thị riêng.", row.id);
+            return Ok(());
+        }
         // Retry from an archived session must not replace the current session's display.
         if row.session_id != self.journal.lock().await.session_id {
             return Ok(());
+        }
+        {
+            let mut status = self.state.status.write().await;
+            if status.raw_capture.as_ref().is_some_and(|raw| raw.received_at <= row.received_at) {
+                status.raw_capture = None;
+            }
         }
         let alias = self
             .journal
@@ -83,7 +104,8 @@ impl Engine {
                 measurement_id: row.measurement_id,
                 record_seq: row.record_seq,
                 total_count: row.total_count,
-                product_code: record.product_code,
+                product_code: crate::services::inbox_service::assigned_sku(&row.ingest_key, row.record_seq)?
+                    .unwrap_or(record.product_code),
                 club_number: record.stick_no,
                 received_at: row.received_at,
                 overall_result: format!("{:?}", record.overall_result).to_uppercase(),
@@ -206,7 +228,7 @@ impl Engine {
                 }
             }
         }
-        // Sync receipt IDs before processing. ACK separately proves PROCESSED by DB read-back.
+        // Sync receipt IDs before processing. ACK separately verifies the committed raw by read-back.
         self.publish_journal().await?;
         Ok(source.id)
     }

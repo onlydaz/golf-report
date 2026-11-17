@@ -193,6 +193,45 @@ pub struct MeasurementQualityStatistics {
     pub butt_histogram: Vec<BendHistogramBin>,
     pub points: Vec<PointQualityStatistics>,
     pub point_summary: Vec<PointSummaryStatistics>,
+    #[serde(default)]
+    pub half_hour: Vec<HalfHourStatistics>,
+    #[serde(default)]
+    pub demo_limits: Option<ReportDemoLimits>,
+    #[serde(default)]
+    pub demo_histogram: Vec<ClassifiedBendBin>,
+    #[serde(default)]
+    pub butt_summary: Option<BendDistributionSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HalfHourStatistics {
+    pub at: DateTime<Utc>,
+    pub ok: i64,
+    pub ng: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReportDemoLimits {
+    pub lower: String,
+    pub upper: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifiedBendBin {
+    pub lower: String,
+    pub upper: String,
+    pub count: i64,
+    pub zone: String,
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BendDistributionSummary {
+    pub count: i64,
+    pub mean: Option<String>,
+    pub stddev: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

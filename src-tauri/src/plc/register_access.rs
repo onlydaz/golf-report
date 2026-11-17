@@ -172,6 +172,11 @@ fn number(selection: &RegisterSelection) -> Result<u16, String> {
 fn resolve(selection: &RegisterSelection) -> Result<(Profile, RegisterAccess), String> {
     let policy = enabled_policy()?;
     let endpoint = socket(&selection.endpoint)?;
+    if endpoint.to_string() != super::connection_settings::PLC_ADDRESS
+        || selection.endpoint.unit_id != 1
+    {
+        return Err("Công cụ kỹ thuật chỉ được dùng với PLC cố định trong ứng dụng.".into());
+    }
     let n = number(selection)?;
     let mut matches = policy.profiles.into_iter().filter(|p| {
         p.ip.parse::<IpAddr>().ok() == Some(endpoint.ip())
@@ -238,16 +243,21 @@ fn resolve(selection: &RegisterSelection) -> Result<(Profile, RegisterAccess), S
     Ok((profile, access))
 }
 
-async fn connect(endpoint: &Endpoint) -> Result<Context, String> {
+async fn connect(endpoint: &Endpoint, state: &WorkerState) -> Result<Context, String> {
     enabled_policy()?;
     let address = socket(endpoint)?;
-    tokio::time::timeout(
-        TIMEOUT,
-        tcp::connect_slave(address, Slave(endpoint.unit_id as u8)),
-    )
-    .await
-    .map_err(|_| "Hết thời gian kết nối PLC; chưa gửi lệnh ghi.")?
-    .map_err(|_| "Không kết nối được PLC. Kiểm tra IP, Port và Unit ID; chưa gửi lệnh ghi.".into())
+    let directory = state.settings_directory.lock().await.clone()
+        .ok_or("Chưa xác định thư mục cấu hình PLC.")?;
+    let (config, _) = super::simulator_config::load(Some(&directory))?
+        .ok_or("Chưa có cấu hình PLC.")?;
+    // The optional source IP belongs only to the configured PLC endpoint.
+    // Technical allowlists and write guards remain independently enforced.
+    let local_ip = if config.address.parse::<SocketAddr>().ok() == Some(address) {
+        config.plc_local_ip
+    } else { None };
+    let stream = super::as200::connect_tcp(&address.to_string(), local_ip, TIMEOUT)
+        .await.map_err(|e| e.to_string())?;
+    Ok(tcp::attach_slave(stream, Slave(endpoint.unit_id as u8)))
 }
 
 async fn read_value(ctx: &mut Context, kind: RegisterKind, address: u16) -> Result<u16, String> {
@@ -306,7 +316,7 @@ pub async fn read_plc_register(
         .try_lock()
         .map_err(|_| "Đang thực hiện thao tác PLC khác.")?;
     let (_, access) = resolve(&selection)?;
-    let mut ctx = connect(&selection.endpoint).await?;
+    let mut ctx = connect(&selection.endpoint, &state).await?;
     let value = read_value(&mut ctx, selection.kind, access.pdu_address).await?;
     Ok(RegisterRead { access, value })
 }
@@ -345,7 +355,7 @@ pub async fn write_plc_register(
         .ok_or("Chưa xác minh mapping D để loại trừ chương trình Golf; khóa ghi.")?;
     let header = u16::try_from(i32::from(d_base) + 25000 + profile.address_offset)
         .map_err(|_| "Địa chỉ kiểm tra chương trình không hợp lệ.")?;
-    let mut ctx = connect(&request.selection.endpoint).await?;
+    let mut ctx = connect(&request.selection.endpoint, &state).await?;
     enabled_policy()?;
     let response =
         tokio::time::timeout(TIMEOUT, ctx.call(Request::ReadHoldingRegisters(header, 3)))
@@ -400,7 +410,7 @@ pub async fn write_plc_register(
     };
     // Drop any uncertain socket; only a new, read-only request is attempted.
     drop(ctx);
-    let after = match connect(&request.selection.endpoint).await {
+    let after = match connect(&request.selection.endpoint, &state).await {
         Ok(mut reader) => read_value(&mut reader, request.selection.kind, access.pdu_address)
             .await
             .ok(),

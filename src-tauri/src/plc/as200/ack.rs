@@ -40,15 +40,12 @@ pub struct PublishedAckIntent {
 
 impl PublishedAckIntent {
     pub fn same_published_record(&self, snapshot: &PublishedRecordSnapshot) -> bool {
-        snapshot.diagnostics.is_empty()
-            && snapshot.control.data_ready == 1
+        snapshot.control.data_ready == 1
+            && snapshot.control.total_count == self.target
+            && self.raw_registers.len() == map::RECORD_SIZE
             && snapshot.buffer.as_ref().is_some_and(|buffer| {
                 buffer.buffer_index == 0
                     && buffer.raw_registers == self.raw_registers
-                    && buffer
-                        .record
-                        .as_ref()
-                        .is_some_and(|record| record.record_seq == self.target && record.complete())
             })
     }
 
@@ -60,7 +57,7 @@ impl PublishedAckIntent {
         let c = &snapshot.control;
         if c.total_count > self.target {
             return Err(format!(
-                "TotalCount={} đi trước RecordSeq={}; chưa có bằng chứng cho phép checkpoint nhỏ hơn TotalCount, chặn ghi ACK.",
+                "TotalCount={} đi trước bản ghi đã lưu={}; chưa đủ bằng chứng ACK bản ghi mới, chặn ghi.",
                 c.total_count, self.target
             ));
         }
@@ -86,7 +83,6 @@ impl PublishedAckIntent {
         let c = &snapshot.control;
         self.phase == PublishedAckPhase::DoneWriteUncertain
             && self.observed_done_high
-            && snapshot.diagnostics.is_empty()
             && c.format_version == 1
             && c.record_size == 240
             && c.buffer_count == 2
@@ -99,11 +95,8 @@ impl PublishedAckIntent {
             } else {
                 snapshot.buffer.as_ref().is_some_and(|buffer| {
                     buffer.buffer_index == 0
-                        && buffer.record.as_ref().is_some_and(|record| {
-                            record.complete()
-                                && self.target.checked_add(1) == Some(record.record_seq)
-                                && i64::from(record.record_seq) <= i64::from(c.total_count)
-                        })
+                        && buffer.raw_registers.len() == map::RECORD_SIZE
+                        && self.target.checked_add(1) == Some(c.total_count)
                 })
             }
     }
@@ -112,6 +105,7 @@ impl PublishedAckIntent {
 /// Chỉ constructor này cấp quyền ghi, dựa trên mode/protocol và opt-in rõ ràng.
 pub struct AckWriter {
     cfg: As200Config,
+    local_ip: Option<std::net::IpAddr>,
 }
 impl AckWriter {
     pub fn new(
@@ -141,7 +135,11 @@ impl AckWriter {
         if !enabled || !permitted || address.port() == 0 {
             return Err("ACK write capability disabled".into());
         }
-        Ok(Self { cfg })
+        Ok(Self { cfg, local_ip: None })
+    }
+    pub fn with_local_ip(mut self, local_ip: Option<std::net::IpAddr>) -> Self {
+        self.local_ip = local_ip;
+        self
     }
     // Không có API địa chỉ tùy ý: FC16 chỉ D25008..09, FC06 chỉ D25012=1.
     pub async fn count(&self, count: i32) -> Result<(), String> {
@@ -158,14 +156,12 @@ impl AckWriter {
         if matches!(self.cfg.word_order, WordOrder::LowWordFirst) {
             words.reverse();
         }
-        send(&self.cfg, Write::Multiple(address, words), None).await
+        send(&self.cfg, self.local_ip, Write::Multiple(address, words), None).await
     }
     /// Mở socket chưa gửi byte nào: lỗi connect không làm intent thành "đã gửi".
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
-        tokio::time::timeout(self.cfg.timeout, TcpStream::connect(&self.cfg.address))
-            .await
-            .map_err(|_| "ACK connect timeout trước Done".to_string())?
-            .map_err(|e| e.to_string())
+        super::connect_tcp(&self.cfg.address, self.local_ip, self.cfg.timeout)
+            .await.map_err(|e| e.to_string())
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
@@ -173,20 +169,19 @@ impl AckWriter {
             self.cfg.modbus_address_offset,
         )
         .ok_or("ACK address overflow")?;
-        send(&self.cfg, Write::Single(address, 1), Some(stream)).await
+        send(&self.cfg, self.local_ip, Write::Single(address, 1), Some(stream)).await
     }
 }
 
 /// Gửi một lệnh ghi qua `tokio-modbus` và chỉ coi là thành công khi PLC echo
 /// đúng địa chỉ/giá trị (FC06) hoặc địa chỉ/số lượng (FC16). Exception, sai
 /// header (transaction/unit), sai function code, mất kết nối hay timeout đều là lỗi.
-async fn send(cfg: &As200Config, write: Write, prepared: Option<TcpStream>) -> Result<(), String> {
+async fn send(cfg: &As200Config, local_ip: Option<std::net::IpAddr>, write: Write, prepared: Option<TcpStream>) -> Result<(), String> {
     let operation = async {
         let stream = match prepared {
             Some(stream) => stream,
-            None => TcpStream::connect(&cfg.address)
-                .await
-                .map_err(|e| e.to_string())?,
+            None => super::connect_tcp(&cfg.address, local_ip, cfg.timeout)
+                .await.map_err(|e| e.to_string())?,
         };
         let mut ctx = tcp::attach_slave(stream, Slave(cfg.unit_id));
         let (request, expected) = match write {
@@ -211,7 +206,10 @@ async fn send(cfg: &As200Config, write: Write, prepared: Option<TcpStream>) -> R
     };
     tokio::time::timeout(cfg.timeout, operation)
         .await
-        .map_err(|_| "ACK timeout".to_string())?
+        .map_err(|_| {
+            eprintln!("PLC_ACK state=TIMEOUT endpoint={} local_ip={local_ip:?}", cfg.address);
+            "ACK hết thời gian kết nối/ghi; giữ intent để đối chiếu, không tự gửi lại. Kiểm tra IP Ethernet và route/interface metric nếu bật Wi-Fi.".to_string()
+        })?
 }
 
 #[cfg(test)]

@@ -117,14 +117,6 @@ impl Engine {
         {
             return self.pause_published_ack_snapshot(&snapshot, format!("RESET/CONFLICT: control không khớp lịch sử v4; total={}, count={}, done={}, accepted={}. Không tự đổi phiên.", c.total_count, c.pc_read_count, c.pc_read_done, progress.accepted)).await;
         }
-        if !snapshot.diagnostics.is_empty() {
-            return self
-                .pause_published_ack_snapshot(
-                    &snapshot,
-                    format!("PUBLISHED_DIAGNOSTIC: {:?}", snapshot.diagnostics),
-                )
-                .await;
-        }
         // Remember increases observed while an intent is pending too, so a later
         // decrease cannot become invisible merely because no record was captured.
         self.observe_published_total(c.total_count).await?;
@@ -150,16 +142,19 @@ impl Engine {
                 };
                 return Ok(());
             }
-            if let Some(record) = snapshot.buffer.as_ref().and_then(|b| b.record.as_ref()) {
-                if record.record_seq <= progress.accepted {
-                    return Err(
-                        "PLC công bố record đã ACK; không lưu lại hoặc tự phát Done lần nữa."
-                            .into(),
-                    );
+            if snapshot.diagnostics.is_empty()
+                && self.config.operator_sku.is_some()
+                && snapshot.buffer.as_ref().and_then(|b| b.record.as_ref())
+                    .is_some_and(|r| r.record_seq == c.total_count)
+            {
+                self.capture_published_snapshot(snapshot.clone()).await?;
+            } else {
+                if progress.accepted.checked_add(1) != Some(c.total_count) {
+                    return self.capture_invalid_snapshot(&snapshot, pool).await;
                 }
+                self.capture_counter_raw(&snapshot).await?;
             }
-            self.capture_published_snapshot(snapshot.clone()).await?;
-            self.flush(pool).await?;
+            self.persist_receipts(pool).await?;
             let delivery = self
                 .journal
                 .lock()
@@ -167,17 +162,14 @@ impl Engine {
                 .deliveries
                 .iter()
                 .find(|d| {
-                    snapshot
-                        .buffer
-                        .as_ref()
-                        .and_then(|b| b.record.as_ref())
-                        .is_some_and(|r| d.input.record_seq == r.record_seq)
+                    d.ack_target() == c.total_count
+                        && snapshot.buffer.as_ref().is_some_and(|b| b.raw_registers == d.input.raw_registers)
                 })
                 .cloned()
                 .ok_or("Thiếu receipt Bản ghi 1 vừa capture.")?;
             recovery::processed_receipt(&self.config, &delivery, pool).await?;
             let prepared = PublishedAckIntent {
-                target: delivery.input.record_seq, // Never substitute TotalCount.
+                target: delivery.ack_target(),
                 inbox_id: delivery.inbox_id.ok_or("Receipt chưa có Inbox ID.")?,
                 raw_registers: delivery.input.raw_registers.clone(),
                 phase: PublishedAckPhase::Prepared,
@@ -197,7 +189,7 @@ impl Engine {
         let delivery = saved
             .deliveries
             .iter()
-            .find(|d| d.input.record_seq == intent.target)
+            .find(|d| d.ack_target() == intent.target)
             .ok_or("Intent Bản ghi 1 thiếu receipt; không ghi PLC.")?;
         recovery::processed_receipt(&self.config, delivery, pool).await?;
         if (matches!(
@@ -205,9 +197,7 @@ impl Engine {
             PublishedAckPhase::CountVerified | PublishedAckPhase::DoneWriteUncertain
         ) && c.pc_read_count != intent.target)
             || snapshot.buffer.as_ref().is_some_and(|b| {
-                b.record.as_ref().is_some_and(|r| {
-                    r.record_seq == intent.target && b.raw_registers != intent.raw_registers
-                })
+                c.total_count == intent.target && b.raw_registers != intent.raw_registers
             })
         {
             return self.pause_published_ack_snapshot(&snapshot,
@@ -235,7 +225,7 @@ impl Engine {
                     self.config.ack_enabled,
                     self.config.ack_protocol.as_deref(),
                     self.config.allow_plc_connection,
-                )?;
+                )?.with_local_ip(self.config.plc_local_ip);
                 updated.phase = PublishedAckPhase::CountWriteUncertain;
                 self.update_published_intent(updated.clone()).await?;
                 writer.count(intent.target).await?;
@@ -267,7 +257,7 @@ impl Engine {
                     self.config.ack_enabled,
                     self.config.ack_protocol.as_deref(),
                     self.config.allow_plc_connection,
-                )?;
+                )?.with_local_ip(self.config.plc_local_ip);
                 let stream = writer.prepare_done().await?;
                 // Socket preparation may take time; verify again before marking/writing Done.
                 self.verify_published_write_snapshot(intent, intent.target)
@@ -277,7 +267,7 @@ impl Engine {
                 writer.done_prepared(stream).await?;
                 // Try to observe the high level promptly, but never infer success
                 // if the pulse has already disappeared or this read fails.
-                if let Ok(control) = As200Reader::new(self.config.reader()).read_control().await {
+                if let Ok(control) = self.config.plc_reader().read_control().await {
                     if control.pc_read_count == intent.target
                         && control.pc_read_done == 1
                         && control.total_count >= intent.target
@@ -367,7 +357,7 @@ impl Engine {
                 != Some(intent)
             || !intent.confirmed_by(snapshot)
             || delivery.inbox_id != Some(intent.inbox_id)
-            || delivery.input.record_seq != intent.target
+            || delivery.ack_target() != intent.target
             || delivery.input.raw_registers != intent.raw_registers
         {
             return Err("Chưa đủ bằng chứng PLC/receipt để compact Journal ACK.".into());
@@ -388,10 +378,10 @@ impl Engine {
         progress.confirmed_receipt = Some(delivery.clone());
         progress.intent = Some(confirmed);
         next.last_total = Some(snapshot.control.total_count);
-        // The only removal is the exact PROCESSED receipt just confirmed by PLC.
+        // Remove only the exact committed raw receipt just confirmed by PLC.
         // Keep an anchor in progress and all unconfirmed/unprocessed deliveries.
         next.deliveries
-            .retain(|d| d.input.record_seq != intent.target);
+            .retain(|d| d.ack_target() != intent.target);
         next.warnings.retain(|w| !w.starts_with("PUBLISHED_ACK:"));
         next.validate(&self.config)?;
         Ok(next)

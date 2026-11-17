@@ -59,6 +59,11 @@ impl InboxRepository {
         }
         let raw = serde_json::to_value(&input.raw_registers).map_err(|e| e.to_string())?;
         if let Some(existing) = existing.into_iter().next() {
+            if crate::services::inbox_service::assigned_sku(&existing.ingest_key, existing.record_seq)?
+                != crate::services::inbox_service::assigned_sku(&input.ingest_key, input.record_seq)?
+            {
+                return Err("CONFLICT: cùng source/session/RecordSeq nhưng SKU đã gán khác nhau; giữ Inbox cũ, không đổi SKU hoặc ACK.".into());
+            }
             if existing.session_id != input.confirmed_session_id
                 || existing.record_seq != input.record_seq
                 || existing.raw_registers != raw
@@ -75,11 +80,19 @@ impl InboxRepository {
         }
         sqlx::query_as("INSERT INTO plc_inbox(source_id,session_id,ingest_key,record_seq,total_count,buffer_index,raw_registers,word_order,received_at,processing_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *")
             .bind(input.source_id).bind(&input.confirmed_session_id).bind(&input.ingest_key).bind(input.record_seq).bind(input.total_count).bind(input.buffer_index).bind(raw).bind(input.word_order.as_str()).bind(input.received_at)
-            .bind(if input.confirmed_session_id.is_some(){"PENDING"}else{"SESSION_UNCONFIRMED"})
+            .bind(if input.confirmed_session_id.is_some() {
+                "PENDING"
+            } else {
+                "SESSION_UNCONFIRMED"
+            })
             .fetch_one(&mut **tx).await.map_err(|e|e.to_string())
     }
     pub async fn pending(pool: &PgPool, limit: i64) -> Result<Vec<InboxRecord>, String> {
         sqlx::query_as("SELECT * FROM plc_inbox WHERE processing_status IN ('PENDING','FAILED') ORDER BY received_at,id LIMIT $1")
+            .bind(limit.clamp(1,100)).fetch_all(pool).await.map_err(|e|e.to_string())
+    }
+    pub async fn raw_snapshots(pool: &PgPool, limit: i64) -> Result<Vec<InboxRecord>, String> {
+        sqlx::query_as("SELECT * FROM plc_inbox WHERE ingest_key LIKE 'raw-published-v1:%' OR ingest_key LIKE 'raw-zero-test-v1:%' OR ingest_key LIKE 'raw-invalid-v1:%' ORDER BY received_at DESC,id DESC LIMIT $1")
             .bind(limit.clamp(1,100)).fetch_all(pool).await.map_err(|e|e.to_string())
     }
     pub async fn pending_for_source(
