@@ -69,9 +69,14 @@ impl AckWriter {
     }
     /// Connect without sending a Modbus request, before the durable Count marker.
     pub async fn prepare_count(&self) -> Result<TcpStream, String> {
-        super::connect_tcp(&self.cfg.address, self.local_ip, self.cfg.timeout)
-            .await
-            .map_err(|e| e.to_string())
+        super::connect_tcp(
+            &self.cfg.address,
+            self.local_ip,
+            self.cfg.network_adapter.as_ref(),
+            self.cfg.timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
     pub async fn count_prepared(&self, count: i32, stream: TcpStream) -> Result<(), String> {
         if count <= 0 {
@@ -97,9 +102,14 @@ impl AckWriter {
     }
     /// Mở socket chưa gửi byte nào: lỗi connect không làm intent thành "đã gửi".
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
-        super::connect_tcp(&self.cfg.address, self.local_ip, self.cfg.timeout)
-            .await
-            .map_err(|e| e.to_string())
+        super::connect_tcp(
+            &self.cfg.address,
+            self.local_ip,
+            self.cfg.network_adapter.as_ref(),
+            self.cfg.timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
@@ -188,6 +198,7 @@ mod tests {
                     stream.write_all(&request).await.unwrap();
                 });
                 let cfg = As200Config {
+                    network_adapter: None,
                     control_start: 25000,
                     record_size: 240,
                     buffer_count: 2,
@@ -228,6 +239,7 @@ mod tests {
                 }
             });
             let cfg = As200Config {
+                network_adapter: None,
                 control_start: 25000,
                 record_size: 240,
                 buffer_count: 2,
@@ -247,6 +259,7 @@ mod tests {
     async fn prepared_done_does_not_send_until_explicitly_consumed() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            network_adapter: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -278,6 +291,7 @@ mod tests {
     ) -> (As200Config, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            network_adapter: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -352,6 +366,7 @@ mod tests {
     async fn prepared_stream_is_used_for_done_without_new_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
+            network_adapter: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -410,6 +425,7 @@ mod tests {
                 socket.write_all(&frame).await.unwrap();
             });
             let cfg = As200Config {
+                network_adapter: None,
                 control_start: 26000,
                 record_size: 240,
                 buffer_count: 2,

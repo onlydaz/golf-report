@@ -141,6 +141,19 @@ impl Default for WorkerStatus {
     }
 }
 impl WorkerStatus {
+    pub(super) fn confirm_read_only_probe(&mut self) {
+        if !self.enabled
+            && self.state == "ERROR"
+            && self.pause_reason.is_none()
+            && !matches!(self.ack_status, "FAILED" | "RECONCILIATION_REQUIRED")
+            && self.blocked_inbox_count == 0
+            && super::network::is_network_error(&self.message)
+        {
+            self.state = "STOPPED".into();
+            self.last_error = None;
+            self.message = "Đã kiểm tra kết nối PLC; bộ thu chưa được khởi động.".into();
+        }
+    }
     fn telemetry_day(now: DateTime<Utc>) -> NaiveDate {
         now.with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap())
             .date_naive()
@@ -205,6 +218,9 @@ pub struct WorkerState {
     reconnect_waiters: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
 }
 impl WorkerState {
+    pub(super) async fn tasks_are_stopped(&self) -> bool {
+        self.tasks.lock().await.is_empty()
+    }
     pub(super) async fn engine_for_diagnostic_read(&self) -> Option<Arc<Engine>> {
         self.engine
             .lock()
@@ -352,6 +368,9 @@ pub(super) struct Engine {
     published_gate: Mutex<()>,
 }
 impl Engine {
+    pub(super) fn connection_config(&self) -> SimulatorConfig {
+        self.config.clone()
+    }
     pub(super) fn try_diagnostic_read_lock(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
@@ -541,10 +560,32 @@ impl Engine {
     }
 }
 impl WorkerState {
-    pub async fn launch(self, app_dir: Option<PathBuf>, database: DatabaseState) {
+    /// Startup prepares settings only, regardless of the persisted enabled flag.
+    /// Only the explicit Connect command may open an Engine/socket.
+    pub async fn initialize(self, app_dir: Option<PathBuf>, database: DatabaseState) {
         let gate = self.settings_gate.clone();
         let _settings_guard = gate.lock().await;
-        self.launch_under_gate(app_dir, database).await;
+        *self.database.lock().await = Some(database);
+        *self.settings_directory.lock().await = app_dir.clone();
+        if let Some(directory) = app_dir.as_deref() {
+            self.load_connection_log(directory).await;
+        }
+        *self.settings_path.lock().await = simulator_config::locate(app_dir.as_deref());
+        self.settings_ready.store(true, Ordering::SeqCst);
+        match simulator_config::load(app_dir.as_deref()) {
+            Ok(Some((config, _))) => {
+                *self.startup_config.lock().await = Some(config.clone());
+                let mut status = self.status.write().await;
+                status.address = config.address;
+                status.unit_id = config.unit_id;
+                status.source_key = config.source_key;
+                status.state = "STOPPED".into();
+                status.message =
+                    "Chưa kết nối PLC. Nhấn Kiểm tra kết nối hoặc Kết nối khi cần.".into();
+            }
+            Ok(None) => {}
+            Err(error) => self.error_status(error).await,
+        }
     }
     pub(super) async fn launch_under_gate(self, app_dir: Option<PathBuf>, database: DatabaseState) {
         *self.database.lock().await = Some(database.clone());

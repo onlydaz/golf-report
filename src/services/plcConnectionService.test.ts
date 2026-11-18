@@ -1,8 +1,41 @@
-  import { describe, expect, it } from "vitest";
-  import { isPlcIp, plcConnectionError } from "./plcConnectionService";
+  import { describe, expect, it, vi } from "vitest";
+  import { invoke } from "@tauri-apps/api/core";
+  import { getPlcConnectionView, isPlcNetworkError, plcConnectionError, savePlcConnectionOptions } from "./plcConnectionService";
+  vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
   import { getMeasurementAvailabilityNotice, getPlcDisplayStatus } from "../hooks/usePlcMonitor";
   import type { As200Status } from "./as200Service";
   describe("PLC connection form", () => {
+    it("shows idle, explicit attempts, real probe failure and later recovery separately", () => {
+      expect(getPlcConnectionView(undefined, null).label).toBe("Chưa kết nối PLC");
+      expect(getPlcConnectionView(undefined, null).feedback).toBeUndefined();
+      expect(getPlcConnectionView(undefined, "test").label).toBe("Đang kiểm tra PLC");
+      expect(getPlcConnectionView(undefined, "connect").label).toBe("Đang kết nối PLC");
+      const report = { tcpConnected: true, modbusReadSucceeded: true, as200Valid: true, mappingWarning: null, message: "Đã kiểm tra PLC." };
+      const probe = getPlcConnectionView(undefined, null, { startedAt: 1000, report });
+      expect(probe.label).toBe("Kết nối PLC hợp lệ"); expect(probe.connected).toBe(false);
+      expect(getPlcConnectionView(undefined, null, {startedAt: 1000, report:{...report, as200Valid:false}}).label).toBe("Kết nối thất bại");
+      const status: As200Status = {
+        enabled:true, address:"127.0.0.1:1503", unitId:1, sourceKey:"test", sessionId:"test", connection:"CONNECTED", state:"WAITING",
+        message:"", pauseReason:null, warnings:[], plcHealth:"RUNNING", pcHeartbeatStatus:"DISABLED",ackStatus:"RECONCILIATION_REQUIRED",
+        latest:null,lastSavedId:null,blockedInboxIds:[],blockedInboxCount:0,retryWaitingCount:0,lastReadAt:new Date(3000).toISOString(),
+      };
+      const failure={startedAt:2000,error:"Chưa phát hiện kết nối Ethernet đến mạng PLC."};
+      const recovered=getPlcConnectionView(status,null,failure);
+      expect(recovered.label).toBe("Đã kết nối PLC");expect(recovered.feedback).toBeUndefined();expect(recovered.color).toBe("green");
+      expect(status.ackStatus).toBe("RECONCILIATION_REQUIRED"); // never reset ACK to fix a network badge
+      expect(getPlcDisplayStatus(status, "").failed).toBe(true);
+      expect(getPlcConnectionView({...status,lastReadAt:new Date(1000).toISOString()},null,failure).label).toBe("Kết nối thất bại");
+      expect(getPlcConnectionView({...status,connection:"DISCONNECTED"},null).label).toBe("Mất kết nối PLC");
+      expect(getPlcConnectionView({...status,enabled:false,state:"STOPPED",connection:"DISABLED"},null).label).toBe("Chưa kết nối PLC");
+      expect(isPlcNetworkError(failure.error)).toBe(true);
+      expect(isPlcNetworkError("ACK chưa rõ; giữ pending receipt")).toBe(false);
+      expect(isPlcNetworkError("PostgreSQL commit thất bại")).toBe(false);
+    });
+    it("saves poll timing without changing deployment adapter settings", async () => {
+      vi.mocked(invoke).mockResolvedValue(undefined);
+      await savePlcConnectionOptions(500);
+      expect(invoke).toHaveBeenLastCalledWith("save_plc_connection_options", { pollIntervalMs: 500 });
+    });
     it("keeps raw diagnostics internal while preserving operator ACK warnings", () => {
       for (const diagnostic of [
         "RAW ZERO: 240 WORD [0, 0] Inbox #42",
@@ -44,10 +77,6 @@
       expect(getPlcDisplayStatus({ ...status, pauseReason: "RESET" }, "").collectionLabel).toBe("Có lỗi");
       expect(getPlcDisplayStatus(status, "Không đọc được trạng thái").verified).toBe(false);
       expect(getPlcDisplayStatus(undefined, "").collectionLabel).toBe("Chưa xác định");
-    });
-    it("accepts IP literals and rejects hosts, malformed IPs or embedded ports", () => {
-      for (const ip of ["127.0.0.1", "192.168.1.10", "::1", "2001:db8::1"]) expect(isPlcIp(ip)).toBe(true);
-      for (const ip of ["localhost", "127.0.0.256", "1.2.3", "1.2.3.4:502", "01.2.3.4", "::xyz", "", "[::1]", " 127.0.0.1"]) expect(isPlcIp(ip)).toBe(false);
     });
     it("keeps technical invoke errors out of the QC message", () => {
       expect(plcConnectionError("Connection refused", "Không thể kết nối với PLC.")).toBe("Không thể kết nối với PLC.");

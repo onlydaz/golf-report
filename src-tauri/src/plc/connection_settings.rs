@@ -51,6 +51,7 @@ pub struct RuntimeParameters {
 pub struct Settings {
     operator_sku: Option<String>,
     plc_local_ip: Option<std::net::IpAddr>,
+    plc_adapter_id: Option<String>,
     endpoint: Endpoint,
     parameters: RuntimeParameters,
     configured: bool,
@@ -186,6 +187,7 @@ fn settings(config: &SimulatorConfig) -> Settings {
     Settings {
         operator_sku: config.operator_sku.clone(),
         plc_local_ip: config.plc_local_ip,
+        plc_adapter_id: config.plc_adapter.as_ref().map(|a| a.id.clone()),
         endpoint: Endpoint {
             ip: address.ip().to_string(),
             port: address.port().into(),
@@ -256,9 +258,51 @@ pub async fn get_plc_connection_settings(
 }
 
 #[tauri::command]
+pub fn get_plc_network_adapters() -> Result<Vec<super::network::Adapter>, String> {
+    super::network::adapters()
+}
+
+#[tauri::command]
+pub async fn inspect_plc_network(
+    state: tauri::State<'_, WorkerState>,
+) -> Result<super::network_route::Status, String> {
+    let dir = directory(&state).await?;
+    let (_, _, config) = current_config(&state, &dir).await?;
+    super::network_route::inspect(&config)
+}
+
+#[tauri::command]
+pub async fn change_plc_host_route(
+    plan: super::network_route::Plan,
+    remove: bool,
+    confirmed: bool,
+    state: tauri::State<'_, WorkerState>,
+) -> Result<super::network_route::Status, String> {
+    if !confirmed {
+        return Err("Cần xác nhận rõ thao tác tuyến trước khi thực hiện.".into());
+    }
+    let gate = state.settings_gate.clone().lock_owned().await;
+    state.ensure_register_writes_stopped().await.map_err(|_| {
+        "Hãy ngắt kết nối và đợi Worker/ACK dừng hoàn toàn trước khi sửa hoặc hoàn tác tuyến."
+            .to_string()
+    })?;
+    let dir = ready(&state).await?;
+    let (path, _, config) = current_config(&state, &dir).await?;
+    let job_config = config.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = gate;
+        super::network_route::change(&job_config, path, plan, remove)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    super::network_route::inspect(&config)
+}
+
+#[tauri::command]
 pub async fn save_plc_connection_options(
     poll_interval_ms: u64,
-    plc_local_ip: String,
+    adapter_id: Option<String>,
+    update_adapter: Option<bool>,
     state: tauri::State<'_, WorkerState>,
 ) -> Result<Settings, String> {
     if !(50..=60000).contains(&poll_interval_ms) {
@@ -273,34 +317,31 @@ pub async fn save_plc_connection_options(
         .as_table_mut()
         .ok_or("Cấu hình PLC không hợp lệ.")?
         .insert("poll_interval_ms".into(), (poll_interval_ms as i64).into());
-    {
-        let value = plc_local_ip;
-        let local_ip: Option<std::net::IpAddr> = if value.trim().is_empty() {
-            None
-        } else {
-            Some(value.trim().parse().map_err(|_| "IP nguồn PLC không hợp lệ. Nhập IP Ethernet, ví dụ 192.168.1.100, hoặc để trống.")?)
-        };
-        if local_ip != config.plc_local_ip {
-            state.ensure_register_writes_stopped().await
-                .map_err(|_| "Cần ngắt kết nối và đợi Worker dừng hoàn toàn trước khi đổi IP nguồn PLC. Không tự dừng hoặc gửi lại ACK.".to_string())?;
-            if let Some(ip) = local_ip {
-                // Bind only: validate local assignment without connecting or writing PLC.
-                let endpoint = config
-                    .address
-                    .parse()
-                    .map_err(|_| "Endpoint PLC không hợp lệ.")?;
-                drop(super::as200::bound_socket(endpoint, ip)?);
-            }
+    if update_adapter.unwrap_or(false) {
+        let adapter = adapter_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(super::network::selection)
+            .transpose()?;
+        if adapter != config.plc_adapter || config.plc_local_ip.is_some() {
+            state.ensure_register_writes_stopped().await.map_err(|_| {
+                "Cần ngắt kết nối và đợi Worker dừng hoàn toàn trước khi đổi adapter PLC."
+                    .to_string()
+            })?;
         }
         let table = document
             .as_table_mut()
             .ok_or("Cấu hình PLC không hợp lệ.")?;
-        match local_ip {
-            Some(ip) => {
-                table.insert("plc_local_ip".into(), ip.to_string().into());
+        table.remove("plc_local_ip");
+        match adapter {
+            Some(adapter) => {
+                table.insert(
+                    "plc_adapter".into(),
+                    toml::Value::try_from(adapter).map_err(|e| e.to_string())?,
+                );
             }
             None => {
-                table.remove("plc_local_ip");
+                table.remove("plc_adapter");
             }
         }
     }
@@ -353,7 +394,14 @@ pub async fn test_plc_connection(
         Some(engine) => Some(engine.try_diagnostic_read_lock()?),
         None => None,
     };
-    Ok(inspect_endpoint(config).await)
+    let report = match engine {
+        Some(ref engine) => inspect_prepared_endpoint(engine.connection_config()).await,
+        None => inspect_endpoint(config).await,
+    };
+    if report.as200_valid && engine.is_none() && state.tasks_are_stopped().await {
+        state.status.write().await.confirm_read_only_probe();
+    }
+    Ok(report)
 }
 
 #[tauri::command]
@@ -404,7 +452,20 @@ pub async fn clear_plc_connection_log(state: tauri::State<'_, WorkerState>) -> R
     state.clear_connection_log().await
 }
 
-async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
+async fn inspect_endpoint(mut config: SimulatorConfig) -> InspectionReport {
+    if let Err(message) = super::network::pin_worker(&mut config) {
+        return InspectionReport {
+            tcp_connected: false,
+            modbus_read_succeeded: false,
+            as200_valid: false,
+            mapping_warning: None,
+            message,
+        };
+    }
+    inspect_prepared_endpoint(config).await
+}
+
+async fn inspect_prepared_endpoint(config: SimulatorConfig) -> InspectionReport {
     let mut report = InspectionReport {
         tcp_connected: false,
         modbus_read_succeeded: false,
@@ -423,6 +484,7 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
     match super::as200::connect_tcp(
         &config.address,
         config.plc_local_ip,
+        config.plc_adapter.as_ref(),
         std::time::Duration::from_millis(config.timeout_ms),
     )
     .await
@@ -446,12 +508,6 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
             report.modbus_read_succeeded = true;
             report.mapping_warning = as200_structure(&snapshot).err();
             report.as200_valid = report.mapping_warning.is_none();
-            if report.as200_valid && !snapshot.diagnostics.is_empty() {
-                report.mapping_warning = Some(format!(
-                    "Raw chưa giải mã thành Measurement: {:?}. Diagnostic này không quyết định quyền ACK.",
-                    snapshot.diagnostics
-                ));
-            }
             report.message = if report.as200_valid {
                 "TCP/Modbus và control AS200 hợp lệ. Lần kiểm tra chỉ đọc, không lưu PostgreSQL hoặc ghi ACK. Worker nhận raw kể cả payload chưa giải mã được."
             } else {

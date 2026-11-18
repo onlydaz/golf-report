@@ -4,12 +4,13 @@ use store::Progress;
 
 impl Engine {
     pub(super) async fn open(
-        config: SimulatorConfig,
+        mut config: SimulatorConfig,
         path: PathBuf,
         state: WorkerState,
         pool: &PgPool,
     ) -> Result<Arc<Self>, String> {
         config.validate()?;
+        super::super::network::pin_worker(&mut config)?;
         if !config.allow_plc_connection
             || config.confirmed_session_id.is_none()
             || config.pc_heartbeat_enabled
@@ -698,8 +699,10 @@ impl WorkerState {
         } else {
             0
         };
+        let mut network_config = config.clone();
+        super::super::network::pin_worker(&mut network_config)?;
         for _ in 0..2 {
-            let snapshot = config
+            let snapshot = network_config
                 .plc_reader()
                 .poll_published_record()
                 .await

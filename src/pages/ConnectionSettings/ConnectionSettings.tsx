@@ -2,10 +2,10 @@ import { ApiOutlined, CheckCircleOutlined, SaveOutlined } from "@ant-design/icon
 import { Alert, Button, Card, Form, Input, InputNumber, Popconfirm } from "antd";
 import { useEffect, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
-import { getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
+import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import { formatReportTime } from "../../utils/reportTime";
-import { clearPlcConnectionLog, connectPlcCollection, isPlcIp, plcConnectionError, savePlcConnectionOptions, stopPlcCollection, testPlcConnection,
-  type PlcEndpoint, type PlcInspectionReport } from "../../services/plcConnectionService";
+import { clearPlcConnectionLog, connectPlcCollection, plcConnectionError, savePlcConnectionOptions, stopPlcCollection, testPlcConnection,
+  getPlcConnectionView, isPlcNetworkError, type PlcConnectionAttempt, type PlcEndpoint } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
 
 export default function ConnectionSettings() {
@@ -14,14 +14,9 @@ export default function ConnectionSettings() {
   const [busy, setBusy] = useState<"test" | "connect" | "stop" | "save" | null>(null);
   const [technicalMode, setTechnicalMode] = useState(false);
   const [pollInterval, setPollInterval] = useState<number | null>(null);
-  const [localIp, setLocalIp] = useState("");
-  const savedLocalIp = settings?.plcLocalIp ?? "";
-  useEffect(() => { setLocalIp(savedLocalIp); }, [savedLocalIp]);
-  const localIpValid = !localIp.trim() || isPlcIp(localIp.trim());
-  const localIpChanged = localIp.trim() !== savedLocalIp;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [inspection, setInspection] = useState<PlcInspectionReport>();
+  const [attempt, setAttempt] = useState<PlcConnectionAttempt>();
   const [clearingLog, setClearingLog] = useState(false);
   const [logError, setLogError] = useState("");
   const [clock, setClock] = useState(Date.now);
@@ -51,25 +46,21 @@ export default function ConnectionSettings() {
       setError("Chu kỳ đọc phải là số nguyên từ 50 đến 60000 ms.");
       return;
     }
-    if (action === "save" && !localIpValid) {
-      setError("IP nguồn PLC không hợp lệ. Nhập IP Ethernet hoặc để trống để hệ điều hành tự chọn.");
-      return;
-    }
+    const startedAt = Date.now();
     inFlight.current = true;
-    setBusy(action); setError(""); setNotice(""); setInspection(undefined);
+    setBusy(action); setError(""); setNotice(""); if (action !== "save") setAttempt({ startedAt });
     try {
       if (action === "save") {
-        const saved = await savePlcConnectionOptions(pollInterval!, localIp.trim());
+        const saved = await savePlcConnectionOptions(pollInterval!);
         if (mounted.current) {
           setPollInterval(saved.parameters.pollIntervalMs);
-          setLocalIp(saved.plcLocalIp ?? "");
           setNotice("Đã lưu cài đặt. Giá trị mới áp dụng khi bắt đầu thu dữ liệu lần tiếp theo.");
         }
         // Saving already succeeded; a failed status refresh must not report it as a save failure.
         await refresh().catch(() => undefined);
       } else if (action === "test") {
         const report = await testPlcConnection();
-        if (mounted.current) setInspection(report);
+        if (mounted.current) setAttempt({ startedAt, report });
       } else {
         if (action === "stop") await stopPlcCollection();
         else await connectPlcCollection();
@@ -78,13 +69,17 @@ export default function ConnectionSettings() {
           : "Đã khởi động bộ thu. Theo dõi trạng thái PLC và ACK bên phải.");
       }
     } catch (reason) {
-      if (mounted.current) setError(plcConnectionError(reason, action === "save" ? "Không thể lưu chu kỳ đọc." : "Không thể thực hiện thao tác kết nối PLC."));
+      if (mounted.current) {
+        const message = plcConnectionError(reason, action === "save" ? "Không thể lưu chu kỳ đọc." : "Không thể thực hiện thao tác kết nối PLC.");
+        if (action === "save") setError(message);
+        else setAttempt({ startedAt, error: message });
+      }
       await refresh().catch(() => undefined);
     } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
   };
-  const display = getPlcDisplayStatus(worker, monitorError);
+  const connectionView = getPlcConnectionView(worker, busy, attempt);
   const workerHasError = !!worker && (!!worker.pauseReason || ["ERROR", "FAILED", "PAUSED"].includes(worker.state));
-  const currentError = monitorError || (workerHasError ? plcConnectionError(worker?.message, "Bộ thu có lỗi; cần đối chiếu.") : "");
+  const currentError = monitorError || (workerHasError && !(connectionView.connected && isPlcNetworkError(worker?.message ?? "")) ? plcConnectionError(worker?.message, "Bộ thu có lỗi; cần đối chiếu.") : "");
   const hasLiveSnapshot = !!worker?.enabled && worker.connection === "CONNECTED" && !monitorError && worker.plcHealth !== "INVALID_DATA";
   const snapshot = hasLiveSnapshot ? worker.controlSnapshot : undefined;
   const memory = settings?.parameters;
@@ -148,11 +143,6 @@ export default function ConnectionSettings() {
             <Form.Item name="unitId" label="Unit ID"><Input readOnly placeholder="—" /></Form.Item>
           </div>
           {technicalMode && <>
-            <Form.Item label="IP nguồn kết nối PLC (Ethernet)" validateStatus={!localIpValid ? "error" : undefined}
-              help={!localIpValid ? "Nhập địa chỉ IP hợp lệ." : "Để trống: hệ điều hành tự chọn. Chọn IP Ethernet của laptop; cần ngắt kết nối trước khi đổi và lưu. Bind IP nguồn không bảo đảm chọn đúng tuyến mạng Windows."}>
-              <Input value={localIp} placeholder="Tự động" disabled={!!busy || !settings || !!worker?.enabled || worker?.state === "STOPPING"}
-                onChange={event => { setLocalIp(event.target.value); setNotice(""); setError(""); }} />
-            </Form.Item>
             <h3 className="plc-config-group">Vùng nhớ giao tiếp</h3>
             <div className="plc-settings-fields">
               {memoryFields.map(([key, label, value]) => key === "pollIntervalMs"
@@ -168,7 +158,7 @@ export default function ConnectionSettings() {
         </Form>
         <div className="plc-settings-actions">
           {technicalMode && <Button type="primary" icon={<SaveOutlined />} loading={busy === "save"}
-            disabled={!!busy || !settings || !pollIntervalValid || !localIpValid || (!localIpChanged && pollInterval === savedPollInterval)}
+            disabled={!!busy || !settings || !pollIntervalValid || pollInterval === savedPollInterval}
             onClick={() => void act("save")}>Lưu cài đặt</Button>}
           <Button className="plc-button-outline" icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
           <Button className={worker?.enabled ? undefined : "plc-button-connect"} danger={worker?.enabled}
@@ -177,14 +167,16 @@ export default function ConnectionSettings() {
         </div>
         <div className="plc-settings-feedback" aria-live="polite">
           {error && <Alert type="error" showIcon title={error} />}
-          {inspection && <Alert showIcon type={inspection.as200Valid ? "success" : "warning"} title={plcConnectionError(inspection.message, "Chưa thể xác minh kết nối PLC.")} description={inspection.mappingWarning ? plcConnectionError(inspection.mappingWarning, "Cần kỹ thuật kiểm tra cấu hình PLC.") : undefined} />}
+
           {notice && <p className="plc-settings-saved"><CheckCircleOutlined /> {notice}</p>}
         </div>
       </Card>
       <div className="plc-settings-right">
         <Card className="plc-settings-card plc-status-card" title="Trạng thái kết nối"
-          extra={<span className={`page-status-pill ${display.verified ? "page-status-connected" : display.failed ? "page-status-error" : "page-status-unverified"}`}><i aria-hidden="true" />{display.plcLabel}</span>}>
-          {currentError && <Alert type="error" showIcon title={currentError} />}
+          extra={<span className={`page-status-pill ${monitorError ? "page-status-error" : connectionView.color === "green" ? "page-status-connected" : connectionView.color === "red" ? "page-status-error" : "page-status-unverified"}`}><i aria-hidden="true" />{monitorError ? "PLC chưa xác minh" : connectionView.label}</span>}>
+          {currentError && (!connectionView.feedback || !isPlcNetworkError(currentError) && currentError !== connectionView.feedback) && <Alert type="error" showIcon title={currentError} />}
+          {connectionView.feedback && <Alert type={connectionView.failed ? "error" : "success"} showIcon title={connectionView.feedback}
+            description={connectionView.detail} />}
           {ackUncertain && <Alert type="error" showIcon title="ACK chưa được đối chiếu" description="Giữ dữ liệu và yêu cầu đang chờ; không tự gửi lại ACK." />}
           <div className="plc-mini-kpis" aria-live="polite">{kpis.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value ?? "—"}</strong></div>)}</div>
         </Card>

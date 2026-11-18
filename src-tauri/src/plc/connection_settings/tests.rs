@@ -4,10 +4,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "golf-single-plc-{}-{}",
+            "golf-single-plc-{}-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
@@ -30,6 +32,7 @@ fn missing_config_creates_disabled_fixed_profile_without_runtime_or_ack() {
     assert_eq!(cfg.address, PLC_ADDRESS);
     assert_eq!(cfg.source_key, SOURCE_KEY);
     assert_eq!(cfg.unit_id, 1);
+    assert!(cfg.plc_local_ip.is_none() && cfg.plc_adapter.is_none());
     assert_eq!(cfg.journal_path.as_deref(), Some(Path::new(JOURNAL)));
     assert!(!cfg.enabled && !cfg.ack_enabled && cfg.read_only && !cfg.technical_setup_confirmed);
     assert!(!dir.0.join("local-runtime").exists());
@@ -152,4 +155,45 @@ async fn inspection_connection_refused_is_not_a_valid_modbus_snapshot() {
     drop(listener);
     let report = inspect_endpoint(cfg).await;
     assert!(!report.tcp_connected && !report.modbus_read_succeeded && !report.as200_valid);
+}
+
+#[tokio::test]
+async fn old_source_ip_and_adapter_do_not_bind_previous_laptop_during_new_probe() {
+    let (address, task) = mock_plc(true).await;
+    let mut cfg = config();
+    cfg.address = address;
+    cfg.plc_local_ip = Some("192.0.2.77".parse().unwrap());
+    cfg.plc_adapter = Some(super::super::network::ManualAdapter {
+        id: "old-laptop-adapter".into(),
+        machine: "old-laptop".into(),
+    });
+    assert!(inspect_endpoint(cfg.clone()).await.as200_valid);
+    assert!(cfg.plc_local_ip.is_some() && cfg.plc_adapter.is_some());
+    task.abort();
+}
+
+#[tokio::test]
+async fn probe_and_worker_reader_share_automatic_transport_and_manual_config() {
+    let (address, task) = mock_plc(true).await;
+    let mut cfg = config();
+    cfg.address = address;
+    assert!(cfg.reader().network_adapter.is_none());
+    assert!(inspect_endpoint(cfg.clone()).await.as200_valid);
+    // The same reader constructor used by Worker, with the same connection policy.
+    assert!(cfg.plc_reader().poll_published_record().await.is_ok());
+    task.abort();
+    cfg.plc_adapter = Some(super::super::network::ManualAdapter {
+        id: "missing-adapter".into(),
+        machine: "another-laptop".into(),
+    });
+    assert_eq!(cfg.reader().network_adapter, cfg.plc_adapter);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.address = listener.local_addr().unwrap().to_string();
+    assert!(!inspect_prepared_endpoint(cfg.clone()).await.tcp_connected);
+    assert!(cfg.plc_reader().poll_published_record().await.is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
 }

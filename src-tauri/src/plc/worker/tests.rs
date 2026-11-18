@@ -16,7 +16,10 @@ fn worker_status_keeps_receipt_metadata_without_legacy_or_raw_payload_fields() {
     };
     let json = serde_json::to_value(status).unwrap();
     for removed in [
-        "publishedRecordSeq", "manualRetryResults", "retryDiagnostics", "volatileCount",
+        "publishedRecordSeq",
+        "manualRetryResults",
+        "retryDiagnostics",
+        "volatileCount",
     ] {
         assert!(json.get(removed).is_none(), "Legacy field {removed}");
     }
@@ -30,12 +33,74 @@ fn worker_status_keeps_receipt_metadata_without_legacy_or_raw_payload_fields() {
 }
 
 struct TestDirectory(PathBuf);
+
+#[tokio::test]
+async fn startup_initializes_settings_without_connecting_even_when_config_enabled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = TestDirectory::new();
+    let template = include_str!("../../../../as200_config.example.toml")
+        .replacen("\nenabled = false", "\nenabled = true", 1)
+        .replace(
+            "192.168.1.5:502",
+            &listener.local_addr().unwrap().to_string(),
+        );
+    std::fs::write(dir.0.join("as200_config.toml"), &template).unwrap();
+    let state = WorkerState::default();
+    state
+        .clone()
+        .initialize(Some(dir.0.clone()), DatabaseState::default())
+        .await;
+    assert!(!state.status.read().await.enabled);
+    assert_eq!(state.status.read().await.state, "STOPPED");
+    assert!(state.tasks.lock().await.is_empty());
+    assert!(state.engine.lock().await.is_none());
+    assert!(state.startup_config.lock().await.as_ref().unwrap().enabled);
+    assert!(!dir.journal().exists() && !dir.journal().with_extension("lock").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.0.join("as200_config.toml")).unwrap(),
+        template
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn successful_probe_clears_only_idle_network_error_not_ack_or_data_evidence() {
+    let mut status = WorkerStatus {
+        state: "ERROR".into(),
+        message: "Chưa phát hiện kết nối Ethernet đến mạng PLC.".into(),
+        ..Default::default()
+    };
+    status.confirm_read_only_probe();
+    assert_eq!(status.state, "STOPPED");
+    assert!(!status.enabled);
+    for fault in ["ack", "pause", "data", "active"] {
+        let mut status = WorkerStatus {
+            state: "ERROR".into(),
+            message: "Chưa phát hiện kết nối Ethernet đến mạng PLC.".into(),
+            ..Default::default()
+        };
+        match fault {
+            "ack" => status.ack_status = "RECONCILIATION_REQUIRED",
+            "pause" => status.pause_reason = Some("RESET".into()),
+            "data" => status.blocked_inbox_count = 1,
+            _ => status.enabled = true,
+        }
+        status.confirm_read_only_probe();
+        assert_eq!(status.state, "ERROR");
+    }
+}
 impl TestDirectory {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "golf-regression-{}-{}",
+            "golf-regression-{}-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
+            Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("as200_config.toml"), "test fixture only").unwrap();

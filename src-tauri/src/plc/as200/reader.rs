@@ -33,9 +33,13 @@ impl ModbusTcpReader {
 
     async fn exchange(&mut self, address: u16, count: u16) -> Result<Vec<u16>, As200Error> {
         if self.ctx.is_none() {
-            let stream =
-                super::connect_tcp(&self.config.address, self.local_ip, self.config.timeout)
-                    .await?;
+            let stream = super::connect_tcp(
+                &self.config.address,
+                self.local_ip,
+                self.config.network_adapter.as_ref(),
+                self.config.timeout,
+            )
+            .await?;
             let ctx = tcp::attach_slave(stream, Slave(self.config.unit_id));
             self.ctx = Some(ctx);
         }

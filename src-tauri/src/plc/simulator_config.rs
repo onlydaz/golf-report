@@ -49,6 +49,7 @@ pub struct SimulatorConfig {
     pub ack_protocol: Option<String>,
     pub address: String,
     pub plc_local_ip: Option<std::net::IpAddr>,
+    pub plc_adapter: Option<super::network::ManualAdapter>,
     pub unit_id: u8,
     pub source_key: String,
     pub confirmed_session_id: Option<String>,
@@ -95,6 +96,7 @@ impl Default for SimulatorConfig {
             journal_path: None,
             operator_sku: None,
             plc_local_ip: None,
+            plc_adapter: None,
         }
     }
 }
@@ -178,9 +180,7 @@ impl SimulatorConfig {
             .address
             .parse()
             .map_err(|_| "Address cần IP:port cụ thể")?;
-        if let Some(ip) = self.plc_local_ip {
-            super::as200::validate_local_ip(address, ip)?;
-        }
+        // Legacy source IP is parsed for compatibility only; never used for sockets.
         if address.port() == 0
             || !(1..=247).contains(&self.unit_id)
             || !(100..=30000).contains(&self.timeout_ms)
@@ -294,6 +294,7 @@ impl SimulatorConfig {
     }
     pub fn reader(&self) -> As200Config {
         As200Config {
+            network_adapter: self.plc_adapter.clone(),
             control_start: self.control_start,
             record_size: self.record_size,
             buffer_count: self.buffer_count,
@@ -308,7 +309,7 @@ impl SimulatorConfig {
         }
     }
     pub fn plc_reader(&self) -> super::as200::reader::As200Reader {
-        super::as200::reader::As200Reader::new(self.reader()).with_local_ip(self.plc_local_ip)
+        super::as200::reader::As200Reader::new(self.reader())
     }
     pub fn heartbeat_timeout(&self) -> Option<Duration> {
         // 5 giây chỉ là policy fixture; không kế thừa ngưỡng này sang PLC thật.

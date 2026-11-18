@@ -4,6 +4,7 @@ pub mod enums;
 pub mod models;
 mod plc;
 pub use plc::as200;
+pub use plc::network_route::helper_entry as plc_route_helper_entry;
 pub mod repositories;
 pub mod services;
 
@@ -147,7 +148,7 @@ pub fn run() {
                 // Acquisition needs the migrated pool; do not race database startup.
                 database_state.initialize(&app_handle).await;
                 match config_dir {
-                    Ok(config_dir) => worker.launch(Some(config_dir), worker_database).await,
+                    Ok(config_dir) => worker.initialize(Some(config_dir), worker_database).await,
                     Err(error) => worker.report_runtime_initialization_failure(error).await,
                 }
             });
@@ -167,6 +168,9 @@ pub fn run() {
             plc::worker::get_as200_worker_status,
             plc::worker::reconnect_as200_plc,
             plc::connection_settings::get_plc_connection_settings,
+            plc::connection_settings::get_plc_network_adapters,
+            plc::connection_settings::inspect_plc_network,
+            plc::connection_settings::change_plc_host_route,
             plc::connection_settings::save_plc_connection_options,
             plc::connection_settings::save_operator_sku,
             plc::connection_settings::stop_plc_collection,

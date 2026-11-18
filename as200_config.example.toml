@@ -14,9 +14,9 @@
 enabled = false
 mode = "modbus"
 address = "192.168.1.5:502"
-# Optional source IP assigned to the laptop Ethernet adapter; omit for OS selection.
-# plc_local_ip = "192.168.1.100"
-# Source binding does not force the Windows route. Check route/interface metrics if needed.
+# Automatic: no local IP or adapter is saved. Windows selects the route.
+# Manual Ethernet is selected on THIS laptop in Connection Settings after installation.
+# Do not copy plc_adapter or legacy plc_local_ip from another laptop.
 unit_id = 1
 source_key = "golf-report-plc-01"
 confirmed_session_id = "golf-report-plc-01-initial"

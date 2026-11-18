@@ -1,3 +1,4 @@
+import type { As200Status } from "./as200Service";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface PlcEndpoint { ip: string; port: number; unitId: number }
@@ -20,6 +21,7 @@ export interface PlcRuntimeParameters {
 export interface PlcConnectionSettings {
   operatorSku?: string | null;
   plcLocalIp?: string | null;
+  plcAdapterId?: string | null;
   parameters: PlcRuntimeParameters;
   endpoint: PlcEndpoint;
   configured: boolean;
@@ -27,8 +29,8 @@ export interface PlcConnectionSettings {
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
 export const saveOperatorSku = (sku: string) => invoke<PlcConnectionSettings>("save_operator_sku", { sku });
 export const clearPlcConnectionLog = () => invoke<void>("clear_plc_connection_log");
-export const savePlcConnectionOptions = (pollIntervalMs: number, plcLocalIp: string) =>
-  invoke<PlcConnectionSettings>("save_plc_connection_options", { pollIntervalMs, plcLocalIp });
+export const savePlcConnectionOptions = (pollIntervalMs: number) =>
+  invoke<PlcConnectionSettings>("save_plc_connection_options", { pollIntervalMs });
 export interface PlcInspectionReport {
   tcpConnected: boolean;
   modbusReadSucceeded: boolean;
@@ -40,14 +42,40 @@ export const testPlcConnection = () => invoke<PlcInspectionReport>("test_plc_con
 export const connectPlcCollection = () => invoke<void>("connect_plc_collection");
 export const stopPlcCollection = () => invoke<void>("stop_plc_collection");
 
-export function isPlcIp(value: string): boolean {
-  if (value.includes(":")) {
-    if (!/^[0-9a-fA-F:]+$/.test(value)) return false;
-    try { return new URL(`http://[${value}]/`).hostname.length > 0; } catch { return false; }
-  }
-  const parts = value.split(".");
-  return parts.length === 4 && parts.every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+export interface PlcConnectionAttempt {
+  startedAt: number;
+  error?: string;
+  report?: PlcInspectionReport;
 }
+
+export function isPlcNetworkError(message: string): boolean {
+  return /Chưa phát hiện kết nối Ethernet|IPv4 của Ethernet|Đường mạng đến PLC|Lỗi Modbus TCP AS200|kết nối TCP PLC|Hết thời gian kết nối\/đọc AS200/i.test(message);
+}
+
+// Connection evidence is separate from ACK/storage health. A successful probe
+// never claims that collection is running or that a pending ACK is resolved.
+export function getPlcConnectionView(status: As200Status | undefined, action: string | null, attempt?: PlcConnectionAttempt) {
+  const pending = action && action !== "save";
+  const connected = !!status?.enabled && status.connection === "CONNECTED" && !!status.lastReadAt && status.plcHealth !== "INVALID_DATA";
+  const recovered = connected && !!attempt && Date.parse(status!.lastReadAt!) > attempt.startedAt;
+  const feedback = pending ? undefined : !recovered ? attempt?.error || attempt?.report?.message : undefined;
+  const failed = !recovered && (!!attempt?.error || !!attempt?.report && !attempt.report.as200Valid);
+  const label = action === "test" ? "Đang kiểm tra PLC" : action === "connect" ? "Đang kết nối PLC"
+    : action === "stop" || status?.state === "STOPPING" ? "Đang dừng"
+    : status?.enabled && status.connection === "CONNECTING" ? "Đang kết nối PLC"
+    : connected && (!failed || recovered) ? "Đã kết nối PLC"
+    : status?.enabled && status.connection === "DISCONNECTED" ? "Mất kết nối PLC"
+    : failed ? "Kết nối thất bại"
+    : attempt?.report?.as200Valid ? "Kết nối PLC hợp lệ" : "Chưa kết nối PLC";
+  return { label, connected,
+    color: pending ? "default" : connected && (!failed || recovered) || attempt?.report?.as200Valid && !status?.enabled ? "green"
+      : failed && !recovered || status?.enabled && status.connection === "DISCONNECTED" ? "red" : "default",
+    feedback: feedback ? plcConnectionError(feedback, "Chưa thể xác minh kết nối PLC.") : undefined,
+    detail: feedback && attempt?.report?.mappingWarning ? plcConnectionError(attempt.report.mappingWarning, "Cần kỹ thuật kiểm tra cấu hình PLC.") : undefined,
+    failed,
+  };
+}
+
 export function plcConnectionError(error: unknown, fallback: string): string {
   if (typeof error !== "string") return fallback;
   // Backend diagnostics remain internal; operator messages retain the required action.
