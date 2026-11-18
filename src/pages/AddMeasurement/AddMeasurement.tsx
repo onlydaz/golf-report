@@ -370,7 +370,7 @@ function AddMeasurement() {
   };
   const measurementAvailabilityNotice = getMeasurementAvailabilityNotice(status);
   const showSystemNotice = !!measurementAvailabilityNotice || !!error || !!status && (
-    !status.enabled || ["STOPPING", "ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || !!status.pauseReason ||
+    ["STOPPING", "ERROR", "FAILED", "PAUSED", "SESSION_UNCONFIRMED"].includes(status.state) || !!status.pauseReason ||
     status.connection === "DISCONNECTED" ||
     status.enabled && status.plcHealth !== "RUNNING" ||
     status.ackStatus === "FAILED" || status.ackStatus === "RECONCILIATION_REQUIRED" ||
@@ -406,7 +406,7 @@ function AddMeasurement() {
     } else if (status.state === "STOPPING") {
       systemNotice = "Hệ thống đang dừng thu dữ liệu.";
     } else if (!status.enabled) {
-      systemNotice = "Hệ thống đã dừng thu dữ liệu. Có thể bắt đầu thu tại đây khi đủ điều kiện.";
+      systemNotice = "";
     } else if (status.connection === "DISCONNECTED") {
       systemNotice = "Mất kết nối với máy đo. Đang thử kết nối lại...";
     } else if (status.pcHeartbeatStatus === "FAILED") {
@@ -424,7 +424,7 @@ function AddMeasurement() {
     }
   }
   const visibleWarnings = (status?.warnings ?? []).filter((warning) =>
-    !/^(?:RESET_CONTEXT:|RESET:)/.test(warning) && !(resetConfirmationReady && /^QUARANTINE:/.test(warning))
+    !/^(?:ACK_HEARTBEAT_BYPASS:|RESET_CONTEXT:|RESET:)/.test(warning) && !(resetConfirmationReady && /^QUARANTINE:/.test(warning))
   ).map((warning) => ({
     message: displayNotice(warning, "Hệ thống ghi nhận cảnh báo. Vui lòng liên hệ kỹ thuật để kiểm tra."),
     severity: (/BUFFER GAP|OVERFLOW|QUEUE_FULL|CONFLICT|LOCAL_HISTORY_MISSING|DIAGNOSTIC_FULL|QUARANTINE|INBOX_RETRY_BLOCKED/.test(warning) ? "error" : "warning") as "error" | "warning",
@@ -553,7 +553,7 @@ function AddMeasurement() {
           && !!activeDetail && activeDetail.productCode === currentSku ? activeDetail.sourceId : undefined} />
       </div>
 
-      {showSystemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
+      {showSystemNotice && !!systemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert
         type={error || status?.state === "ERROR" || status?.state === "FAILED" || status?.pauseReason || latest?.saveState === "FAILED" || status?.ackStatus === "FAILED" || status?.ackStatus === "RECONCILIATION_REQUIRED" ? "error" : "warning"}
         showIcon
         className="add-measurement-alert"

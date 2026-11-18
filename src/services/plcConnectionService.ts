@@ -20,8 +20,6 @@ export interface PlcRuntimeParameters {
 }
 export interface PlcConnectionSettings {
   operatorSku?: string | null;
-  plcLocalIp?: string | null;
-  plcAdapterId?: string | null;
   parameters: PlcRuntimeParameters;
   endpoint: PlcEndpoint;
   configured: boolean;
@@ -29,8 +27,6 @@ export interface PlcConnectionSettings {
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
 export const saveOperatorSku = (sku: string) => invoke<PlcConnectionSettings>("save_operator_sku", { sku });
 export const clearPlcConnectionLog = () => invoke<void>("clear_plc_connection_log");
-export const savePlcConnectionOptions = (pollIntervalMs: number) =>
-  invoke<PlcConnectionSettings>("save_plc_connection_options", { pollIntervalMs });
 export interface PlcInspectionReport {
   tcpConnected: boolean;
   modbusReadSucceeded: boolean;
@@ -49,13 +45,13 @@ export interface PlcConnectionAttempt {
 }
 
 export function isPlcNetworkError(message: string): boolean {
-  return /Chưa phát hiện kết nối Ethernet|IPv4 của Ethernet|Đường mạng đến PLC|Lỗi Modbus TCP AS200|kết nối TCP PLC|Hết thời gian kết nối\/đọc AS200/i.test(message);
+  return /Lỗi Modbus TCP AS200|kết nối TCP PLC|Hết thời gian kết nối\/đọc AS200/i.test(message);
 }
 
 // Connection evidence is separate from ACK/storage health. A successful probe
 // never claims that collection is running or that a pending ACK is resolved.
 export function getPlcConnectionView(status: As200Status | undefined, action: string | null, attempt?: PlcConnectionAttempt) {
-  const pending = action && action !== "save";
+  const pending = !!action;
   const connected = !!status?.enabled && status.connection === "CONNECTED" && !!status.lastReadAt && status.plcHealth !== "INVALID_DATA";
   const recovered = connected && !!attempt && Date.parse(status!.lastReadAt!) > attempt.startedAt;
   const feedback = pending ? undefined : !recovered ? attempt?.error || attempt?.report?.message : undefined;

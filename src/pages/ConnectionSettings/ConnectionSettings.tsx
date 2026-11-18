@@ -1,20 +1,18 @@
-import { ApiOutlined, CheckCircleOutlined, SaveOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, Form, Input, InputNumber, Popconfirm } from "antd";
+import { ApiOutlined, CheckCircleOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, Form, Input, Popconfirm } from "antd";
 import { useEffect, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
 import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import { formatReportTime } from "../../utils/reportTime";
-import { clearPlcConnectionLog, connectPlcCollection, plcConnectionError, savePlcConnectionOptions, stopPlcCollection, testPlcConnection,
+import { clearPlcConnectionLog, connectPlcCollection, plcConnectionError, stopPlcCollection, testPlcConnection,
   getPlcConnectionView, isPlcNetworkError, type PlcConnectionAttempt, type PlcEndpoint } from "../../services/plcConnectionService";
 import "./ConnectionSettings.css";
 
 export default function ConnectionSettings() {
   const [form] = Form.useForm<PlcEndpoint>();
   const { status: worker, settings, error: monitorError, refresh } = usePlcMonitor();
-  const [busy, setBusy] = useState<"test" | "connect" | "stop" | "save" | null>(null);
+  const [busy, setBusy] = useState<"test" | "connect" | "stop" | null>(null);
   const [technicalMode, setTechnicalMode] = useState(false);
-  const [pollInterval, setPollInterval] = useState<number | null>(null);
-  const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [attempt, setAttempt] = useState<PlcConnectionAttempt>();
   const [clearingLog, setClearingLog] = useState(false);
@@ -31,34 +29,17 @@ export default function ConnectionSettings() {
   const inFlight = useRef(false);
   const mounted = useRef(true);
   useEffect(() => { if (settings) form.setFieldsValue(settings.endpoint); }, [form, settings]);
-  const savedPollInterval = settings?.parameters.pollIntervalMs;
-  useEffect(() => {
-    setPollInterval(savedPollInterval ?? null);
-  }, [savedPollInterval]);
-  const pollIntervalValid = pollInterval !== null && Number.isInteger(pollInterval) && pollInterval >= 50 && pollInterval <= 60000;
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
-  const act = async (action: "test" | "connect" | "stop" | "save") => {
+  const act = async (action: "test" | "connect" | "stop") => {
     if (inFlight.current) return;
-    if (action === "save" && !pollIntervalValid) {
-      setError("Chu kỳ đọc phải là số nguyên từ 50 đến 60000 ms.");
-      return;
-    }
     const startedAt = Date.now();
     inFlight.current = true;
-    setBusy(action); setError(""); setNotice(""); if (action !== "save") setAttempt({ startedAt });
+    setBusy(action); setNotice(""); setAttempt({ startedAt });
     try {
-      if (action === "save") {
-        const saved = await savePlcConnectionOptions(pollInterval!);
-        if (mounted.current) {
-          setPollInterval(saved.parameters.pollIntervalMs);
-          setNotice("Đã lưu cài đặt. Giá trị mới áp dụng khi bắt đầu thu dữ liệu lần tiếp theo.");
-        }
-        // Saving already succeeded; a failed status refresh must not report it as a save failure.
-        await refresh().catch(() => undefined);
-      } else if (action === "test") {
+      if (action === "test") {
         const report = await testPlcConnection();
         if (mounted.current) setAttempt({ startedAt, report });
       } else {
@@ -70,9 +51,8 @@ export default function ConnectionSettings() {
       }
     } catch (reason) {
       if (mounted.current) {
-        const message = plcConnectionError(reason, action === "save" ? "Không thể lưu chu kỳ đọc." : "Không thể thực hiện thao tác kết nối PLC.");
-        if (action === "save") setError(message);
-        else setAttempt({ startedAt, error: message });
+        const message = plcConnectionError(reason, "Không thể thực hiện thao tác kết nối PLC.");
+        setAttempt({ startedAt, error: message });
       }
       await refresh().catch(() => undefined);
     } finally { inFlight.current = false; if (mounted.current) setBusy(null); }
@@ -87,7 +67,7 @@ export default function ConnectionSettings() {
     ["controlStart", "Thanh ghi bắt đầu (D)", memory?.controlStart],
     ["modbusAddressOffset", "Lệch địa chỉ Modbus", memory?.modbusAddressOffset],
     ["recordSize", "Kích thước bản ghi (WORD)", memory?.recordSize],
-    ["pollIntervalMs", "Chu kỳ đọc (ms)", null],
+    ["pollIntervalMs", "Chu kỳ đọc (ms)", memory?.pollIntervalMs],
     ["timeoutMs", "Timeout kết nối / đọc (ms)", memory?.timeoutMs],
     ["retryIntervalMs", "Chu kỳ retry (ms)", memory?.retryIntervalMs],
     ["wordOrder", "Thứ tự word REAL/DINT", memory?.wordOrder === "LOW" ? "Word thấp trước" : memory?.wordOrder === "HIGH" ? "Word cao trước" : null],
@@ -145,29 +125,18 @@ export default function ConnectionSettings() {
           {technicalMode && <>
             <h3 className="plc-config-group">Vùng nhớ giao tiếp</h3>
             <div className="plc-settings-fields">
-              {memoryFields.map(([key, label, value]) => key === "pollIntervalMs"
-                ? <Form.Item key={key} label={label} validateStatus={settings && !pollIntervalValid ? "error" : undefined}
-                    help={settings && !pollIntervalValid ? "Nhập số nguyên từ 50 đến 60000 ms." : undefined}>
-                    <InputNumber<number> value={pollInterval} min={50} max={60000} precision={0}
-                      disabled={!!busy || !settings}
-                      onChange={value => { setPollInterval(value); setNotice(""); setError(""); }} />
-                  </Form.Item>
-                : <Form.Item key={key} label={label}><Input readOnly value={value ?? ""} placeholder="—" /></Form.Item>)}
+              {memoryFields.map(([key, label, value]) =>
+                <Form.Item key={key} label={label}><Input readOnly value={value ?? ""} placeholder="—" /></Form.Item>)}
             </div>
           </>}
         </Form>
         <div className="plc-settings-actions">
-          {technicalMode && <Button type="primary" icon={<SaveOutlined />} loading={busy === "save"}
-            disabled={!!busy || !settings || !pollIntervalValid || pollInterval === savedPollInterval}
-            onClick={() => void act("save")}>Lưu cài đặt</Button>}
           <Button className="plc-button-outline" icon={<ApiOutlined />} loading={busy === "test"} disabled={!!busy || !settings} onClick={() => void act("test")}>Kiểm tra kết nối</Button>
           <Button className={worker?.enabled ? undefined : "plc-button-connect"} danger={worker?.enabled}
             loading={busy === "connect" || busy === "stop"} disabled={!!busy || (!settings && !worker?.enabled) || worker?.state === "STOPPING"}
             onClick={() => void act(worker?.enabled ? "stop" : "connect")}>{worker?.enabled ? "Ngắt kết nối" : "Kết nối"}</Button>
         </div>
         <div className="plc-settings-feedback" aria-live="polite">
-          {error && <Alert type="error" showIcon title={error} />}
-
           {notice && <p className="plc-settings-saved"><CheckCircleOutlined /> {notice}</p>}
         </div>
       </Card>

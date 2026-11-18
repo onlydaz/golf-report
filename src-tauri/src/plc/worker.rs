@@ -148,7 +148,9 @@ impl WorkerStatus {
             && self.pause_reason.is_none()
             && !matches!(self.ack_status, "FAILED" | "RECONCILIATION_REQUIRED")
             && self.blocked_inbox_count == 0
-            && super::network::is_network_error(&self.message)
+            && ["Lỗi Modbus TCP AS200:", "Hết thời gian kết nối/đọc AS200"]
+                .iter()
+                .any(|error| self.message.contains(error))
         {
             self.state = "STOPPED".into();
             self.last_error = None;
@@ -345,6 +347,11 @@ impl WorkerState {
     }
     async fn fresh_health(&self) -> bool {
         let mut status = self.status.write().await;
+        // This configuration choice is diagnostic only, not an operator warning.
+        // Status polling also removes old entries while the Worker is idle.
+        status
+            .warnings
+            .retain(|warning| !warning.starts_with("ACK_HEARTBEAT_BYPASS:"));
         let health = self
             .heartbeat
             .lock()
@@ -357,6 +364,28 @@ impl WorkerState {
             }
         }
         health == Some("RUNNING") && status.plc_health == "RUNNING"
+    }
+
+    // Used only after a successful, matching Modbus snapshot before an ACK write.
+    // Monitoring remains independent: bypass never changes STALE to RUNNING.
+    async fn heartbeat_allows_ack(&self, required: bool) -> bool {
+        const WARNING: &str = "ACK_HEARTBEAT_BYPASS: require_plc_heartbeat_for_ack=false; cho phép ACK khi heartbeat OBSERVING/STALE, vẫn kiểm tra các điều kiện an toàn khác.";
+        let running = self.fresh_health().await;
+        let status = self.status.read().await;
+        let observed_health = self
+            .heartbeat
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.health(std::time::Instant::now()));
+        let bypass = !required
+            && status.connection == "CONNECTED"
+            && matches!(observed_health, Some("OBSERVING" | "STALE"))
+            && observed_health == Some(status.plc_health.as_str());
+        if bypass {
+            eprintln!("PLC_WORKER {WARNING} health={}", status.plc_health);
+        }
+        status.connection == "CONNECTED" && (running || bypass)
     }
 }
 pub(super) struct Engine {

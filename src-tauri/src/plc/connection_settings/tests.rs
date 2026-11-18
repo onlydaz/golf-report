@@ -32,7 +32,6 @@ fn missing_config_creates_disabled_fixed_profile_without_runtime_or_ack() {
     assert_eq!(cfg.address, PLC_ADDRESS);
     assert_eq!(cfg.source_key, SOURCE_KEY);
     assert_eq!(cfg.unit_id, 1);
-    assert!(cfg.plc_local_ip.is_none() && cfg.plc_adapter.is_none());
     assert_eq!(cfg.journal_path.as_deref(), Some(Path::new(JOURNAL)));
     assert!(!cfg.enabled && !cfg.ack_enabled && cfg.read_only && !cfg.technical_setup_confirmed);
     assert!(!dir.0.join("local-runtime").exists());
@@ -158,42 +157,35 @@ async fn inspection_connection_refused_is_not_a_valid_modbus_snapshot() {
 }
 
 #[tokio::test]
-async fn old_source_ip_and_adapter_do_not_bind_previous_laptop_during_new_probe() {
-    let (address, task) = mock_plc(true).await;
-    let mut cfg = config();
-    cfg.address = address;
-    cfg.plc_local_ip = Some("192.0.2.77".parse().unwrap());
-    cfg.plc_adapter = Some(super::super::network::ManualAdapter {
-        id: "old-laptop-adapter".into(),
-        machine: "old-laptop".into(),
-    });
-    assert!(inspect_endpoint(cfg.clone()).await.as200_valid);
-    assert!(cfg.plc_local_ip.is_some() && cfg.plc_adapter.is_some());
-    task.abort();
-}
-
-#[tokio::test]
-async fn probe_and_worker_reader_share_automatic_transport_and_manual_config() {
-    let (address, task) = mock_plc(true).await;
-    let mut cfg = config();
-    cfg.address = address;
-    assert!(cfg.reader().network_adapter.is_none());
-    assert!(inspect_endpoint(cfg.clone()).await.as200_valid);
-    // The same reader constructor used by Worker, with the same connection policy.
-    assert!(cfg.plc_reader().poll_published_record().await.is_ok());
-    task.abort();
-    cfg.plc_adapter = Some(super::super::network::ManualAdapter {
-        id: "missing-adapter".into(),
-        machine: "another-laptop".into(),
-    });
-    assert_eq!(cfg.reader().network_adapter, cfg.plc_adapter);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    cfg.address = listener.local_addr().unwrap().to_string();
-    assert!(!inspect_prepared_endpoint(cfg.clone()).await.tcp_connected);
-    assert!(cfg.plc_reader().poll_published_record().await.is_err());
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
-            .await
-            .is_err()
-    );
+async fn probe_reader_and_ack_sockets_use_system_routing_despite_legacy_adapter_settings() {
+    for legacy in [false, true] {
+        let (address, task) = mock_plc(true).await;
+        let text = if legacy {
+            format!(
+                "{DEFAULT_CONFIG}\nplc_local_ip='192.0.2.77'\n[plc_adapter]\nid='missing-adapter'\nmachine='old-laptop'\n"
+            )
+        } else {
+            DEFAULT_CONFIG.into()
+        };
+        let mut cfg = simulator_config::parse(&text).unwrap();
+        cfg.address = address;
+        assert!(inspect_endpoint(cfg.clone()).await.as200_valid);
+        // Worker uses this same reader. No adapter inventory, pin or source bind.
+        assert!(cfg.plc_reader().poll_published_record().await.is_ok());
+        // Preparing Count/Done connects, but sends no Modbus bytes.
+        let writer = super::super::as200::ack::AckWriter::new(
+            cfg.reader(),
+            "modbus",
+            true,
+            Some("as200"),
+            true,
+        )
+        .unwrap();
+        drop(writer.prepare_count().await.unwrap());
+        drop(writer.prepare_done().await.unwrap());
+        // The mock asserts every actual request is FC03: no ACK can be sent here.
+        // A final probe also proves reconnect works with the same policy.
+        assert!(inspect_endpoint(cfg).await.as200_valid);
+        task.abort();
+    }
 }

@@ -19,7 +19,6 @@ enum Write {
 /// Chỉ constructor này cấp quyền ghi, dựa trên mode/protocol và opt-in rõ ràng.
 pub struct AckWriter {
     cfg: As200Config,
-    local_ip: Option<std::net::IpAddr>,
 }
 impl AckWriter {
     pub fn new(
@@ -49,14 +48,7 @@ impl AckWriter {
         if !enabled || !permitted || address.port() == 0 {
             return Err("ACK write capability disabled".into());
         }
-        Ok(Self {
-            cfg,
-            local_ip: None,
-        })
-    }
-    pub fn with_local_ip(mut self, local_ip: Option<std::net::IpAddr>) -> Self {
-        self.local_ip = local_ip;
-        self
+        Ok(Self { cfg })
     }
     // Không có API địa chỉ tùy ý: FC16 chỉ D25008..09, FC06 chỉ D25012=1.
     #[cfg(test)]
@@ -69,14 +61,9 @@ impl AckWriter {
     }
     /// Connect without sending a Modbus request, before the durable Count marker.
     pub async fn prepare_count(&self) -> Result<TcpStream, String> {
-        super::connect_tcp(
-            &self.cfg.address,
-            self.local_ip,
-            self.cfg.network_adapter.as_ref(),
-            self.cfg.timeout,
-        )
-        .await
-        .map_err(|e| e.to_string())
+        super::connect_tcp(&self.cfg.address, self.cfg.local_bind_ip, self.cfg.timeout)
+            .await
+            .map_err(|e| e.to_string())
     }
     pub async fn count_prepared(&self, count: i32, stream: TcpStream) -> Result<(), String> {
         if count <= 0 {
@@ -92,24 +79,13 @@ impl AckWriter {
         if matches!(self.cfg.word_order, WordOrder::LowWordFirst) {
             words.reverse();
         }
-        send(
-            &self.cfg,
-            self.local_ip,
-            Write::Multiple(address, words),
-            stream,
-        )
-        .await
+        send(&self.cfg, Write::Multiple(address, words), stream).await
     }
     /// Mở socket chưa gửi byte nào: lỗi connect không làm intent thành "đã gửi".
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
-        super::connect_tcp(
-            &self.cfg.address,
-            self.local_ip,
-            self.cfg.network_adapter.as_ref(),
-            self.cfg.timeout,
-        )
-        .await
-        .map_err(|e| e.to_string())
+        super::connect_tcp(&self.cfg.address, self.cfg.local_bind_ip, self.cfg.timeout)
+            .await
+            .map_err(|e| e.to_string())
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
@@ -117,19 +93,14 @@ impl AckWriter {
             self.cfg.modbus_address_offset,
         )
         .ok_or("ACK address overflow")?;
-        send(&self.cfg, self.local_ip, Write::Single(address, 1), stream).await
+        send(&self.cfg, Write::Single(address, 1), stream).await
     }
 }
 
 /// Gửi một lệnh ghi qua `tokio-modbus` và chỉ coi là thành công khi PLC echo
 /// đúng địa chỉ/giá trị (FC06) hoặc địa chỉ/số lượng (FC16). Exception, sai
 /// header (transaction/unit), sai function code, mất kết nối hay timeout đều là lỗi.
-async fn send(
-    cfg: &As200Config,
-    local_ip: Option<std::net::IpAddr>,
-    write: Write,
-    stream: TcpStream,
-) -> Result<(), String> {
+async fn send(cfg: &As200Config, write: Write, stream: TcpStream) -> Result<(), String> {
     let operation = async {
         let mut ctx = tcp::attach_slave(stream, Slave(cfg.unit_id));
         let (request, expected) = match write {
@@ -155,8 +126,8 @@ async fn send(
     tokio::time::timeout(cfg.timeout, operation)
         .await
         .map_err(|_| {
-            eprintln!("PLC_ACK state=TIMEOUT endpoint={} local_ip={local_ip:?}", cfg.address);
-            "ACK hết thời gian kết nối/ghi; giữ intent để đối chiếu, không tự gửi lại. Kiểm tra IP Ethernet và route/interface metric nếu bật Wi-Fi.".to_string()
+            eprintln!("PLC_ACK state=TIMEOUT endpoint={}", cfg.address);
+            "ACK hết thời gian kết nối/ghi; giữ intent để đối chiếu, không tự gửi lại.".to_string()
         })?
 }
 
@@ -198,7 +169,7 @@ mod tests {
                     stream.write_all(&request).await.unwrap();
                 });
                 let cfg = As200Config {
-                    network_adapter: None,
+                    local_bind_ip: None,
                     control_start: 25000,
                     record_size: 240,
                     buffer_count: 2,
@@ -239,7 +210,7 @@ mod tests {
                 }
             });
             let cfg = As200Config {
-                network_adapter: None,
+                local_bind_ip: None,
                 control_start: 25000,
                 record_size: 240,
                 buffer_count: 2,
@@ -259,7 +230,7 @@ mod tests {
     async fn prepared_done_does_not_send_until_explicitly_consumed() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
-            network_adapter: None,
+            local_bind_ip: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -291,7 +262,7 @@ mod tests {
     ) -> (As200Config, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
-            network_adapter: None,
+            local_bind_ip: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -366,7 +337,7 @@ mod tests {
     async fn prepared_stream_is_used_for_done_without_new_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = As200Config {
-            network_adapter: None,
+            local_bind_ip: None,
             control_start: 25000,
             record_size: 240,
             buffer_count: 2,
@@ -425,7 +396,7 @@ mod tests {
                 socket.write_all(&frame).await.unwrap();
             });
             let cfg = As200Config {
-                network_adapter: None,
+                local_bind_ip: None,
                 control_start: 26000,
                 record_size: 240,
                 buffer_count: 2,

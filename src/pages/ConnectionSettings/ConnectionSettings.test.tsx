@@ -16,7 +16,8 @@ describe("QC PLC connection page", () => {
     for (const label of ["4 · Kết nối PLC", "Thiết lập kỹ thuật", "Kiểm tra kết nối", "Kết nối", "Trạng thái kết nối", "Nhật ký kết nối PLC", "Chưa kết nối PLC", "Heartbeat PLC"]) {
       expect(html).toContain(label);
     }
-    for (const removed of ["Kết nối mạng PLC", "Automatic", "Manual", "Cập nhật card mạng", "Khắc phục đường mạng", "Chưa phát hiện kết nối Ethernet"]) {
+    expect(html).not.toContain("Chỉnh thông số trong as200_config.toml");
+    for (const removed of ["Kết nối mạng PLC", "Automatic", "Manual", "Cập nhật card mạng", "Khắc phục đường mạng", "Chưa phát hiện kết nối Ethernet", "Lưu cài đặt", "ant-input-number"]) {
       expect(html).not.toContain(removed);
     }
     expect(invoke).not.toHaveBeenCalled();

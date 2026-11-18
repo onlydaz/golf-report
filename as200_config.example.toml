@@ -14,9 +14,10 @@
 enabled = false
 mode = "modbus"
 address = "192.168.1.5:502"
-# Automatic: no local IP or adapter is saved. Windows selects the route.
-# Manual Ethernet is selected on THIS laptop in Connection Settings after installation.
-# Do not copy plc_adapter or legacy plc_local_ip from another laptop.
+# Windows selects the route. Omit local_bind_ip to let Windows select the source IP.
+# Optional: bind an IP already assigned to this laptop before connecting.
+# local_bind_ip = "192.168.1.100"
+# Edit PLC connection parameters here while the app is stopped, then restart it.
 unit_id = 1
 source_key = "golf-report-plc-01"
 confirmed_session_id = "golf-report-plc-01-initial"
@@ -32,6 +33,8 @@ poll_interval_ms = 500
 retry_interval_ms = 2000
 max_queue = 128
 plc_heartbeat_timeout_ms = 5000
+# Keep monitoring D25007 even when this ACK requirement is disabled.
+require_plc_heartbeat_for_ack = true
 auto_reconnect = true
 read_only = true
 allow_plc_connection = true

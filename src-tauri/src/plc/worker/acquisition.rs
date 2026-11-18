@@ -4,13 +4,12 @@ use store::Progress;
 
 impl Engine {
     pub(super) async fn open(
-        mut config: SimulatorConfig,
+        config: SimulatorConfig,
         path: PathBuf,
         state: WorkerState,
         pool: &PgPool,
     ) -> Result<Arc<Self>, String> {
         config.validate()?;
-        super::super::network::pin_worker(&mut config)?;
         if !config.allow_plc_connection
             || config.confirmed_session_id.is_none()
             || config.pc_heartbeat_enabled
@@ -425,8 +424,16 @@ impl Engine {
                 "Publication/Count/Done thay đổi trước write; giữ receipt để đối chiếu.".into(),
             );
         }
-        if self.state.stopping.load(Ordering::SeqCst) || !self.state.fresh_health().await {
-            return Err("Đã giữ raw; đang dừng hoặc heartbeat chưa RUNNING, chưa ghi PLC.".into());
+        if self.state.stopping.load(Ordering::SeqCst)
+            || !self
+                .state
+                .heartbeat_allows_ack(self.config.require_plc_heartbeat_for_ack)
+                .await
+        {
+            return Err(
+                "Đã giữ raw; đang dừng hoặc heartbeat chưa đáp ứng chính sách ACK, chưa ghi PLC."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -470,7 +477,6 @@ impl Engine {
             self.config.ack_protocol.as_deref(),
             self.config.allow_plc_connection,
         )
-        .map(|writer| writer.with_local_ip(self.config.plc_local_ip))
     }
 
     async fn first_done(
@@ -746,10 +752,8 @@ impl WorkerState {
         } else {
             0
         };
-        let mut network_config = config.clone();
-        super::super::network::pin_worker(&mut network_config)?;
         for _ in 0..2 {
-            let snapshot = network_config
+            let snapshot = config
                 .plc_reader()
                 .poll_published_record()
                 .await

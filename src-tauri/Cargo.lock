@@ -1336,7 +1336,6 @@ dependencies = [
  "tokio",
  "tokio-modbus",
  "toml 0.8.2",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

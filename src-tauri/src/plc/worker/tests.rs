@@ -71,7 +71,7 @@ async fn startup_initializes_settings_without_connecting_even_when_config_enable
 fn successful_probe_clears_only_idle_network_error_not_ack_or_data_evidence() {
     let mut status = WorkerStatus {
         state: "ERROR".into(),
-        message: "Chưa phát hiện kết nối Ethernet đến mạng PLC.".into(),
+        message: "Lỗi Modbus TCP AS200: Không kết nối được TCP PLC.".into(),
         ..Default::default()
     };
     status.confirm_read_only_probe();
@@ -80,7 +80,7 @@ fn successful_probe_clears_only_idle_network_error_not_ack_or_data_evidence() {
     for fault in ["ack", "pause", "data", "active"] {
         let mut status = WorkerStatus {
             state: "ERROR".into(),
-            message: "Chưa phát hiện kết nối Ethernet đến mạng PLC.".into(),
+            message: "Lỗi Modbus TCP AS200: Không kết nối được TCP PLC.".into(),
             ..Default::default()
         };
         match fault {
@@ -480,16 +480,19 @@ async fn committed_zero_publication_replaces_previous_completed_display() {
 async fn database_unavailable_prevents_snapshot_and_any_ack_write() {
     let plc = Plc::new().await;
     let dir = TestDirectory::new();
-    let mut cfg = config();
-    cfg.address = plc.address.clone();
-    let e = engine(cfg, &dir, 1);
-    assert!(
-        e.poll_and_ack_published(&closed_pool().await)
-            .await
-            .is_err()
-    );
-    assert!(plc.writes.lock().await.is_empty());
-    assert!(e.state.status.read().await.control_snapshot.is_none());
+    for required in [true, false] {
+        let mut cfg = config();
+        cfg.address = plc.address.clone();
+        cfg.require_plc_heartbeat_for_ack = required;
+        let e = engine(cfg, &dir, 1);
+        assert!(
+            e.poll_and_ack_published(&closed_pool().await)
+                .await
+                .is_err()
+        );
+        assert!(plc.writes.lock().await.is_empty());
+        assert!(e.state.status.read().await.control_snapshot.is_none());
+    }
 }
 #[tokio::test]
 async fn live_idle_snapshot_is_connected_but_requires_heartbeat_change_before_writing() {
@@ -502,9 +505,69 @@ async fn live_idle_snapshot_is_connected_but_requires_heartbeat_change_before_wr
     assert!(snapshot.buffer.is_none());
     assert_eq!(e.state.status.read().await.connection, "CONNECTED");
     assert!(!e.state.fresh_health().await);
+    assert!(!e.state.heartbeat_allows_ack(true).await);
+    assert!(e.state.heartbeat_allows_ack(false).await);
+    assert_eq!(e.state.status.read().await.plc_health, "OBSERVING");
     e.read_snapshot().await.unwrap();
     assert!(e.state.fresh_health().await);
+    assert!(e.state.heartbeat_allows_ack(true).await);
+    assert!(e.state.heartbeat_allows_ack(false).await);
+    assert!(e.state.status.read().await.warnings.is_empty());
     assert!(plc.writes.lock().await.is_empty());
+}
+#[tokio::test]
+async fn ack_heartbeat_policy_preserves_monitoring_and_requires_connection() {
+    use as200::heartbeat::HeartbeatMonitor;
+    use std::time::Instant;
+    for health in ["OBSERVING", "RUNNING", "STALE", "UNCONFIGURED"] {
+        for required in [true, false] {
+            let state = WorkerState::default();
+            let now = Instant::now();
+            let observed = if health == "STALE" {
+                now - Duration::from_secs(60)
+            } else {
+                now
+            };
+            let mut monitor = HeartbeatMonitor::new(
+                (health != "UNCONFIGURED").then_some(Duration::from_secs(30)),
+                observed,
+            );
+            monitor.observe(1, observed);
+            if health == "RUNNING" {
+                monitor.observe(2, now);
+            }
+            *state.heartbeat.lock().unwrap() = Some(monitor);
+            {
+                let mut status = state.status.write().await;
+                status.connection = "CONNECTED".into();
+                status
+                    .warnings
+                    .push("MEASUREMENT: keep this warning".into());
+                status.warnings.push("ACK_HEARTBEAT_BYPASS: old entry".into());
+                status.warnings.push("RECONCILIATION_REQUIRED: keep this warning".into());
+            }
+            let bypass = !required && matches!(health, "OBSERVING" | "STALE");
+            for _ in 0..2 {
+                assert_eq!(
+                    state.heartbeat_allows_ack(required).await,
+                    health == "RUNNING" || bypass
+                );
+            }
+            {
+                let status = state.status.read().await;
+                assert_eq!(status.plc_health, health);
+                assert_eq!(status.warnings.len(), 2);
+                assert!(status.warnings[0].starts_with("MEASUREMENT:"));
+                assert!(status.warnings[1].starts_with("RECONCILIATION_REQUIRED:"));
+            }
+            state.status.write().await.connection = "DISCONNECTED".into();
+            assert!(!state.heartbeat_allows_ack(required).await);
+            assert_eq!(state.status.read().await.warnings.len(), 2);
+        }
+    }
+    let state = WorkerState::default();
+    state.status.write().await.connection = "CONNECTED".into();
+    assert!(!state.heartbeat_allows_ack(false).await); // No monitor evidence.
 }
 #[test]
 fn binding_changes_for_source_session_endpoint_unit_order_or_layout() {

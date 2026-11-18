@@ -3,7 +3,7 @@ use std::time::Duration;
 
 fn config(order: WordOrder) -> As200Config {
     As200Config {
-        network_adapter: None,
+        local_bind_ip: None,
         control_start: 25000,
         record_size: 240,
         buffer_count: 2,

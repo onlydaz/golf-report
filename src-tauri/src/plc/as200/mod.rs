@@ -17,64 +17,52 @@ use std::{
 };
 use tokio::net::{TcpSocket, TcpStream};
 
-const ROUTE_HELP: &str = "Bind IP nguồn không bảo đảm Windows chọn Ethernet. Kiểm tra IP Ethernet và route/interface metric tới PLC; ứng dụng không tự đổi cấu hình mạng.";
-
-pub(crate) fn validate_local_ip(endpoint: SocketAddr, local_ip: IpAddr) -> Result<(), String> {
-    if endpoint.is_ipv4() != local_ip.is_ipv4()
-        || local_ip.is_unspecified()
-        || local_ip.is_multicast()
-        || local_ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
-        || endpoint.ip().is_loopback() != local_ip.is_loopback()
-    {
-        return Err("IP nguồn PLC phải là IP unicast cùng họ IPv4/IPv6 và phù hợp với endpoint. Chọn IP Ethernet của laptop; không dùng loopback cho PLC từ xa.".into());
-    }
-    Ok(())
-}
-
-// Binding proves the IP is assigned locally (or the OS rejects it). It does not
-// identify an adapter as Ethernet, select an interface, or change the route table.
-pub(crate) fn bound_socket(endpoint: SocketAddr, local_ip: IpAddr) -> Result<TcpSocket, String> {
-    validate_local_ip(endpoint, local_ip)?;
-    let socket = if endpoint.is_ipv4() {
-        TcpSocket::new_v4()
-    } else {
-        TcpSocket::new_v6()
-    }
-    .map_err(|e| format!("Không tạo được socket PLC: {e}"))?;
-    socket.bind(SocketAddr::new(local_ip, 0)).map_err(|e| {
-        eprintln!("PLC_TCP state=BIND_FAILED endpoint={endpoint} local_ip={local_ip} kind={:?} error={e}", e.kind());
-        format!("Không bind được IP nguồn PLC {local_ip}. Kiểm tra IP này đang được gán trên Ethernet và card đã bật. Lỗi hệ điều hành: {e}. {ROUTE_HELP}")
-    })?;
-    Ok(socket)
-}
-
+// Probe, FC03 and prepared ACK sockets share this optional source bind.
+// Binding does not alter the operating system's routes or select an adapter.
 pub(crate) async fn connect_tcp(
     address: &str,
-    local_ip: Option<IpAddr>,
-    manual: Option<&super::network::ManualAdapter>,
+    local_bind_ip: Option<IpAddr>,
     duration: Duration,
 ) -> Result<TcpStream, As200Error> {
     let endpoint: SocketAddr = address
         .parse()
         .map_err(|_| As200Error::Transport("Địa chỉ PLC phải là IP:port dạng số.".into()))?;
-    let local_ip =
-        super::network::resolve(endpoint, local_ip, manual).map_err(As200Error::Transport)?;
-    let selected = local_ip
+    let source = local_bind_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "auto".into());
     let connection = async {
-        match local_ip {
+        let result = match local_bind_ip {
             Some(ip) => {
-                bound_socket(endpoint, ip)
-                    .map_err(As200Error::Transport)?
-                    .connect(endpoint)
-                    .await
+                if ip.is_ipv4() != endpoint.is_ipv4()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+                {
+                    return Err(As200Error::Transport(format!(
+                        "local_bind_ip={ip} phải là IP unicast cụ thể, cùng họ IPv4/IPv6 với PLC {endpoint}."
+                    )));
+                }
+                let socket = if ip.is_ipv4() {
+                    TcpSocket::new_v4()
+                } else {
+                    TcpSocket::new_v6()
+                }
+                .map_err(|e| {
+                    As200Error::Transport(format!("Không tạo được socket PLC để bind {ip}: {e}"))
+                })?;
+                socket.bind(SocketAddr::new(ip, 0)).map_err(|e| {
+                    eprintln!("PLC_TCP state=BIND_FAILED endpoint={endpoint} local_bind_ip={ip} error={e}");
+                    As200Error::Transport(format!(
+                        "Không bind được IP nguồn {ip} trước khi kết nối PLC {endpoint}: {e}. Kiểm tra IP này đã được gán cho laptop."
+                    ))
+                })?;
+                socket.connect(endpoint).await
             }
             None => TcpStream::connect(endpoint).await,
-        }
-        .map_err(|e| {
+        };
+        result.map_err(|e| {
             eprintln!(
-                "PLC_TCP state=FAILED endpoint={endpoint} local_ip={selected} kind={:?} error={e}",
+                "PLC_TCP state=FAILED endpoint={endpoint} source_ip={source} routing=system kind={:?} error={e}",
                 e.kind()
             );
             let reason = match e.kind() {
@@ -83,7 +71,7 @@ pub(crate) async fn connect_tcp(
                 _ => "Không kết nối được TCP PLC",
             };
             As200Error::Transport(format!(
-                "{reason} ({endpoint}, IP nguồn {selected}): {e}. {ROUTE_HELP}"
+                "{reason} ({endpoint}, IP nguồn {source}): {e}. Kiểm tra cáp, nguồn PLC và cấu hình IP/route của Windows."
             ))
         })
     };
@@ -91,15 +79,15 @@ pub(crate) async fn connect_tcp(
         .await
         .map_err(|_| {
             eprintln!(
-                "PLC_TCP state=TIMEOUT endpoint={endpoint} local_ip={selected} timeout_ms={}",
+                "PLC_TCP state=TIMEOUT endpoint={endpoint} source_ip={source} routing=system timeout_ms={}",
                 duration.as_millis()
             );
             As200Error::Transport(format!(
-                "Hết thời gian kết nối TCP PLC {endpoint}, IP nguồn {selected}. {ROUTE_HELP}"
+                "Hết thời gian kết nối TCP PLC {endpoint}, IP nguồn {source}. Kiểm tra cáp, nguồn PLC và cấu hình IP/route của Windows."
             ))
         })??;
     eprintln!(
-        "PLC_TCP state=CONNECTED endpoint={endpoint} local_ip={selected} actual_local={:?}",
+        "PLC_TCP state=CONNECTED endpoint={endpoint} source_ip={source} routing=system actual_local={:?}",
         stream.local_addr().ok()
     );
     Ok(stream)
@@ -107,11 +95,11 @@ pub(crate) async fn connect_tcp(
 
 #[derive(Debug, Clone)]
 pub struct As200Config {
-    pub network_adapter: Option<super::network::ManualAdapter>,
     pub control_start: u16,
     pub record_size: usize,
     pub buffer_count: usize,
     pub address: String,
+    pub local_bind_ip: Option<IpAddr>,
     pub unit_id: u8,
     // TODO kỹ thuật viên xác nhận ánh xạ D -> địa chỉ PDU; tài liệu đề xuất 0.
     pub modbus_address_offset: i32,

@@ -1,5 +1,5 @@
 use super::{As200Config, As200Error, decode, map, model::*};
-use std::{future::Future, net::IpAddr};
+use std::future::Future;
 use tokio::time::timeout;
 use tokio_modbus::{
     Request, Response, Slave,
@@ -20,23 +20,17 @@ pub trait HoldingRegisterReader {
 pub struct ModbusTcpReader {
     config: As200Config,
     ctx: Option<Context>,
-    local_ip: Option<IpAddr>,
 }
 impl ModbusTcpReader {
     pub fn new(config: As200Config) -> Self {
-        Self {
-            config,
-            ctx: None,
-            local_ip: None,
-        }
+        Self { config, ctx: None }
     }
 
     async fn exchange(&mut self, address: u16, count: u16) -> Result<Vec<u16>, As200Error> {
         if self.ctx.is_none() {
             let stream = super::connect_tcp(
                 &self.config.address,
-                self.local_ip,
-                self.config.network_adapter.as_ref(),
+                self.config.local_bind_ip,
                 self.config.timeout,
             )
             .await?;
@@ -89,14 +83,13 @@ impl HoldingRegisterReader for ModbusTcpReader {
             )));
         }
         let duration = self.config.timeout;
-        let mut result = timeout(duration, self.exchange(address, count))
+        let result = timeout(duration, self.exchange(address, count))
             .await
             .unwrap_or(Err(As200Error::Timeout));
         if matches!(&result, Err(As200Error::Timeout)) {
             eprintln!(
-                "PLC_READ state=TIMEOUT endpoint={} local_ip={:?} stage={} timeout_ms={}",
+                "PLC_READ state=TIMEOUT endpoint={} stage={} timeout_ms={}",
                 self.config.address,
-                self.local_ip,
                 if self.ctx.is_some() {
                     "FC03"
                 } else {
@@ -104,14 +97,6 @@ impl HoldingRegisterReader for ModbusTcpReader {
                 },
                 duration.as_millis()
             );
-            if self.ctx.is_none() && self.local_ip.is_some() {
-                result = Err(As200Error::Transport(format!(
-                    "Hết thời gian kết nối TCP PLC {}, IP nguồn {:?}. {}",
-                    self.config.address,
-                    self.local_ip,
-                    super::ROUTE_HELP
-                )));
-            }
         }
         // Sau lỗi/timeout, socket có thể chứa response dở. Hủy kết nối, nối lại ở lần gọi sau.
         if result.is_err() {
@@ -157,10 +142,6 @@ pub struct As200Reader<T = ModbusTcpReader> {
 impl As200Reader<ModbusTcpReader> {
     pub fn new(config: As200Config) -> Self {
         Self::with_transport(config.clone(), ModbusTcpReader::new(config))
-    }
-    pub fn with_local_ip(mut self, local_ip: Option<IpAddr>) -> Self {
-        self.transport.local_ip = local_ip;
-        self
     }
 }
 impl<T: HoldingRegisterReader> As200Reader<T> {

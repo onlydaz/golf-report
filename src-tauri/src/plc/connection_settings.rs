@@ -50,8 +50,6 @@ pub struct RuntimeParameters {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     operator_sku: Option<String>,
-    plc_local_ip: Option<std::net::IpAddr>,
-    plc_adapter_id: Option<String>,
     endpoint: Endpoint,
     parameters: RuntimeParameters,
     configured: bool,
@@ -186,8 +184,6 @@ fn settings(config: &SimulatorConfig) -> Settings {
     let address: std::net::SocketAddr = config.address.parse().expect("validated PLC address");
     Settings {
         operator_sku: config.operator_sku.clone(),
-        plc_local_ip: config.plc_local_ip,
-        plc_adapter_id: config.plc_adapter.as_ref().map(|a| a.id.clone()),
         endpoint: Endpoint {
             ip: address.ip().to_string(),
             port: address.port().into(),
@@ -258,103 +254,6 @@ pub async fn get_plc_connection_settings(
 }
 
 #[tauri::command]
-pub fn get_plc_network_adapters() -> Result<Vec<super::network::Adapter>, String> {
-    super::network::adapters()
-}
-
-#[tauri::command]
-pub async fn inspect_plc_network(
-    state: tauri::State<'_, WorkerState>,
-) -> Result<super::network_route::Status, String> {
-    let dir = directory(&state).await?;
-    let (_, _, config) = current_config(&state, &dir).await?;
-    super::network_route::inspect(&config)
-}
-
-#[tauri::command]
-pub async fn change_plc_host_route(
-    plan: super::network_route::Plan,
-    remove: bool,
-    confirmed: bool,
-    state: tauri::State<'_, WorkerState>,
-) -> Result<super::network_route::Status, String> {
-    if !confirmed {
-        return Err("Cần xác nhận rõ thao tác tuyến trước khi thực hiện.".into());
-    }
-    let gate = state.settings_gate.clone().lock_owned().await;
-    state.ensure_register_writes_stopped().await.map_err(|_| {
-        "Hãy ngắt kết nối và đợi Worker/ACK dừng hoàn toàn trước khi sửa hoặc hoàn tác tuyến."
-            .to_string()
-    })?;
-    let dir = ready(&state).await?;
-    let (path, _, config) = current_config(&state, &dir).await?;
-    let job_config = config.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _gate = gate;
-        super::network_route::change(&job_config, path, plan, remove)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    super::network_route::inspect(&config)
-}
-
-#[tauri::command]
-pub async fn save_plc_connection_options(
-    poll_interval_ms: u64,
-    adapter_id: Option<String>,
-    update_adapter: Option<bool>,
-    state: tauri::State<'_, WorkerState>,
-) -> Result<Settings, String> {
-    if !(50..=60000).contains(&poll_interval_ms) {
-        return Err("Chu kỳ đọc phải là số nguyên từ 50 đến 60000 ms.".into());
-    }
-    let _gate = state.settings_gate.lock().await;
-    let dir = ready(&state).await?;
-    let (path, before, config) = current_config(&state, &dir).await?;
-    let mut document: toml::Value =
-        toml::from_str(&before).map_err(|_| "Cấu hình PLC không hợp lệ.")?;
-    document
-        .as_table_mut()
-        .ok_or("Cấu hình PLC không hợp lệ.")?
-        .insert("poll_interval_ms".into(), (poll_interval_ms as i64).into());
-    if update_adapter.unwrap_or(false) {
-        let adapter = adapter_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .map(super::network::selection)
-            .transpose()?;
-        if adapter != config.plc_adapter || config.plc_local_ip.is_some() {
-            state.ensure_register_writes_stopped().await.map_err(|_| {
-                "Cần ngắt kết nối và đợi Worker dừng hoàn toàn trước khi đổi adapter PLC."
-                    .to_string()
-            })?;
-        }
-        let table = document
-            .as_table_mut()
-            .ok_or("Cấu hình PLC không hợp lệ.")?;
-        table.remove("plc_local_ip");
-        match adapter {
-            Some(adapter) => {
-                table.insert(
-                    "plc_adapter".into(),
-                    toml::Value::try_from(adapter).map_err(|e| e.to_string())?,
-                );
-            }
-            None => {
-                table.remove("plc_adapter");
-            }
-        }
-    }
-    let after = toml::to_string_pretty(&document).map_err(|_| "Không tạo được cấu hình PLC.")?;
-    let saved = simulator_config::parse(&after)?;
-    validate_config(&saved)?;
-    replace_config(&path, &before, &after)?;
-    // Running Engine retains its immutable config. The next start loads this value;
-    // saving never stops/restarts the Worker or changes an ACK intent/checkpoint.
-    Ok(settings(&saved))
-}
-
-#[tauri::command]
 pub async fn save_operator_sku(
     sku: String,
     state: tauri::State<'_, WorkerState>,
@@ -395,7 +294,7 @@ pub async fn test_plc_connection(
         None => None,
     };
     let report = match engine {
-        Some(ref engine) => inspect_prepared_endpoint(engine.connection_config()).await,
+        Some(ref engine) => inspect_endpoint(engine.connection_config()).await,
         None => inspect_endpoint(config).await,
     };
     if report.as200_valid && engine.is_none() && state.tasks_are_stopped().await {
@@ -452,20 +351,7 @@ pub async fn clear_plc_connection_log(state: tauri::State<'_, WorkerState>) -> R
     state.clear_connection_log().await
 }
 
-async fn inspect_endpoint(mut config: SimulatorConfig) -> InspectionReport {
-    if let Err(message) = super::network::pin_worker(&mut config) {
-        return InspectionReport {
-            tcp_connected: false,
-            modbus_read_succeeded: false,
-            as200_valid: false,
-            mapping_warning: None,
-            message,
-        };
-    }
-    inspect_prepared_endpoint(config).await
-}
-
-async fn inspect_prepared_endpoint(config: SimulatorConfig) -> InspectionReport {
+async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
     let mut report = InspectionReport {
         tcp_connected: false,
         modbus_read_succeeded: false,
@@ -483,8 +369,7 @@ async fn inspect_prepared_endpoint(config: SimulatorConfig) -> InspectionReport 
     // after this one-shot inspection; no Worker or PLC writer is constructed.
     match super::as200::connect_tcp(
         &config.address,
-        config.plc_local_ip,
-        config.plc_adapter.as_ref(),
+        config.local_bind_ip,
         std::time::Duration::from_millis(config.timeout_ms),
     )
     .await

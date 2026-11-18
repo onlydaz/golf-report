@@ -12,6 +12,17 @@ use std::{
 pub const AS200_ACK_SCOPE_APPROVED: bool = true;
 pub const AS200_ACK_SCOPE_ID: &str = "company-as200-register-map-v1";
 
+// Read old TOML without reusing a laptop's adapter or binding its local IP.
+// These fields have no effect on sockets, route selection or ACK permissions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LegacyAdapter {
+    #[serde(rename = "id")]
+    _id: String,
+    #[serde(rename = "machine")]
+    _machine: String,
+}
+
 pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
     AS200_ACK_SCOPE_APPROVED
         && config.mode == "modbus"
@@ -37,6 +48,7 @@ pub struct SimulatorConfig {
     pub read_only: bool,
     pub technical_setup_confirmed: bool,
     pub plc_heartbeat_timeout_ms: Option<u64>,
+    pub require_plc_heartbeat_for_ack: bool,
     pub pc_heartbeat_enabled: bool,
     pub allow_plc_heartbeat_write: bool,
     // Parsed only for compatibility with existing TOML; no Journal retry queue.
@@ -48,8 +60,11 @@ pub struct SimulatorConfig {
     pub ack_enabled: bool,
     pub ack_protocol: Option<String>,
     pub address: String,
-    pub plc_local_ip: Option<std::net::IpAddr>,
-    pub plc_adapter: Option<super::network::ManualAdapter>,
+    pub local_bind_ip: Option<std::net::IpAddr>,
+    #[serde(rename = "plc_local_ip")]
+    pub(super) _plc_local_ip: Option<std::net::IpAddr>,
+    #[serde(rename = "plc_adapter")]
+    pub(super) _plc_adapter: Option<LegacyAdapter>,
     pub unit_id: u8,
     pub source_key: String,
     pub confirmed_session_id: Option<String>,
@@ -74,6 +89,7 @@ impl Default for SimulatorConfig {
             read_only: false,
             technical_setup_confirmed: false,
             plc_heartbeat_timeout_ms: None,
+            require_plc_heartbeat_for_ack: true,
             pc_heartbeat_enabled: false,
             allow_plc_heartbeat_write: false,
             retry_max_attempts: 8,
@@ -84,6 +100,7 @@ impl Default for SimulatorConfig {
             ack_enabled: false,
             ack_protocol: None,
             address: "127.0.0.1:1503".into(),
+            local_bind_ip: None,
             unit_id: 1,
             source_key: String::new(),
             confirmed_session_id: None,
@@ -95,8 +112,8 @@ impl Default for SimulatorConfig {
             max_queue: 128,
             journal_path: None,
             operator_sku: None,
-            plc_local_ip: None,
-            plc_adapter: None,
+            _plc_local_ip: None,
+            _plc_adapter: None,
         }
     }
 }
@@ -132,10 +149,11 @@ impl SimulatorConfig {
         }
     }
 
-    // Timing, source IP and a safely stopped operator SKU may be saved separately;
+    // Timing and a safely stopped operator SKU do not change the source identity;
     // identity, map and write permissions need an app restart.
     pub(super) fn same_environment(&self, other: &Self) -> bool {
         self.address == other.address
+            && self.local_bind_ip == other.local_bind_ip
             && self.unit_id == other.unit_id
             && self.mode == other.mode
             && self.source_key == other.source_key
@@ -152,6 +170,7 @@ impl SimulatorConfig {
             && self.ack_protocol == other.ack_protocol
             && self.allow_plc_connection == other.allow_plc_connection
             && self.technical_setup_confirmed == other.technical_setup_confirmed
+            && self.require_plc_heartbeat_for_ack == other.require_plc_heartbeat_for_ack
             && self.pc_heartbeat_enabled == other.pc_heartbeat_enabled
             && self.allow_plc_heartbeat_write == other.allow_plc_heartbeat_write
     }
@@ -294,11 +313,11 @@ impl SimulatorConfig {
     }
     pub fn reader(&self) -> As200Config {
         As200Config {
-            network_adapter: self.plc_adapter.clone(),
             control_start: self.control_start,
             record_size: self.record_size,
             buffer_count: self.buffer_count,
             address: self.address.clone(),
+            local_bind_ip: self.local_bind_ip,
             unit_id: self.unit_id,
             modbus_address_offset: self.modbus_address_offset,
             word_order: match self.word_order {
@@ -421,6 +440,21 @@ pub(super) fn parse(text: &str) -> Result<SimulatorConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ack_heartbeat_requirement_defaults_true_and_requires_restart_when_changed() {
+        let omitted = parse("").unwrap();
+        assert!(omitted.require_plc_heartbeat_for_ack);
+        for required in [true, false] {
+            let cfg = parse(&format!("require_plc_heartbeat_for_ack={required}")).unwrap();
+            assert_eq!(cfg.require_plc_heartbeat_for_ack, required);
+            assert_eq!(omitted.same_environment(&cfg), required);
+            assert_eq!(cfg.heartbeat_timeout(), omitted.heartbeat_timeout());
+            assert!(!cfg.pc_heartbeat_enabled);
+            assert!(!cfg.allow_plc_heartbeat_write);
+            assert!(!cfg.ack_enabled);
+        }
+        assert!(parse("require_plc_heartbeat_for_ack='false'").is_err());
+    }
     #[test]
     fn unified_profile_requires_explicit_technical_setup_and_independent_write_permissions() {
         let text = "mode='modbus'\nenabled=true\ntechnical_setup_confirmed=true\naddress='192.0.2.10:502'\nunit_id=7\nword_order='HIGH'\nmodbus_address_offset=-1\nsource_key='commissioned-source'\nconfirmed_session_id='confirmed-session'\nplc_heartbeat_timeout_ms=5000\n";

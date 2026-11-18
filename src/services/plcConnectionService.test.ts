@@ -1,7 +1,5 @@
-  import { describe, expect, it, vi } from "vitest";
-  import { invoke } from "@tauri-apps/api/core";
-  import { getPlcConnectionView, isPlcNetworkError, plcConnectionError, savePlcConnectionOptions } from "./plcConnectionService";
-  vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+  import { describe, expect, it } from "vitest";
+  import { getPlcConnectionView, isPlcNetworkError, plcConnectionError } from "./plcConnectionService";
   import { getMeasurementAvailabilityNotice, getPlcDisplayStatus } from "../hooks/usePlcMonitor";
   import type { As200Status } from "./as200Service";
   describe("PLC connection form", () => {
@@ -19,7 +17,7 @@
         message:"", pauseReason:null, warnings:[], plcHealth:"RUNNING", pcHeartbeatStatus:"DISABLED",ackStatus:"RECONCILIATION_REQUIRED",
         latest:null,lastSavedId:null,blockedInboxIds:[],blockedInboxCount:0,retryWaitingCount:0,lastReadAt:new Date(3000).toISOString(),
       };
-      const failure={startedAt:2000,error:"Chưa phát hiện kết nối Ethernet đến mạng PLC."};
+      const failure={startedAt:2000,error:"Lỗi Modbus TCP AS200: Không kết nối được TCP PLC."};
       const recovered=getPlcConnectionView(status,null,failure);
       expect(recovered.label).toBe("Đã kết nối PLC");expect(recovered.feedback).toBeUndefined();expect(recovered.color).toBe("green");
       expect(status.ackStatus).toBe("RECONCILIATION_REQUIRED"); // never reset ACK to fix a network badge
@@ -30,11 +28,6 @@
       expect(isPlcNetworkError(failure.error)).toBe(true);
       expect(isPlcNetworkError("ACK chưa rõ; giữ pending receipt")).toBe(false);
       expect(isPlcNetworkError("PostgreSQL commit thất bại")).toBe(false);
-    });
-    it("saves poll timing without changing deployment adapter settings", async () => {
-      vi.mocked(invoke).mockResolvedValue(undefined);
-      await savePlcConnectionOptions(500);
-      expect(invoke).toHaveBeenLastCalledWith("save_plc_connection_options", { pollIntervalMs: 500 });
     });
     it("keeps raw diagnostics internal while preserving operator ACK warnings", () => {
       for (const diagnostic of [
