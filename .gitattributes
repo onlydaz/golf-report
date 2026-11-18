@@ -1,0 +1,2 @@
+# Preserve the exact SQLx checksum already applied on Neon (UTF-8, LF, no BOM).
+src-tauri/migrations/20261118160000_measurement_settings.sql text eol=lf

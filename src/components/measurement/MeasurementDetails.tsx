@@ -38,8 +38,8 @@ export default function MeasurementDetails({
   return (
     <div className="measurement-details">
       {data.qualityError && <Alert type="info" showIcon
-        title="Chưa xác định chất lượng"
-        description={`Bản ghi đã lưu, không tính vào KPI sản xuất. ${data.qualityError}`} />}
+        title={data.overallResult === "UNMEASURED" ? "Chưa xác định chất lượng" : "Bản ghi có thông tin cần kiểm tra"}
+        description={`${data.overallResult === "UNMEASURED" ? "Bản ghi đã lưu, không tính vào KPI sản xuất." : "Kết quả và KPI giữ theo Overall do PLC cung cấp."} ${data.qualityError}`} />}
       {showGeneralInformation && (
         <Card className="section-card">
           <Descriptions
@@ -132,7 +132,7 @@ export default function MeasurementDetails({
                     {
                       key: "count",
                       label: "Số điểm đo",
-                      children: station.pointCount,
+                      children: station.pointCount ?? "—",
                     },
                     {
                       key: "ng",

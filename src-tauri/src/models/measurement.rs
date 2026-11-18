@@ -50,9 +50,9 @@ pub struct PointInput {
 pub struct StationInput {
     pub station_type: StationType,
     pub result: MeasurementResult,
-    pub point_count: i32,
+    pub point_count: Option<i32>,
     pub ng_point: Option<i32>,
-    pub load: BigDecimal,
+    pub load: Option<BigDecimal>,
     pub points: Vec<PointInput>,
 }
 #[derive(Debug, Clone)]
@@ -102,9 +102,9 @@ pub struct MeasurementStation {
     pub station_type: StationType,
     #[sqlx(try_from = "String")]
     pub result: MeasurementResult,
-    pub point_count: i32,
+    pub point_count: Option<i32>,
     pub ng_point: Option<i32>,
-    pub load: BigDecimal,
+    pub load: Option<BigDecimal>,
     pub created_at: DateTime<Utc>,
     #[sqlx(skip)]
     pub points: Vec<MeasurementPoint>,

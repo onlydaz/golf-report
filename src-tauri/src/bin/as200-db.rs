@@ -4,17 +4,22 @@ use std::str::FromStr;
 async fn run() -> Result<(), String> {
     let mut target = None;
     let mut apply = false;
+    let mut checksums = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--database" => target = Some(args.next().ok_or("Thiếu tên database")?),
             "--migrate" => apply = true,
+            "--migration-checksums" => checksums = true,
             _ => {
                 return Err(
-                    "Dùng: as200-db [--database NAME] [--migrate]. Mặc định chỉ audit.".into(),
+                    "Dùng: as200-db [--database NAME] [--migrate | --migration-checksums]. Mặc định chỉ audit.".into(),
                 );
             }
         }
+    }
+    if checksums && apply {
+        return Err("Kiểm tra checksum chỉ đọc, không được dùng cùng --migrate".into());
     }
     if apply && target.is_none() {
         return Err("--migrate bắt buộc chỉ định --database rõ ràng".into());
@@ -37,7 +42,7 @@ async fn run() -> Result<(), String> {
             .username(&settings.username)
             .password(&settings.password)
     };
-    let options = if cloud && !apply {
+    let options = if checksums || (cloud && !apply) {
         options.options([("default_transaction_read_only", "on")])
     } else {
         options
@@ -58,6 +63,30 @@ async fn run() -> Result<(), String> {
     println!(
         "Connected database={database}, schema={schema:?}, search_path={search_path}, read_only={read_only}, can_create_public={create_public}"
     );
+    if checksums {
+        if read_only != "on" {
+            return Err("Checksum audit requires a read-only connection".into());
+        }
+        let rows: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        for (version, success, checksum) in rows {
+            let stored = checksum
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let embedded = migrations::MIGRATOR.iter().find(|m| m.version == version);
+            println!(
+                "MIGRATION_CHECKSUM version={version} success={success} stored={stored} matches_embedded={}",
+                embedded.is_some_and(|m| m.checksum.as_ref() == checksum.as_slice())
+            );
+        }
+        pool.close().await;
+        return Ok(());
+    }
     let schema_tables: Vec<(String, String)> = sqlx::query_as(
         "SELECT schemaname::text,tablename::text FROM pg_tables \
          WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY 1,2",

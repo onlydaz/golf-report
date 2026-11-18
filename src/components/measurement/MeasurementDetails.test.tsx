@@ -20,6 +20,14 @@ const zero: MeasurementDetail = {
 };
 
 describe("manual publications in the existing Measurement UI", () => {
+  it("shows the stored Overall independently of station results and diagnostics", () => {
+    const data: MeasurementDetail = { ...zero, overallResult: "OK", buttResult: "NG", tipResult: "NG" };
+    const html = renderToStaticMarkup(<MeasurementDetails data={data} />);
+    expect(html).toContain("Bản ghi có thông tin cần kiểm tra");
+    expect(html).toContain("KPI giữ theo Overall do PLC cung cấp");
+    expect(html).not.toContain("không tính vào KPI sản xuất");
+    expect(html).toContain(">OK<");
+  });
   it("renders unknown detail, zero StickNo/load, receipt provenance and no invented attempts or RAW table", () => {
     const html = renderToStaticMarkup(<MeasurementDetails data={zero} />);
     expect(html).toContain("QC-MANUAL");

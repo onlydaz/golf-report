@@ -27,6 +27,7 @@ fn tables(registry: bool) -> Vec<String> {
         "measurement_stations",
         "measurement_points",
         "measurement_attempts",
+        "measurement_settings",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -70,6 +71,42 @@ fn retirement_cannot_mask_missing_failed_duplicate_or_unknown_history() {
         success: true,
     });
     assert!(validate_history(&tables(false), &unknown).is_err());
+}
+
+#[test]
+fn applied_settings_migration_requires_settings_table() {
+    let latest = history(true);
+    let mut schema = tables(false);
+    assert!(validate_history(&schema, &latest).is_ok());
+    schema.retain(|table| table != "measurement_settings");
+    assert!(
+        validate_history(&schema, &latest)
+            .unwrap_err()
+            .contains("measurement_settings")
+    );
+    let pending: Vec<_> = latest
+        .into_iter()
+        .filter(|m| m.version < MEASUREMENT_SETTINGS_VERSION)
+        .collect();
+    assert!(validate_history(&schema, &pending).is_ok());
+}
+
+#[test]
+fn historical_settings_migration_matches_verified_applied_checksum() {
+    // Read-only Neon audit confirmed this SHA-384. Never rewrite SQLx history.
+    let migration = MIGRATOR
+        .iter()
+        .find(|m| m.version == MEASUREMENT_SETTINGS_VERSION)
+        .unwrap();
+    let checksum = migration
+        .checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        checksum,
+        "1508c54f177eab759fabd612d71ba5d7695e4755322c6b8955585cfefe4cef42fb77dabc530437c4a7ef5fad4677725a"
+    );
 }
 
 // Separate local database ONLY. Never read the application's Neon config/helper.
@@ -137,6 +174,140 @@ async fn empty_database_runs_all_migrations() {
     let pool = isolated().await;
     migrate(&pool).await.unwrap();
     assert_retired(&pool).await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "Requires dedicated loopback golf_report_migration_test; never use Neon"]
+async fn historical_settings_migration_and_rows_are_preserved_without_runtime_api() {
+    let pool = isolated().await;
+    migrate(&pool).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM measurement_settings")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    // Historical migration remains applied. Removing the UI must not delete rows.
+    sqlx::query("INSERT INTO measurement_settings(product_code,station_type,load_g,push_dist_mm,bend_lower_mm,bend_upper_mm,positions_mm) VALUES('KEEP-QC','TIP',200,8,0,2,ARRAY[80]::float8[])")
+        .execute(&pool).await.unwrap();
+    let before: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(s) FROM measurement_settings s WHERE product_code='KEEP-QC'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    migrate(&pool).await.unwrap();
+    let after: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(s) FROM measurement_settings s WHERE product_code='KEEP-QC'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, after);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "Requires dedicated loopback golf_report_migration_test; migration, projection and KPI only"]
+async fn authoritative_results_preserve_history_and_independent_detail_counters() {
+    use crate::{
+        database::test_support::registers, models::*, repositories::*, services::InboxService,
+    };
+    let pool = isolated().await;
+    let old = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version < 20261118150000)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    old.run(&pool).await.unwrap();
+    let source = SourceRepository::upsert(&pool, "authoritative-results-test", None)
+        .await
+        .unwrap();
+    let old_id: i64 = sqlx::query_scalar("INSERT INTO measurements(source_id,session_id,record_seq,total_count,product_code,club_number,measured_at,overall_result,publication_count,quality_error,sku_origin) VALUES($1,'test',1,1,'TEST',1,now(),'UNMEASURED',1,'historical workflow warning','QC') RETURNING id")
+        .bind(source.id).fetch_one(&pool).await.unwrap();
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(m) FROM measurements m WHERE id=$1")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    migrate(&pool).await.unwrap();
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(m) FROM measurements m WHERE id=$1")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    for count in [2, 3] {
+        let mut raw = registers(count);
+        raw[20] = if count == 2 { 1 } else { 2 };
+        raw[24] = 2;
+        raw[25] = 4;
+        raw[26] = 1;
+        raw[32] = 2;
+        raw[33] = 1;
+        raw[34] = 4;
+        if count == 3 {
+            raw[1] = 0;
+        } // Diagnostic cannot overwrite D25040.
+        let row: InboxRecord = sqlx::query_as("INSERT INTO plc_inbox(source_id,ingest_key,record_seq,total_count,buffer_index,raw_registers,word_order,received_at,processing_status,publication_session,publication_count,assigned_sku) VALUES($1,$2,$3::integer,$3::bigint,0,$4,'LOW',now(),'PENDING','test',$3::integer,'TEST') RETURNING *")
+            .bind(source.id).bind(format!("test-{count}")).bind(count).bind(serde_json::json!(raw))
+            .fetch_one(&pool).await.unwrap();
+        let id = InboxService::process(&pool, row.id).await.unwrap();
+        assert_eq!(InboxService::process(&pool, row.id).await.unwrap(), id);
+        let saved = MeasurementRepository::find_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.summary.overall_result.as_str(),
+            if count == 2 { "OK" } else { "NG" }
+        );
+        assert_eq!(saved.summary.butt_result.as_deref(), Some("NG"));
+        assert_eq!(saved.summary.quality_error.is_some(), count == 3);
+        let butt = saved
+            .stations
+            .iter()
+            .find(|s| s.station_type == StationType::Butt)
+            .unwrap();
+        assert_eq!(butt.point_count, Some(4));
+        assert_eq!(butt.ng_point, Some(1));
+        assert_eq!(butt.points[0].attempt_count, 1);
+        assert_eq!(butt.points[0].decide_attempt, Some(4));
+        assert_eq!(butt.points[0].attempts.len(), 4);
+        assert_eq!(
+            InboxRepository::find(&pool, row.id)
+                .await
+                .unwrap()
+                .raw_registers,
+            serde_json::json!(raw)
+        );
+        assert!(
+            sqlx::query("UPDATE measurement_points SET decide_attempt=5 WHERE id=$1")
+                .bind(butt.points[0].id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+    let request = MeasurementListRequest::default();
+    let stats = MeasurementRepository::statistics(&pool, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        (stats.total_measurements, stats.total_ok, stats.total_ng),
+        (2, 1, 1)
+    );
+    let history = MeasurementRepository::history_page(&pool, &request)
+        .await
+        .unwrap();
+    assert_eq!(history.total, 3);
     pool.close().await;
 }
 #[tokio::test]

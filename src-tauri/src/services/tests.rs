@@ -25,7 +25,7 @@ fn all_zero_publication_creates_unknown_draft_without_inventing_metadata() {
         assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
         assert!(draft.quality_error.is_some());
         for station in draft.stations {
-            assert_eq!(station.load.to_string(), "0");
+            assert_eq!(station.load.as_ref().unwrap().to_string(), "0");
             assert_eq!(station.result, MeasurementResult::Unmeasured);
             assert!(station.points.iter().all(|p| p.attempts.is_empty()
                 && p.position.is_none()
@@ -69,7 +69,7 @@ fn manual_sparse_words_preserve_types_counts_raw_sequence_and_sku_provenance() {
     row.raw_registers = serde_json::json!(raw);
     let draft = draft_from_inbox(&row).unwrap();
     let tip = &draft.stations[0];
-    assert_eq!(tip.load.to_string(), "-3.5");
+    assert_eq!(tip.load.as_ref().unwrap().to_string(), "-3.5");
     assert_eq!(tip.points[0].position.as_ref().unwrap().to_string(), "10");
     assert_eq!(
         tip.points[0].attempts[0]
@@ -140,7 +140,7 @@ fn completed_measurement_preserves_zero_negative_and_positive_reals_in_both_word
             MeasurementService::validate(&draft).unwrap();
             assert_eq!(draft.overall_result, MeasurementResult::Ng);
             for station in &draft.stations {
-                assert_eq!(station.load, real32_numeric(value).unwrap());
+                assert_eq!(station.load, Some(real32_numeric(value).unwrap()));
                 for point in &station.points {
                     assert_eq!(point.position, Some(real32_numeric(value).unwrap()));
                     assert_eq!(point.attempt_count, 4);
@@ -170,8 +170,8 @@ fn projection_preserves_frozen_sku_results_loads_attempts_and_time() {
     let butt = &draft.stations[1];
     assert_eq!(tip.station_type, StationType::Tip);
     assert_eq!(butt.station_type, StationType::Butt);
-    assert_eq!(tip.load.to_string(), "165.25");
-    assert_eq!(butt.load.to_string(), "125.5");
+    assert_eq!(tip.load.as_ref().unwrap().to_string(), "165.25");
+    assert_eq!(butt.load.as_ref().unwrap().to_string(), "125.5");
     assert_eq!(tip.points.len(), 1);
     assert_eq!(butt.points.len(), 4);
     assert_eq!(tip.points[0].attempts.len(), 4);
@@ -190,7 +190,7 @@ fn projection_preserves_frozen_sku_results_loads_attempts_and_time() {
     );
 }
 #[test]
-fn zero_one_word_and_status_zero_project_as_unknown_without_mutating_raw() {
+fn zero_and_status_diagnostics_do_not_rewrite_plc_results() {
     for case in 0..3 {
         let mut inbox = receipt(0);
         let mut raw = vec![0_u16; 240];
@@ -203,7 +203,14 @@ fn zero_one_word_and_status_zero_project_as_unknown_without_mutating_raw() {
         }
         inbox.raw_registers = serde_json::to_value(&raw).unwrap();
         let draft = draft_from_inbox(&inbox).unwrap();
-        assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
+        assert_eq!(
+            draft.overall_result,
+            if case == 2 {
+                MeasurementResult::Ng
+            } else {
+                MeasurementResult::Unmeasured
+            }
+        );
         assert!(draft.quality_error.is_some());
         assert_eq!(inbox.raw_registers, serde_json::to_value(raw).unwrap());
     }
@@ -225,21 +232,116 @@ fn missing_sku_session_and_publication_identity_have_specific_projection_errors(
     assert!(draft_from_inbox(&row).unwrap_err().contains("Publication"));
 }
 #[test]
-fn workflow_rejects_extra_tip_points_and_inconsistent_overall_without_rewriting_raw() {
-    for offset in [20, 121, 122, 150] {
-        let mut row = receipt(1);
-        let mut raw = registers(1);
-        raw[offset] = if offset == 20 { 1 } else { 2 };
-        row.raw_registers = serde_json::to_value(raw).unwrap();
-        let before = row.raw_registers.clone();
-        let draft = draft_from_inbox(&row).unwrap();
-        assert!(draft.quality_error.is_some(), "offset {offset}");
-        assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
-        assert_eq!(row.raw_registers, before);
+fn plc_results_are_independent_of_detail_consistency() {
+    for overall in 0..=2 {
+        for butt in 0..=2 {
+            for tip in 0..=2 {
+                let mut row = receipt(1);
+                let mut raw = registers(1);
+                raw[20] = overall;
+                raw[24] = butt;
+                raw[25] = 4;
+                raw[26] = 1;
+                raw[32] = 2;
+                raw[33] = 1;
+                raw[34] = 4; // Deliberately beyond AttemptCount.
+                raw[120] = tip;
+                raw[121] = 4; // Does not match TIP business point count.
+                raw[122] = 3;
+                row.raw_registers = serde_json::to_value(&raw).unwrap();
+                let draft = draft_from_inbox(&row).unwrap();
+                let result = |n| match n {
+                    1 => MeasurementResult::Ok,
+                    2 => MeasurementResult::Ng,
+                    _ => MeasurementResult::Unmeasured,
+                };
+                assert_eq!(draft.overall_result, result(overall));
+                assert_eq!(draft.stations[0].result, result(tip));
+                assert_eq!(draft.stations[1].result, result(butt));
+                assert_eq!(draft.stations[1].point_count, Some(4));
+                assert_eq!(draft.stations[1].ng_point, Some(1));
+                let point = &draft.stations[1].points[0];
+                assert_eq!(point.attempt_count, 1);
+                assert_eq!(point.decide_attempt, Some(4));
+                assert_eq!(point.attempts.len(), 4); // Nonzero A2-A4 are preserved.
+                assert_eq!(point.result, MeasurementResult::Ng);
+                assert!(
+                    !draft
+                        .quality_error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("AS200_WORKFLOW")
+                );
+                if overall > 0 && butt > 0 && tip > 0 {
+                    assert!(draft.quality_error.is_none());
+                }
+                assert_eq!(row.raw_registers, serde_json::json!(raw));
+            }
+        }
     }
 }
 #[test]
-fn ng_stops_at_first_butt_point_and_keeps_unused_projection_values_null() {
+fn butt_ng_and_overall_follow_registers_even_when_all_points_are_ok() {
+    for (point_result, decide) in [(1, 0), (2, 1)] {
+        let mut row = receipt(1);
+        let mut raw = registers(1);
+        raw[20] = 2;
+        raw[24] = 2;
+        raw[25] = 4;
+        raw[26] = 1;
+        raw[32] = point_result;
+        raw[33] = 1;
+        raw[34] = decide;
+        raw[120] = 1;
+        row.raw_registers = serde_json::json!(raw);
+        let draft = draft_from_inbox(&row).unwrap();
+        assert_eq!(draft.overall_result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[0].result, MeasurementResult::Ok);
+        assert_eq!(draft.stations[1].result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[1].points[0].attempt_count, 1);
+        assert_eq!(
+            draft.stations[1].points[0].decide_attempt,
+            (decide > 0).then_some(i32::from(decide))
+        );
+        assert!(
+            draft.stations[1].points[1..]
+                .iter()
+                .all(|p| p.result == MeasurementResult::Ok)
+        );
+        assert!(draft.quality_error.is_none());
+        assert_eq!(row.raw_registers, serde_json::json!(raw));
+    }
+}
+
+#[test]
+fn malformed_detail_preserves_valid_result_registers_and_other_stations() {
+    for offset in [28, 33, 40, 25] {
+        let mut row = receipt(1);
+        let mut raw = registers(1);
+        if [28, 40].contains(&offset) {
+            raw[offset] = 0;
+            raw[offset + 1] = 0x7FC0; // NaN, not a finite zero substitute.
+        } else {
+            raw[offset] = 99;
+        }
+        row.raw_registers = serde_json::json!(raw);
+        let draft = draft_from_inbox(&row).unwrap();
+        assert_eq!(draft.overall_result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[0].result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[1].result, MeasurementResult::Ok);
+        assert!(draft.quality_error.is_some());
+        assert_eq!(draft.stations[0].points.len(), 1);
+        if offset == 28 {
+            assert!(draft.stations[1].load.is_none());
+        }
+        if offset == 25 {
+            assert!(draft.stations[1].point_count.is_none());
+        }
+    }
+}
+
+#[test]
+fn plc_unmeasured_points_after_ng_keep_unused_projection_values_null() {
     let mut row = receipt(1);
     let mut raw = registers(1);
     raw[24] = 2;
@@ -250,7 +352,7 @@ fn ng_stops_at_first_butt_point_and_keeps_unused_projection_values_null() {
     row.raw_registers = serde_json::to_value(raw).unwrap();
     let draft = draft_from_inbox(&row).unwrap();
     let butt = &draft.stations[1];
-    assert_eq!(butt.point_count, 1);
+    assert_eq!(butt.point_count, Some(1));
     assert_eq!(butt.points.len(), 4);
     assert_eq!(butt.points[0].position.as_ref().unwrap().to_string(), "0");
     for point in &butt.points[1..] {
@@ -285,7 +387,7 @@ fn unmeasured_slots_are_null_and_measured_zero_and_negative_values_remain_real_v
     assert!(real32_numeric(f32::INFINITY).is_err());
 }
 #[test]
-fn protocol_identity_stays_strict_and_incomplete_metadata_is_unknown() {
+fn protocol_identity_stays_strict_and_invalid_metadata_keeps_diagnostics() {
     for (seq, total) in [(-1, Some(1)), (999, Some(1)), (1, None), (1, Some(-1))] {
         let mut row = receipt(seq);
         row.total_count = total;
@@ -305,7 +407,7 @@ fn protocol_identity_stays_strict_and_incomplete_metadata_is_unknown() {
         );
     }
     let mut draft = draft_from_inbox(&receipt(1)).unwrap();
-    draft.stations[0].points[0].attempt_count = 3;
+    draft.stations[0].points[0].attempt_count = 5;
     assert!(MeasurementService::validate(&draft).is_err());
     draft.stations[0].points[0].attempt_count = 4;
     draft.stations[0].points[0].decide_attempt = Some(5);

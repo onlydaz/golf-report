@@ -7,6 +7,9 @@ import { ResultTag } from "../../components/measurement/MeasurementDetails";
 import type { BackendMeasurement, MeasurementDetail, MeasurementHistoryItem, MeasurementStatistics } from "../../services/measurementService";
 import { displayPointResult, formatDecimal, isBusinessPoint, isUnmeasuredPoint, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime } from "../../utils/reportTime";
+import { measurementSettings } from "../../config/measurementSettings";
+import type { MeasurementChartSettings } from "../../config/measurementSettings";
+import { bendDomain, bendExcess } from "../../utils/bendChart";
 
 export function ProductionSummary({ productCode, statistics, loading, skuEditor }: {
   productCode?: string; statistics?: MeasurementStatistics; loading: boolean; skuEditor?: ReactNode;
@@ -55,37 +58,59 @@ export function buildBendSeries(records: MeasurementHistoryItem[], productCode: 
     });
 }
 
-// Display-only defaults for the Python DEMO fixture. Never inferred from measured values.
-const simulatorDemoSettings = {
-  BUTT: { load: 500, pushDist: 10, bendMin: 0, bendMax: 2, positions: [150, 300, 450, 600] },
-  TIP: { load: 200, pushDist: 8, bendMin: 0, bendMax: 2, positions: [80] },
-} as const;
+const decimal = (value: number) => value.toLocaleString("vi-VN", { minimumFractionDigits: 2, maximumFractionDigits: 20 });
+const compactNumber = (value: number) => value.toLocaleString("vi-VN", { maximumFractionDigits: 20 });
+const configured = (value: number | null | undefined, unit: string) => value == null ? "Chưa cấu hình" : `${decimal(value)} ${unit}`;
+function bendLimitText(settings?: MeasurementChartSettings | null) {
+  return settings?.bendLowerMm != null || settings?.bendUpperMm != null
+    ? settings.bendLowerMm == null ? `≤ ${decimal(settings.bendUpperMm!)} mm`
+      : settings.bendUpperMm == null ? `≥ ${decimal(settings.bendLowerMm)} mm`
+        : `${decimal(settings.bendLowerMm)} - ${decimal(settings.bendUpperMm)} mm`
+    : "Chưa cấu hình";
+}
 
-export function BendComparison({ records, productCode, loading, error, simulatorSourceId }: {
-  records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string; simulatorSourceId?: number;
+export function BendSettingsSummary({ settings, station }: {
+  settings: MeasurementChartSettings; station: "BUTT" | "TIP";
+}) {
+  return <div className="monitor-chart-settings">
+    <span>Lực đè<b>{settings.loadG == null ? "Chưa cấu hình" : `${compactNumber(settings.loadG)} g`}</b></span>
+    <span>Khoảng cách đẩy<b>{configured(settings.pushDistMm, "mm")}</b></span>
+    <span>Giới hạn độ cong<b>{bendLimitText(settings)}</b></span>
+    <span>Vị trí điểm đo<b className="monitor-position-values">{settings.positionsMm.some(v => v != null)
+      ? <>{stationPointNumbers(station).map((_, i) => <span key={i}>
+        {i > 0 && <span className="monitor-position-separator"> · </span>}
+        {settings.positionsMm[i] == null ? "Chưa cấu hình" : compactNumber(settings.positionsMm[i]!)}
+      </span>)} mm</> : "Chưa cấu hình"}</b></span>
+  </div>;
+}
+
+export function BendDot({ cx, cy, value, color, settings }: {
+  cx?: number; cy?: number; value?: number | null; color: string; settings?: MeasurementChartSettings | null;
+}) {
+  if (cx == null || cy == null || value == null || !Number.isFinite(value)) return <g />;
+  const exceeded = (bendExcess(value, settings) ?? 0) > 0;
+  return <circle cx={cx} cy={cy} r={exceeded ? 5 : 3}
+    fill={exceeded ? "white" : color} stroke={exceeded ? "#d92d20" : color} strokeWidth={exceeded ? 2 : 1} />;
+}
+
+export function BendComparison({ records, productCode, loading, error }: {
+  records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string;
 }) {
   const [station, setStation] = useState<"BUTT" | "TIP">("BUTT");
+  const settings = measurementSettings[station];
   const series = buildBendSeries(records, productCode, station);
-  // A dedicated new SKU avoids reinterpreting older TEST-AS200 fixtures with different samples.
-  // Mixed-source history must not receive a shared DEMO limit, even with the same SKU.
-  const demo = productCode === "DEMO-AS200" && simulatorSourceId != null && series.length > 0
-    && series.every(row => row.sourceId === simulatorSourceId) ? simulatorDemoSettings[station] : undefined;
-  const decimal = (value: number) => value.toLocaleString("vi-VN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const limits = settings?.bendLowerMm != null || settings?.bendUpperMm != null;
+  const limitText = bendLimitText(settings);
   const keys = ["p1", "p2", "p3", "p4"] as const;
-  const excess = (value: number) => demo ? Math.max(demo.bendMin - value, value - demo.bendMax, 0) : null;
+  const excess = (value: number) => bendExcess(value, settings);
   const colors = ["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].slice(0, stationPointNumbers(station).length);
   const hasBend = series.some(row => [row.p1, row.p2, row.p3, row.p4].some(value => value != null));
   return <Card className="section-card monitor-bend" title="Độ cong thực tế · 30 gậy gần nhất"
     extra={<Select aria-label="Trạm biểu đồ độ cong" value={station} onChange={setStation}
       options={[{ value: "BUTT", label: "Trạm BUTT" }, { value: "TIP", label: "Trạm TIP" }]} />}>
-    <div className="monitor-chart-settings">
-      <span>Lực đè cài đặt<b>{demo ? demo.load : "—"}</b></span>
-      <span>Khoảng cách đẩy<b>{demo ? decimal(demo.pushDist) : "—"}</b></span>
-      <span>Giới hạn độ cong<b>{demo ? `${decimal(demo.bendMin)} – ${decimal(demo.bendMax)}` : "—"}</b></span>
-      <span>Vị trí điểm đo<b>{demo ? demo.positions.join(" · ") : "—"}</b></span>
-    </div>
+    <BendSettingsSummary settings={settings} station={station} />
     <div className="monitor-chart-legend" aria-label="Chú giải điểm đo">{colors.map((color, i) => <span key={color}><i style={{ background: color }} />Điểm {i + 1}</span>)}
-      {demo && <span><i className="monitor-limit-dot" />Vượt giới hạn (NG)</span>}
+      {limits && <span><i className="monitor-limit-dot" />Vượt giới hạn cài đặt</span>}
     </div>
     {error && <Alert type="error" showIcon title={error} />}
     <Spin spinning={loading}>
@@ -93,37 +118,33 @@ export function BendComparison({ records, productCode, loading, error, simulator
         <LineChart data={series} margin={{ top: 16, right: 18, bottom: 8, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="id" tickFormatter={id => `#${series.find(row => row.id === id)?.clubNumber ?? "—"}`} />
-          <YAxis width={65} label={{ value: "Độ cong (mm)", angle: -90, position: "insideLeft" }} />
-          {demo && <>
-            <ReferenceLine y={demo.bendMin} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
-              label={{ value: `Dưới ${decimal(demo.bendMin)}`, position: "insideBottomRight", fill: "#b42318", fontSize: 13 }} />
-            <ReferenceLine y={demo.bendMax} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
-              label={{ value: `Trên ${decimal(demo.bendMax)}`, position: "insideTopRight", fill: "#b42318", fontSize: 13 }} />
-          </>}
+          <YAxis width={65} domain={bendDomain(series.flatMap(row => keys.map(key => row[key])), settings)}
+            label={{ value: "Độ cong (mm)", angle: -90, position: "insideLeft" }} />
+          {settings?.bendLowerMm != null && <ReferenceLine y={settings.bendLowerMm} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
+            label={{ value: `Dưới ${decimal(settings.bendLowerMm)}`, position: "insideBottomRight", fill: "#b42318", fontSize: 13 }} />}
+          {settings?.bendUpperMm != null && <ReferenceLine y={settings.bendUpperMm} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
+            label={{ value: `Trên ${decimal(settings.bendUpperMm)}`, position: "insideTopRight", fill: "#b42318", fontSize: 13 }} />}
           <Tooltip content={({ active, label }) => {
             const row = series.find(item => item.id === Number(label));
             if (!active || !row) return null;
             return <div className="monitor-bend-tooltip"><strong>{station} · Gậy #{row.clubNumber}</strong>
               <div>{formatReportTime(row.measuredAt)}</div>
-              <div>Giới hạn: {demo ? `${decimal(demo.bendMin)} – ${decimal(demo.bendMax)} mm (DEMO)` : "Chưa có dữ liệu cài đặt"}</div>
+              <div>Giới hạn cài đặt hiện tại: {limitText}</div>
               {colors.map((color, i) => {
                 const value = row[keys[i]];
                 const exceeded = value != null ? excess(value) : null;
                 return <div key={keys[i]} style={{ color: exceeded != null && exceeded > 0 ? "#d92d20" : color }}>
-                  {station} · P{i + 1}: {value != null ? `${decimal(value)} mm` : "—"}
-                  {demo && value != null && exceeded != null && exceeded > 0
-                    ? ` · Vượt ${value < demo.bendMin ? "dưới" : "trên"} ${decimal(exceeded)} mm` : ""}
+                  {station} · P{i + 1} · Vị trí cài đặt: {configured(settings?.positionsMm[i], "mm")}
+                  {` · Độ cong thực tế: ${value != null ? `${decimal(value)} mm` : "—"}`}
+                  {value != null && exceeded != null && exceeded > 0
+                    ? ` · Vượt ${settings?.bendLowerMm != null && value < settings.bendLowerMm ? "dưới" : "trên"} ${decimal(exceeded)} mm` : ""}
                 </div>;
               })}
             </div>;
           }} />
           {colors.map((color, i) => {
-            const dot = ({ cx, cy, value }: { cx?: number; cy?: number; value?: number | null }) => {
-              if (cx == null || cy == null || value == null || !Number.isFinite(value)) return <g />;
-              const ng = (excess(value) ?? 0) > 0;
-              return <circle key={`${i}-${cx}-${cy}`} cx={cx} cy={cy} r={ng ? 5 : 3}
-                fill={ng ? "#d92d20" : color} stroke={ng ? "white" : color} strokeWidth={ng ? 2 : 1} />;
-            };
+            const dot = (props: { cx?: number; cy?: number; value?: number | null }) =>
+              <BendDot key={`${i}-${props.cx}-${props.cy}`} {...props} color={color} settings={settings} />;
             return <Line key={color} type="linear" dataKey={keys[i]} name={`${station} · Điểm ${i + 1}`} stroke={color}
               connectNulls={false} dot={dot} activeDot={dot} isAnimationActive={false} />;
           })}

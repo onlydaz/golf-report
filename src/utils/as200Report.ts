@@ -10,9 +10,8 @@ export function isBusinessPoint(station: string, pointNumber: number): boolean {
     && (station === "TIP" ? pointNumber === 1 : station === "BUTT" && pointNumber <= 4);
 }
 
-export function displayPointResult(station: Pick<MeasurementStation, "result" | "pointCount">, point: MeasurementPoint) {
-  return station.result === "NG" && point.pointNumber > station.pointCount && isUnmeasuredPoint(point)
-    ? "SKIPPED" as const : point.result;
+export function displayPointResult(_station: Pick<MeasurementStation, "result" | "pointCount">, point: MeasurementPoint) {
+  return point.result; // Preserve the PLC value; do not infer SKIPPED from station metadata.
 }
 
 // Old records may contain padding position=0. Only a wholly unused point is empty;

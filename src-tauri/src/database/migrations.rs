@@ -4,6 +4,7 @@ pub const INITIAL_VERSION: i64 = 20261109120000;
 pub const REGISTRY_VERSION: i64 = 20261111120000;
 pub const PUBLICATION_VERSION: i64 = 20261117120000;
 pub const REGISTRY_RETIREMENT_VERSION: i64 = 20261117140000;
+pub const MEASUREMENT_SETTINGS_VERSION: i64 = 20261118160000;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, FromRow)]
@@ -115,6 +116,13 @@ pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Resu
                     "Lịch sử SQLx ghi AS200 đã áp dụng nhưng thiếu bảng {table}. Không tự reset lịch sử hoặc chạy chồng migration."
                 ));
             }
+        }
+        if history
+            .iter()
+            .any(|item| item.version == MEASUREMENT_SETTINGS_VERSION)
+            && !tables.iter().any(|name| name == "measurement_settings")
+        {
+            return Err("SQLx ghi cấu hình đo đã áp dụng nhưng thiếu measurement_settings; cần đối chiếu schema/history.".into());
         }
         let registry_retired = history
             .iter()

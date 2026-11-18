@@ -108,6 +108,27 @@ const record: MeasurementDetail = {
 };
 
 describe("AS200 display and export", () => {
+  it("preserves independent PLC results and detail slots beyond AttemptCount", async () => {
+    const source = structuredClone(record);
+    source.overallResult = "OK";
+    source.buttResult = "NG";
+    source.stations[1].result = "NG";
+    source.stations[1].pointCount = 0;
+    source.stations[0].points[0].attemptCount = 1;
+    source.stations[0].points[0].decideAttempt = 2;
+    const tables = buildReportTables([source]);
+    expect(tables.measurements[0].OverallResult).toBe("OK");
+    expect(tables.measurements[0]["BUTT Result"]).toBe("NG");
+    expect(tables.points[1].Result).toBe("UNMEASURED"); // No inferred SKIPPED.
+    expect(tables.points[0].AttemptCount).toBe(1);
+    expect(tables.points[0].DecideAttempt).toBe(2);
+    expect(tables.attempts.map(a => a.AttemptNumber)).toEqual([1, 2]);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(await createExcelBytes(tables.measurements, [source]) as unknown as Parameters<typeof workbook.xlsx.load>[0]);
+    expect(workbook.worksheets[0].getRow(2).values).toContain("OK");
+    expect(source.stations[0].points[0].attemptCount).toBe(1);
+  });
+
   it("excludes unused TIP P2-P4 padding while retaining legitimate BUTT unmeasured points", () => {
     const source = structuredClone(record);
     for (const pointNumber of [2, 3, 4]) {

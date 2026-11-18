@@ -326,7 +326,6 @@ function AddMeasurement() {
   }, [status]);
 
   const latest = status?.latest;
-  const displayed = latest ?? storedLatest;
   const stoppedWithPendingData = status?.state === "STOPPED" && status.message.includes("dữ liệu chưa lưu");
   const safelyStopped = status?.state === "STOPPED" && !status.enabled && !stoppedWithPendingData;
   const collectionLabel = collectionAction ? collectionAction === "stop" ? "Đang dừng" : "Đang kết nối lại"
@@ -477,6 +476,13 @@ function AddMeasurement() {
 
   const displayStatus = getPlcDisplayStatus(status, error);
   const activeDetail = detail && detail.id === committedId ? detail : undefined;
+  // Committed results come from Measurement, including historical rows whose
+  // projection policy differs from the current decoder. Never reclassify them.
+  const displayed = latest?.measurementId != null
+    ? activeDetail ?? recent.find(row => row.id === latest.measurementId)
+      ?? chartRecords.find(row => row.id === latest.measurementId)
+      ?? (storedLatest?.id === latest.measurementId ? storedLatest : undefined)
+    : latest ?? storedLatest;
   const receivedTime = latest?.receivedAt ?? storedLatest?.measuredAt;
 
   return (
@@ -485,8 +491,10 @@ function AddMeasurement() {
 
       <PageHeader eyebrow="GIÁM SÁT" title="1 · Giám sát" description="" />
       {displayed?.qualityError && <Alert type="info" showIcon
-        title="Đã lưu bản ghi — chất lượng chưa xác định"
-        description="Dữ liệu chưa đủ để kết luận OK/NG và không tính vào KPI sản xuất. Xem Chi tiết để đối chiếu." />}
+        title={displayed.overallResult === "UNMEASURED" ? "Đã lưu bản ghi — chất lượng chưa xác định" : "Đã lưu kết quả PLC — có thông tin cần kiểm tra"}
+        description={displayed.overallResult === "UNMEASURED"
+          ? "Dữ liệu chưa đủ để kết luận OK/NG và không tính vào KPI sản xuất. Xem Chi tiết để đối chiếu."
+          : "Kết quả và KPI giữ theo Overall do PLC cung cấp. Xem Chi tiết để đối chiếu thông tin bản ghi."} />}
 
       <div className="monitor-top-grid">
       <ProductionSummary productCode={currentSku}
@@ -547,10 +555,7 @@ function AddMeasurement() {
         {detailError && <Alert type="error" showIcon message={detailError} />}
         <CurrentPointTable detail={activeDetail} loading={detailLoading} />
       </Card>
-      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError}
-        simulatorSourceId={status?.sourceKey === "golf-report-simulator"
-          && settings?.endpoint.ip === "127.0.0.1" && settings.endpoint.port === 1503
-          && !!activeDetail && activeDetail.productCode === currentSku ? activeDetail.sourceId : undefined} />
+      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError} />
       </div>
 
       {showSystemNotice && !!systemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert

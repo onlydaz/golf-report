@@ -642,7 +642,7 @@ impl MeasurementRepository {
         let list = Self::list(pool, request).await?;
         let ids: Vec<_> = list.items.iter().map(|m| m.id).collect();
         // One bounded query for decision values on this page, not one request per club.
-        let points: Vec<HistoryDecisionPoint> = sqlx::query_as("SELECT s.measurement_id,s.station_type AS station,p.point_number,CASE WHEN p.attempt_count>0 AND p.result IN ('OK','NG') THEN a.bend ELSE NULL END AS bend FROM measurement_stations s JOIN measurement_points p ON p.station_id=s.id LEFT JOIN measurement_attempts a ON a.point_id=p.id AND a.attempt_number=p.decide_attempt AND p.decide_attempt BETWEEN 1 AND p.attempt_count WHERE s.measurement_id=ANY($1) AND ((s.station_type='TIP' AND p.point_number=1) OR (s.station_type='BUTT' AND p.point_number BETWEEN 1 AND 4)) ORDER BY s.measurement_id,s.station_type,p.point_number")
+        let points: Vec<HistoryDecisionPoint> = sqlx::query_as("SELECT s.measurement_id,s.station_type AS station,p.point_number,a.bend AS bend FROM measurement_stations s JOIN measurement_points p ON p.station_id=s.id LEFT JOIN measurement_attempts a ON a.point_id=p.id AND a.attempt_number=p.decide_attempt AND p.decide_attempt BETWEEN 1 AND 4 WHERE s.measurement_id=ANY($1) AND ((s.station_type='TIP' AND p.point_number=1) OR (s.station_type='BUTT' AND p.point_number BETWEEN 1 AND 4)) ORDER BY s.measurement_id,s.station_type,p.point_number")
             .bind(&ids).fetch_all(pool).await.map_err(|e| e.to_string())?;
         let mut grouped = std::collections::HashMap::<i64, Vec<HistoryDecisionPoint>>::new();
         for point in points {
@@ -678,7 +678,7 @@ impl MeasurementRepository {
         );
         q.push(JOINS);
         filter(&mut q, request);
-        q.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
+        q.push(" AND m.overall_result IN ('OK','NG')");
         q.push(r#"), half_hour AS (
             SELECT to_timestamp(floor(extract(epoch FROM measured_at)/1800)*1800) AS at,
                 count(*) FILTER(WHERE overall_result='OK') AS ok,
@@ -694,8 +694,8 @@ impl MeasurementRepository {
             JOIN measurement_points p ON p.station_id=s.id
             LEFT JOIN measurement_attempts a ON a.point_id=p.id
                 AND a.attempt_number=p.decide_attempt
-                AND p.decide_attempt BETWEEN 1 AND p.attempt_count
-            WHERE p.attempt_count>0 AND p.result IN ('OK','NG')
+                AND p.decide_attempt BETWEEN 1 AND 4
+            WHERE p.result IN ('OK','NG')
                 AND ((s.station_type='TIP' AND p.point_number=1)
                     OR (s.station_type='BUTT' AND p.point_number BETWEEN 1 AND 4))
         ), grouped AS (
@@ -939,7 +939,7 @@ impl MeasurementRepository {
         );
         q.push(JOINS);
         filter(&mut q, request);
-        q.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
+        q.push(" AND m.overall_result IN ('OK','NG')");
         let row = q
             .build()
             .fetch_one(&mut *tx)
@@ -950,7 +950,7 @@ impl MeasurementRepository {
         );
         daily.push(JOINS);
         filter(&mut daily, request);
-        daily.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
+        daily.push(" AND m.overall_result IN ('OK','NG')");
         daily.push(" GROUP BY (m.measured_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date ORDER BY (m.measured_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date");
         let daily = daily
             .build_query_as()
@@ -961,7 +961,7 @@ impl MeasurementRepository {
             QueryBuilder::<Postgres>::new("SELECT m.overall_result AS result,count(*) AS count");
         distribution.push(JOINS);
         filter(&mut distribution, request);
-        distribution.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
+        distribution.push(" AND m.overall_result IN ('OK','NG')");
         distribution.push(" GROUP BY m.overall_result ORDER BY m.overall_result");
         let overall_distribution = distribution
             .build_query_as()

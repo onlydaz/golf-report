@@ -59,9 +59,9 @@ export interface MeasurementStation {
   measurementId: number;
   stationType: "TIP" | "BUTT";
   result: MeasurementResult;
-  pointCount: number;
+  pointCount: number | null;
   ngPoint: number | null;
-  load: string;
+  load: string | null;
   createdAt: string;
   points: MeasurementPoint[];
 }

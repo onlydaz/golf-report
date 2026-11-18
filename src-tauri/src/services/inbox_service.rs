@@ -5,7 +5,7 @@ use crate::{
     plc::as200::{
         WordOrder, decode, map,
         map::record as r,
-        model::{PlcResult, PlcStation},
+        model::{PlcMeasurementPoint, PlcResult, PlcStation},
     },
     repositories::*,
 };
@@ -64,48 +64,142 @@ fn result(value: PlcResult) -> MeasurementResult {
         PlcResult::Ng => MeasurementResult::Ng,
     }
 }
+fn point(value: &PlcMeasurementPoint, number: usize) -> Result<PointInput, String> {
+    let attempts = value
+        .attempts
+        .iter()
+        .filter(|a| {
+            i16::from(a.number) <= value.attempt_count
+                || i16::from(a.number) == value.decide_attempt
+                || a.push_dist != 0.0
+                || a.bend != 0.0
+        })
+        .map(|a| {
+            Ok(AttemptInput {
+                attempt_number: i32::from(a.number),
+                push_dist: Some(real32_numeric(a.push_dist)?),
+                bend: Some(real32_numeric(a.bend)?),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let has_detail = value.attempt_count > 0
+        || value.decide_attempt > 0
+        || value.result != PlcResult::Unmeasured
+        || value.position != 0.0
+        || !attempts.is_empty();
+    Ok(PointInput {
+        point_number: number as i32,
+        result: result(value.result),
+        attempt_count: i32::from(value.attempt_count),
+        decide_attempt: (value.decide_attempt != 0).then_some(i32::from(value.decide_attempt)),
+        position: if has_detail {
+            Some(real32_numeric(value.position)?)
+        } else {
+            None
+        },
+        attempts,
+    })
+}
 fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput, String> {
-    let mut points = Vec::new();
-    let point_limit = match &station_type {
-        StationType::Tip => 1,
-        StationType::Butt => 4,
+    let limit = if station_type == StationType::Tip {
+        1
+    } else {
+        4
     };
-    for (index, point) in value.points.iter().take(point_limit).enumerate() {
-        let mut attempts = Vec::new();
-        for attempt in point.attempts.iter().take(point.attempt_count as usize) {
-            attempts.push(AttemptInput {
-                attempt_number: i32::from(attempt.number),
-                push_dist: Some(real32_numeric(attempt.push_dist)?),
-                bend: Some(real32_numeric(attempt.bend)?),
-            });
-        }
-        points.push(PointInput {
-            point_number: (index + 1) as i32,
-            result: result(point.result),
-            attempt_count: i32::from(point.attempt_count),
-            decide_attempt: if point.decide_attempt == 0 {
-                None
-            } else {
-                Some(i32::from(point.decide_attempt))
-            },
-            // An explicit attempt count identifies a measured position. Keep
-            // business points only (TIP 1, BUTT 4), independently of station completion.
-            position: if point.attempt_count > 0 {
-                Some(real32_numeric(point.position)?)
-            } else {
-                None
-            },
-            attempts,
-        });
-    }
     Ok(StationInput {
         station_type,
         result: result(value.result),
-        point_count: i32::from(value.point_count),
+        point_count: Some(i32::from(value.point_count)),
         ng_point: Some(i32::from(value.ng_point)),
-        load: real32_numeric(value.load)?,
-        points,
+        load: Some(real32_numeric(value.load)?),
+        points: value
+            .points
+            .iter()
+            .take(limit)
+            .enumerate()
+            .map(|(i, p)| point(p, i + 1))
+            .collect::<Result<_, _>>()?,
     })
+}
+// A malformed detail must not erase a valid result register. Missing scalar
+// projections stay NULL/absent with diagnostics; the original WORDs remain in Inbox.
+fn partial_station(raw: &[u16], order: WordOrder, station_type: StationType) -> StationInput {
+    let (base, points_base, limit) = if station_type == StationType::Tip {
+        (r::TIP, r::TIP_POINTS, 1)
+    } else {
+        (r::BUTT, r::BUTT_POINTS, 4)
+    };
+    let bounded = |offset| {
+        decode::int16(raw, offset)
+            .ok()
+            .filter(|n| (0..=4).contains(n))
+            .map(i32::from)
+    };
+    StationInput {
+        station_type,
+        result: decoded_result(raw, base),
+        point_count: bounded(base + 1),
+        ng_point: bounded(base + 2),
+        load: decode::real32(raw, base + 4, order)
+            .ok()
+            .and_then(|v| real32_numeric(v).ok()),
+        points: (0..limit)
+            .filter_map(|i| {
+                decode::point(raw, points_base + i * r::POINT_SIZE, order)
+                    .ok()
+                    .and_then(|p| point(&p, i + 1).ok())
+                    .or_else(|| partial_point(raw, points_base + i * r::POINT_SIZE, order, i + 1))
+            })
+            .collect(),
+    }
+}
+fn partial_point(raw: &[u16], base: usize, order: WordOrder, number: usize) -> Option<PointInput> {
+    let point_result = decode::int16(raw, base).and_then(decode::result).ok()?;
+    let count = decode::int16(raw, base + 1)
+        .ok()
+        .filter(|n| (0..=4).contains(n))?;
+    let decide = decode::int16(raw, base + 2)
+        .ok()
+        .filter(|n| (1..=4).contains(n));
+    let numeric = |offset| {
+        decode::real32(raw, offset, order)
+            .ok()
+            .and_then(|v| real32_numeric(v).ok())
+    };
+    let mut attempts = Vec::new();
+    for index in 0..4 {
+        let offset = base + 6 + index * 4;
+        let number = (index + 1) as i32;
+        if number <= i32::from(count)
+            || decide.map(i32::from) == Some(number)
+            || raw[offset..offset + 4].iter().any(|word| *word != 0)
+        {
+            attempts.push(AttemptInput {
+                attempt_number: number,
+                push_dist: numeric(offset),
+                bend: numeric(offset + 2),
+            });
+        }
+    }
+    let has_detail = count > 0
+        || decide.is_some()
+        || point_result != PlcResult::Unmeasured
+        || !attempts.is_empty()
+        || raw[base + 4..base + 6].iter().any(|word| *word != 0);
+    Some(PointInput {
+        point_number: number as i32,
+        result: result(point_result),
+        attempt_count: i32::from(count),
+        decide_attempt: decide.map(i32::from),
+        position: if has_detail { numeric(base + 4) } else { None },
+        attempts,
+    })
+}
+fn decoded_result(raw: &[u16], offset: usize) -> MeasurementResult {
+    decode::int16(raw, offset)
+        .and_then(decode::result)
+        .map(result)
+        .unwrap_or(MeasurementResult::Unmeasured)
 }
 fn legacy_draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String> {
     let session = inbox
@@ -127,7 +221,7 @@ fn legacy_draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, Stri
     )
     .map_err(|e| e.to_string())?;
     record.validate_metadata(inbox.total_count)?;
-    record.validate_workflow()?;
+    record.validate_product_code()?;
     if !record.valid_unacknowledged || record.record_seq != inbox.record_seq {
         return Err("Status bit 0 hoặc RecordSeq không khớp inbox".into());
     }
@@ -209,7 +303,7 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
             }
             // SKU is receipt metadata, never rewritten into the raw WORD array.
             r.product_code = product_code.clone();
-            r.validate_workflow()?;
+            r.validate_product_code()?;
             if !r.complete() || r.record_seq != count {
                 return Err("Incomplete results or RecordSeq/publication mismatch".into());
             }
@@ -219,25 +313,30 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
     if product_code.is_empty() {
         quality_error = Some("SKU not assigned at receipt; PLC ProductCode empty".into());
     }
-    let mut stations = Vec::new();
-    if let Ok(record) = &decoded {
-        // Scalar decoding and bounded counts still apply. Unused slots do not
-        // become measured values just because their raw WORDs are nonzero.
-        stations.push(station(&record.tip, StationType::Tip)?);
-        stations.push(station(&record.butt, StationType::Butt)?);
-    } else if let Err(error) = &decoded {
-        quality_error = Some(error.to_string());
-    }
+    let mut stations = if let Ok(record) = &decoded {
+        vec![
+            station(&record.tip, StationType::Tip)?,
+            station(&record.butt, StationType::Butt)?,
+        ]
+    } else {
+        vec![
+            partial_station(&raw, order, StationType::Tip),
+            partial_station(&raw, order, StationType::Butt),
+        ]
+    };
     if quality_error.is_some() {
         for station in &mut stations {
-            station.points.retain(|p| p.attempt_count > 0);
+            station.points.retain(|p| {
+                p.result != MeasurementResult::Unmeasured
+                    || p.attempt_count > 0
+                    || p.decide_attempt.is_some()
+                    || p.position.is_some()
+                    || !p.attempts.is_empty()
+            });
         }
     }
-    let overall_result = if quality_error.is_none() {
-        result(decoded.as_ref().unwrap().overall_result)
-    } else {
-        MeasurementResult::Unmeasured
-    };
+    // D25040 is authoritative even if completion/metadata/detail diagnostics exist.
+    let overall_result = decoded_result(&raw, r::OVERALL_RESULT);
     let draft = MeasurementDraft {
         source_id: inbox.source_id,
         confirmed_session_id: session.clone(),

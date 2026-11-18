@@ -56,7 +56,7 @@ pub fn product_code(words: &[u16]) -> Result<String, As200Error> {
     }
     String::from_utf8(bytes[..end].to_vec()).map_err(|_| invalid("ProductCode không hợp lệ"))
 }
-fn result(value: i16) -> Result<PlcResult, As200Error> {
+pub(crate) fn result(value: i16) -> Result<PlcResult, As200Error> {
     match value {
         0 => Ok(PlcResult::Unmeasured),
         1 => Ok(PlcResult::Ok),
@@ -118,14 +118,15 @@ pub fn control(words: &[u16], order: WordOrder) -> Result<PlcControl, As200Error
     Ok(value)
 }
 
-fn point(words: &[u16], base: usize, order: WordOrder) -> Result<PlcMeasurementPoint, As200Error> {
+pub(crate) fn point(
+    words: &[u16],
+    base: usize,
+    order: WordOrder,
+) -> Result<PlcMeasurementPoint, As200Error> {
     let point_result = result(int16(words, base)?)?;
     let count = int16(words, base + 1)?;
     let decide = int16(words, base + 2)?;
-    if !(0..=4).contains(&count)
-        || !(0..=count).contains(&decide)
-        || (point_result != PlcResult::Unmeasured && (count == 0 || decide == 0))
-    {
+    if !(0..=4).contains(&count) || !(0..=4).contains(&decide) {
         return Err(invalid(format!(
             "AttemptCount/DecideAttempt không hợp lệ tại offset {base}"
         )));
@@ -157,11 +158,7 @@ fn station(
     let station_result = result(int16(words, base)?)?;
     let point_count = int16(words, base + 1)?;
     let ng_point = int16(words, base + 2)?;
-    if !(0..=4).contains(&point_count)
-        || !(0..=4).contains(&ng_point)
-        || (station_result == PlcResult::Ok && ng_point != 0)
-        || (station_result == PlcResult::Ng && ng_point == 0)
-    {
+    if !(0..=4).contains(&point_count) || !(0..=4).contains(&ng_point) {
         return Err(invalid(format!(
             "PointCount/NGPoint không hợp lệ tại offset {base}"
         )));
