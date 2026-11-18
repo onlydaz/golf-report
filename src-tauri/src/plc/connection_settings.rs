@@ -352,6 +352,15 @@ pub async fn clear_plc_connection_log(state: tauri::State<'_, WorkerState>) -> R
 }
 
 async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
+    eprintln!(
+        "PLC_INSPECT state=START endpoint={} unit_id={} control_start=D{} modbus_start={:?} offset={} word_order={}",
+        config.address,
+        config.unit_id,
+        config.control_start,
+        map::modbus_address(config.control_start, config.modbus_address_offset),
+        config.modbus_address_offset,
+        config.word_order.as_str()
+    );
     let mut report = InspectionReport {
         tcp_connected: false,
         modbus_read_succeeded: false,
@@ -360,6 +369,10 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
         message: CONNECT.into(),
     };
     if let Err(error) = config.validate_read() {
+        eprintln!(
+            "PLC_INSPECT state=INVALID_CONFIG endpoint={} reason={error}",
+            config.address
+        );
         report.mapping_warning = Some(error);
         report.message =
             "Cấu hình vùng đọc chưa hợp lệ. Kiểm tra Register Map trước khi thử lại.".into();
@@ -379,6 +392,10 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
             drop(stream);
         }
         Err(error) => {
+            eprintln!(
+                "PLC_INSPECT state=TCP_FAILED endpoint={} reason={error}",
+                config.address
+            );
             report.message = error.to_string();
             return report;
         }
@@ -393,6 +410,20 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
             report.modbus_read_succeeded = true;
             report.mapping_warning = as200_structure(&snapshot).err();
             report.as200_valid = report.mapping_warning.is_none();
+            eprintln!(
+                "PLC_INSPECT stage=CONTROL state={} endpoint={} control={:?} reason={}",
+                if report.as200_valid {
+                    "VALID"
+                } else {
+                    "INVALID"
+                },
+                config.address,
+                snapshot.control,
+                report
+                    .mapping_warning
+                    .as_deref()
+                    .unwrap_or("stable control/profile; ACK requires Worker checkpoint validation")
+            );
             report.message = if report.as200_valid {
                 "TCP/Modbus và control AS200 hợp lệ. Lần kiểm tra chỉ đọc, không lưu PostgreSQL hoặc ghi ACK. Worker nhận raw kể cả payload chưa giải mã được."
             } else {
@@ -418,8 +449,24 @@ async fn inspect_endpoint(config: SimulatorConfig) -> InspectionReport {
         }
         Err(_) => {
             report.message = "TCP đã kết nối nhưng chưa đọc được Modbus hợp lệ. Kiểm tra Unit ID, vùng nhớ và timeout.".into();
+            report.mapping_warning = Some(format!(
+                "Hết thời gian kiểm tra snapshot AS200 ({} ms).",
+                config.timeout_ms.saturating_mul(10)
+            ));
         }
     }
+    eprintln!(
+        "PLC_INSPECT state={} endpoint={} tcp_connected={} modbus_read_succeeded={} reason={}",
+        if report.as200_valid {
+            "COMPLETE"
+        } else {
+            "REJECTED"
+        },
+        config.address,
+        report.tcp_connected,
+        report.modbus_read_succeeded,
+        report.mapping_warning.as_deref().unwrap_or(&report.message)
+    );
     report
 }
 
@@ -436,12 +483,15 @@ fn as200_structure(report: &super::as200::reader::PublishedRecordSnapshot) -> Re
         }
         if control.total_count < 0
             || control.pc_read_count < 0
-            || control.pc_read_count > control.total_count
+            // Ready=0 allows a provisional TotalCount during preparation. This
+            // read-only probe cannot validate DB checkpoint/pending state; Worker
+            // still requires that evidence before any Count/Done write.
+            || (control.data_ready == 1 && control.pc_read_count > control.total_count)
             || !matches!(control.data_ready, 0 | 1)
             || !matches!(control.pc_read_done, 0 | 1)
         {
             return Err(format!(
-                "Trạng thái AS200 không hợp lệ: TotalCount={}, PC_ReadCount={}, DataReady={}, PC_ReadDone={}.",
+                "Trạng thái AS200 không hợp lệ: TotalCount={}, PC_ReadCount={}, DataReady={}, PC_ReadDone={}. Cần counter không âm, cờ 0/1 và PC_ReadCount <= TotalCount khi DataReady=1.",
                 control.total_count,
                 control.pc_read_count,
                 control.data_ready,

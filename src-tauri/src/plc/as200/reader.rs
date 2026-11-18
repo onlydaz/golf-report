@@ -161,11 +161,29 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         let mut result = Vec::with_capacity(count);
         while result.len() < count {
             let block_size = (count - result.len()).min(map::FC03_LIMIT);
+            let request_address = address + result.len() as u16;
             let block = self
                 .transport
-                .read_holding_registers(address + result.len() as u16, block_size as u16)
-                .await?;
+                .read_holding_registers(request_address, block_size as u16)
+                .await
+                .map_err(|error| {
+                    eprintln!(
+                        "PLC_FC03 state=ERROR endpoint={} unit_id={} d_start={} modbus_start={} offset={} words={} reason={error}",
+                        self.config.address, self.config.unit_id,
+                        usize::from(d_address) + result.len(), request_address,
+                        self.config.modbus_address_offset, block_size
+                    );
+                    error
+                })?;
             if block.len() != block_size {
+                eprintln!(
+                    "PLC_FC03 state=SHORT_RESPONSE endpoint={} unit_id={} modbus_start={} expected_words={} received_words={}",
+                    self.config.address,
+                    self.config.unit_id,
+                    request_address,
+                    block_size,
+                    block.len()
+                );
                 return Err(As200Error::Protocol("FC03 trả thiếu WORD".into()));
             }
             result.extend(block);
@@ -187,7 +205,15 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         let raw = self
             .read_range(self.config.control_start, map::CONTROL_SIZE)
             .await?;
-        decode::control(&raw, self.config.word_order)
+        decode::control(&raw, self.config.word_order).map_err(|error| {
+            eprintln!(
+                "PLC_CONTROL state=INVALID endpoint={} unit_id={} d_start={} modbus_start={:?} offset={} word_order={:?} words={raw:?} reason={error}",
+                self.config.address, self.config.unit_id, self.config.control_start,
+                map::modbus_address(self.config.control_start, self.config.modbus_address_offset),
+                self.config.modbus_address_offset, self.config.word_order
+            );
+            error
+        })
     }
     /// Theo xác nhận kỹ thuật PLC: PC chỉ đọc Bản ghi 1 khi DataReady=1;
     /// PLC chịu trách nhiệm công bố và quản lý toàn bộ buffer vật lý.
@@ -218,6 +244,10 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         if before.data_ready == 0 {
             let after = self.read_control().await?;
             if !same_control(&before, &after) {
+                eprintln!(
+                    "PLC_CONTROL state=UNSTABLE stage=IDLE endpoint={} before={before:?} after={after:?}",
+                    self.config.address
+                );
                 return Err(As200Error::Unstable);
             }
             return Ok(PublishedRecordSnapshot {
@@ -230,13 +260,25 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         let raw = self.read_published_words().await?;
         let middle = self.read_control().await?;
         if !same_control(&before, &middle) {
+            eprintln!(
+                "PLC_CONTROL state=UNSTABLE stage=AFTER_PAYLOAD endpoint={} before={before:?} after={middle:?}",
+                self.config.address
+            );
             return Err(As200Error::Unstable);
         }
         if raw != self.read_published_words().await? {
+            eprintln!(
+                "PLC_SNAPSHOT state=UNSTABLE endpoint={} reason=published_payload_changed",
+                self.config.address
+            );
             return Err(As200Error::Unstable);
         }
         let after = self.read_control().await?;
         if !same_control(&before, &after) {
+            eprintln!(
+                "PLC_CONTROL state=UNSTABLE stage=AFTER_RECHECK endpoint={} before={before:?} after={after:?}",
+                self.config.address
+            );
             return Err(As200Error::Unstable);
         }
 

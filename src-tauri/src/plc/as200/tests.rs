@@ -33,6 +33,30 @@ fn control(total: i32, order: WordOrder) -> Vec<u16> {
     put32(&mut raw, 4, total as u32, order);
     raw
 }
+
+#[test]
+fn invalid_control_names_the_field_value_and_allowed_range() {
+    let order = WordOrder::LowWordFirst;
+    for (offset, field, actual) in [
+        (3, "WriteIdx", 2_u16),
+        (6, "LastIdx", 2),
+        (7, "Heartbeat", 0xFFFF),
+        (11, "DataReady", 2),
+        (12, "PC_ReadDone", 2),
+    ] {
+        let mut words = control(1, order);
+        words[offset] = actual;
+        let error = decode::control(&words, order).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("{field}={}", actual as i16)),
+            "{error}"
+        );
+        assert!(error.contains(&format!("offset {offset}")), "{error}");
+        assert!(error.contains("ngoài phạm vi 0.."), "{error}");
+    }
+    assert!(decode::control(&control(1, order), order).is_ok()); // Heartbeat=32767 remains valid.
+}
+
 fn record(seq: i32, order: WordOrder) -> Vec<u16> {
     let mut raw = vec![0; 240];
     raw[0] = 1;
@@ -297,6 +321,52 @@ async fn published_record_not_ready_reads_only_control_then_observes_ready_level
     let snapshot = reader.poll_published_record().await.unwrap();
     assert!(snapshot.buffer.is_some());
     assert!(snapshot.diagnostics.is_empty());
+}
+
+#[tokio::test]
+async fn idle_preparation_never_reads_payload_and_ready_requires_a_stable_snapshot() {
+    let order = WordOrder::LowWordFirst;
+    let mut memory = MemoryReader::new(order, 1);
+    memory.words[11] = 0;
+    memory.words[8] = 1;
+    let mut reader = As200Reader::with_transport(config(order), memory);
+    // Provisional values may be entered in any order while Ready stays low.
+    for total in [8, 0, 2] {
+        put32(&mut reader.transport.words, 4, total, order);
+        put32(&mut reader.transport.words, 22, 99, order); // StickNo
+        put32(&mut reader.transport.words, 42, 77, order); // RecordSeq
+        reader.transport.words[180] ^= 1;
+        reader.transport.calls.clear();
+        let snapshot = reader.poll_published_record().await.unwrap();
+        assert_eq!(snapshot.control.total_count, total as i32);
+        assert!(snapshot.buffer.is_none());
+        assert_eq!(reader.transport.calls, [(25000, 20), (25000, 20)]);
+    }
+    // Changing control mid-poll is a transient snapshot error, not a receipt.
+    reader.transport.calls.clear();
+    reader.transport.mutate_on_call = Some(2);
+    reader.transport.mutation_offset = 4;
+    assert_eq!(
+        reader.poll_published_record().await.unwrap_err(),
+        As200Error::Unstable
+    );
+    assert_eq!(reader.transport.calls, [(25000, 20), (25000, 20)]);
+
+    reader.transport.mutate_on_call = None;
+    put32(&mut reader.transport.words, 4, 2, order);
+    let raw = record(2, order);
+    reader.transport.words[20..260].copy_from_slice(&raw);
+    reader.transport.words[11] = 1; // Publish only after all words are prepared.
+    let snapshot = reader.poll_published_record().await.unwrap();
+    assert_eq!(snapshot.control.total_count, 2);
+    assert_eq!(snapshot.buffer.unwrap().raw_registers, raw);
+    reader.transport.calls.clear();
+    reader.transport.mutate_on_call = Some(6);
+    reader.transport.mutation_offset = 42;
+    assert_eq!(
+        reader.poll_published_record().await.unwrap_err(),
+        As200Error::Unstable
+    );
 }
 
 #[tokio::test]

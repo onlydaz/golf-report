@@ -93,6 +93,19 @@ fn fixed_identity_and_ack_permission_cannot_be_changed_by_connect() {
 }
 // A loopback mock accepts FC03 only. No test ever connects to the configured real IP.
 async fn mock_plc(valid: bool) -> (String, tokio::task::JoinHandle<()>) {
+    let mut control = [0; 20];
+    control[0] = if valid { 1 } else { 9 };
+    control[1] = 240;
+    control[2] = 2;
+    control[7] = 42;
+    mock_control(control, 0, false).await
+}
+
+async fn mock_control(
+    control: [u16; 20],
+    offset: i32,
+    exception: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let task = tokio::spawn(async move {
@@ -108,23 +121,25 @@ async fn mock_plc(valid: bool) -> (String, tokio::task::JoinHandle<()>) {
                 let start = u16::from_be_bytes([request[8], request[9]]);
                 let count = u16::from_be_bytes([request[10], request[11]]);
                 assert!(count <= 100);
+                let d_start = i32::from(start) - offset;
+                assert!((25000..25260).contains(&d_start));
+                if d_start == 25000 {
+                    assert_eq!(count, 20);
+                }
                 let mut response = request[..7].to_vec();
+                if exception {
+                    response[4..6].copy_from_slice(&3_u16.to_be_bytes());
+                    response.extend_from_slice(&[0x83, 2]);
+                    stream.write_all(&response).await.unwrap();
+                    continue;
+                }
                 response[4..6].copy_from_slice(&(3 + 2 * count).to_be_bytes());
                 response.extend_from_slice(&[3, (2 * count) as u8]);
-                for address in start..start + count {
-                    let word: u16 = match address {
-                        25000 => {
-                            if valid {
-                                1
-                            } else {
-                                9
-                            }
-                        }
-                        25001 => 240,
-                        25002 => 2,
-                        25007 => 42,
-                        _ => 0,
-                    };
+                for address in d_start..d_start + i32::from(count) {
+                    let word = control
+                        .get((address - 25000) as usize)
+                        .copied()
+                        .unwrap_or(0);
                     response.extend_from_slice(&word.to_be_bytes());
                 }
                 stream.write_all(&response).await.unwrap();
@@ -144,6 +159,50 @@ async fn inspection_is_read_only_and_separates_tcp_modbus_map() {
         assert!(report.tcp_connected && report.modbus_read_succeeded);
         assert_eq!(report.as200_valid, valid);
         assert_eq!(report.mapping_warning.is_none(), valid);
+        if !valid {
+            assert!(report.mapping_warning.unwrap().contains("9/240/2"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn inspection_distinguishes_idle_preparation_from_invalid_published_control() {
+    for fault in ["idle", "published", "negative", "flag", "exception"] {
+        let mut control = [0; 20];
+        control[0] = 1;
+        control[1] = 240;
+        control[2] = 2;
+        control[8] = 1; // Previously acknowledged Count, Total still being prepared.
+        match fault {
+            "published" => control[11] = 1,
+            "negative" => {
+                control[4] = u16::MAX;
+                control[5] = u16::MAX;
+            }
+            "flag" => control[11] = 2,
+            _ => {}
+        }
+        let (address, task) = mock_control(control, -1, fault == "exception").await;
+        let mut cfg = config();
+        cfg.address = address;
+        cfg.modbus_address_offset = -1;
+        let report = inspect_endpoint(cfg).await;
+        task.abort();
+        assert!(report.tcp_connected);
+        assert_eq!(report.modbus_read_succeeded, fault != "exception");
+        assert_eq!(report.as200_valid, fault == "idle", "{fault}: {report:?}");
+        match fault {
+            "idle" => assert!(report.mapping_warning.is_none()),
+            "published" => {
+                assert!(report.message.contains("control AS200 chưa hợp lệ"));
+                let reason = report.mapping_warning.unwrap();
+                assert!(reason.contains("TotalCount=0") && reason.contains("PC_ReadCount=1"));
+                assert!(reason.contains("PC_ReadCount <= TotalCount khi DataReady=1"));
+            }
+            "negative" => assert!(report.mapping_warning.unwrap().contains("TotalCount=-1")),
+            "flag" => assert!(report.mapping_warning.unwrap().contains("DataReady=2")),
+            _ => assert!(report.mapping_warning.unwrap().contains("exception FC03")),
+        }
     }
 }
 #[tokio::test]

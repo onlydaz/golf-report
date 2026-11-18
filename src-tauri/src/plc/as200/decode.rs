@@ -102,15 +102,18 @@ pub fn control(words: &[u16], order: WordOrder) -> Result<PlcControl, As200Error
             map::CONTROL_BASE + 2
         )));
     }
-    if !(0..2).contains(&value.write_idx)
-        || !(0..2).contains(&value.last_idx)
-        || !(0..=1).contains(&value.data_ready)
-        || !(0..=1).contains(&value.pc_read_done)
-        || value.heartbeat < 0
-    {
-        return Err(invalid(
-            "Chỉ số buffer, heartbeat hoặc cờ điều khiển ngoài phạm vi",
-        ));
+    for (field, offset, actual, max) in [
+        ("WriteIdx", c::WRITE_IDX, value.write_idx, 1),
+        ("LastIdx", c::LAST_IDX, value.last_idx, 1),
+        ("DataReady", c::DATA_READY, value.data_ready, 1),
+        ("PC_ReadDone", c::PC_READ_DONE, value.pc_read_done, 1),
+        ("Heartbeat", c::HEARTBEAT, value.heartbeat, i16::MAX),
+    ] {
+        if !(0..=max).contains(&actual) {
+            return Err(invalid(format!(
+                "Control {field}={actual} tại offset {offset} ngoài phạm vi 0..{max}"
+            )));
+        }
     }
     Ok(value)
 }

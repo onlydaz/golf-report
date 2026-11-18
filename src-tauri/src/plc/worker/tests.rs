@@ -686,6 +686,127 @@ async fn finish(e: &Engine, plc: &Plc, pool: &PgPool, target: i32) {
 }
 
 #[tokio::test]
+#[ignore = "Dedicated loopback golf_report_migration_test only; idle preparation and durable conflict regression"]
+async fn local_idle_preparation_does_not_latch_counters_or_release_pending_conflicts() {
+    let pool = crate::database::migrations::integration_tests::isolated().await;
+    crate::database::migrations::migrate(&pool).await.unwrap();
+    for fault in ["ready-low", "payload", "target"] {
+        let plc = Plc::new().await;
+        let dir = TestDirectory::new();
+        let mut cfg = config();
+        cfg.address = plc.address.clone();
+        cfg.source_key = format!("idle-preparation-{fault}");
+        cfg.timeout_ms = 2000;
+        // Startup itself can occur during preparation of an unpublished record.
+        plc.words.lock().await[4] = 9;
+        let e = Engine::open(cfg, dir.journal(), WorkerState::default(), &pool)
+            .await
+            .unwrap();
+        e.poll_and_ack_published(&pool).await.unwrap();
+        let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+        assert_eq!((p.accepted, p.last_total), (0, 0));
+        assert!(p.blocked_reason.is_none() && p.pending_inbox_id.is_none());
+
+        plc.publish(1, &registers(1)).await;
+        poll(&e, &pool).await;
+        finish(&e, &plc, &pool, 1).await;
+        let writes = plc.writes.lock().await.clone();
+        let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+        let anchor = p.anchor_inbox_id;
+        for total in [9, 0, 2] {
+            {
+                let mut w = plc.words.lock().await;
+                w[4] = total;
+                w[22] = 55; // Changing StickNo and RecordSeq is still preparation.
+                w[42] = 77;
+                w[151] ^= 1;
+            }
+            plc.reads.lock().await.clear();
+            e.poll_and_ack_published(&pool).await.unwrap();
+            assert!(plc.reads.lock().await.iter().all(|r| *r == (25000, 20)));
+            let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+            assert_eq!((p.accepted, p.last_total), (1, 1));
+            assert_eq!(p.anchor_inbox_id, anchor);
+            assert!(p.pending_inbox_id.is_none() && p.blocked_reason.is_none());
+            assert!(!p.ack_attempted && !p.done_observed);
+            assert_eq!(p.done_started, Some(false));
+            assert_eq!(*plc.writes.lock().await, writes);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM plc_inbox WHERE source_id=$1")
+            .bind(e.source_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let e = restart(e, &dir, &pool).await;
+        e.poll_and_ack_published(&pool).await.unwrap();
+
+        // Reproduce PROCESSED + pending receipt before the first ACK attempt.
+        let raw = registers(2);
+        plc.publish(2, &raw).await;
+        let snapshot = e.read_snapshot().await.unwrap();
+        let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+        let row = e.receive(&pool, &p, &snapshot, None).await.unwrap();
+        e.process_receipt(&pool, &row).await.unwrap();
+        assert_eq!(
+            InboxRepository::find(&pool, row.id)
+                .await
+                .unwrap()
+                .processing_status,
+            "PROCESSED"
+        );
+        {
+            let mut w = plc.words.lock().await;
+            match fault {
+                "ready-low" => w[11] = 0,
+                "payload" => w[151] ^= 1,
+                _ => w[4] = 3,
+            }
+        }
+        let error = e.poll_and_ack_published(&pool).await.unwrap_err();
+        assert!(error.contains("Raw/target"));
+        if fault == "ready-low" {
+            assert!(error.contains("DataReady về 0"));
+        }
+        let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+        assert_eq!(p.accepted, 1);
+        assert_eq!(p.pending_inbox_id, Some(row.id));
+        assert_eq!(p.blocked_reason.as_deref(), Some("PUBLICATION_CONFLICT"));
+        assert!(!p.ack_attempted && !p.done_observed);
+        assert_eq!(p.done_started, Some(false));
+        assert_eq!(
+            InboxRepository::find(&pool, row.id)
+                .await
+                .unwrap()
+                .raw_registers,
+            serde_json::json!(raw)
+        );
+        assert_eq!(*plc.writes.lock().await, writes);
+
+        // Matching the receipt again, even after restart, cannot clear the latch.
+        plc.publish(2, &raw).await;
+        let e = restart(e, &dir, &pool).await;
+        assert!(
+            e.poll_and_ack_published(&pool)
+                .await
+                .unwrap_err()
+                .contains("PUBLICATION_CONFLICT")
+        );
+        assert_eq!(*plc.writes.lock().await, writes);
+        assert_eq!(
+            store::progress(&pool, e.source_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .blocked_reason
+                .as_deref(),
+            Some("PUBLICATION_CONFLICT")
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
 #[ignore = "Dedicated loopback golf_report_migration_test only; isolated schema, never Neon"]
 async fn local_manual_measurement_commit_precedes_ack_and_retry_is_idempotent() {
     let pool = crate::database::migrations::integration_tests::isolated().await;

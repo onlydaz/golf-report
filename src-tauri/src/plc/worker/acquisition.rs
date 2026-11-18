@@ -1,5 +1,6 @@
 //! Committed raw receipt and linked Measurement precede new ACK writes.
 use super::*;
+use as200::model::PlcControl;
 use store::Progress;
 
 impl Engine {
@@ -45,8 +46,9 @@ impl Engine {
             let c = &snapshot.control;
             let unconfirmed = c.pc_read_count != accepted
                 || c.pc_read_done != 0
-                || c.total_count < last_total
-                || (c.data_ready == 0 && c.total_count != accepted)
+                || (c.data_ready == 1 && c.total_count < last_total)
+                || (c.data_ready == 0
+                    && !Self::idle_control_matches_checkpoint(c, accepted, last_total))
                 || (last_total > accepted && (c.data_ready != 1 || c.total_count != last_total));
             let blocked = unconfirmed.then_some("INITIAL_HANDSHAKE");
             // Preserve a ready raw payload even when the remote checkpoint is
@@ -100,6 +102,15 @@ impl Engine {
         });
         engine.refresh_display(pool).await?;
         Ok(engine)
+    }
+
+    // Only for a source with no pending receipt/ACK. While Ready is low, TotalCount
+    // belongs to PLC preparation, not to the durable publication high-water mark.
+    fn idle_control_matches_checkpoint(c: &PlcControl, accepted: i32, last_total: i32) -> bool {
+        c.data_ready == 0
+            && last_total == accepted
+            && c.pc_read_count == accepted
+            && c.pc_read_done == 0
     }
 
     fn same_receipt(row: &InboxRecord, snapshot: &PublishedRecordSnapshot) -> bool {
@@ -597,25 +608,18 @@ impl Engine {
                 "DB đang giữ trạng thái cần đối chiếu: {reason}; không tự xóa block/đổi epoch."
             ));
         }
-        if c.total_count < p.last_total || c.pc_read_count < p.accepted {
-            self.block(pool, "RESET").await?;
-            return Err("Counter PLC giảm; không tự tạo epoch hoặc sửa checkpoint.".into());
-        }
-        if c.total_count > p.last_total {
-            sqlx::query(
-                "UPDATE plc_acquisition SET last_total=$2 WHERE source_id=$1 AND last_total<$2",
-            )
-            .bind(p.source_id)
-            .bind(c.total_count)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-        let Some(mut row) = pending else {
-            if c.data_ready != 0
-                || c.total_count != p.accepted
-                || c.pc_read_count != p.accepted
-                || c.pc_read_done != 0
+        // Do not latch provisional TotalCount values or compare raw with an old
+        // anchor while PLC prepares the next record. Existing blocks and pending
+        // receipts never take this path; PC-owned Count/Done still must match.
+        if pending.is_none() && c.data_ready == 0 {
+            if c.pc_read_count < p.accepted {
+                self.block(pool, "RESET").await?;
+                return Err("Counter PLC giảm; không tự tạo epoch hoặc sửa checkpoint.".into());
+            }
+            if !Self::idle_control_matches_checkpoint(c, p.accepted, p.last_total)
+                || p.ack_attempted
+                || p.done_started != Some(false)
+                || p.done_observed
             {
                 return Err("PLC idle nhưng counter/Done khác DB; chưa thể xác nhận.".into());
             }
@@ -632,7 +636,22 @@ impl Engine {
             status.last_error = None;
             status.message = "Đã kết nối máy đo, đang chờ publication mới; trạng thái ACK của bản ghi cũ được giữ nguyên.".into();
             return Ok(());
-        };
+        }
+        if c.total_count < p.last_total || c.pc_read_count < p.accepted {
+            self.block(pool, "RESET").await?;
+            return Err("Counter PLC giảm; không tự tạo epoch hoặc sửa checkpoint.".into());
+        }
+        if c.total_count > p.last_total {
+            sqlx::query(
+                "UPDATE plc_acquisition SET last_total=$2 WHERE source_id=$1 AND last_total<$2",
+            )
+            .bind(p.source_id)
+            .bind(c.total_count)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        let mut row = pending.ok_or("Thiếu receipt của publication; chưa ACK.")?;
         let target = row.publication_count.ok_or("Thiếu định danh công bố.")?;
         if target <= 0 || p.accepted.checked_add(1) != Some(target) {
             self.state.status.write().await.ack_status = "RECONCILIATION_REQUIRED";
@@ -666,7 +685,17 @@ impl Engine {
         }
         if !Self::same_receipt(&row, &snapshot) {
             self.block(pool, "PUBLICATION_CONFLICT").await?;
-            return Err("Raw/target khác receipt đã commit; không ACK.".into());
+            let reason = if c.data_ready == 0 {
+                "DataReady về 0 khi receipt còn chờ ACK; PLC phải giữ publication đã công bố"
+            } else if c.total_count != target {
+                "TotalCount khác publication đã commit"
+            } else {
+                "Payload khác 240 WORD đã commit"
+            };
+            return Err(format!(
+                "Raw/target khác receipt đã commit; không ACK. {reason} (DataReady={}, TotalCount={}, receipt={target}).",
+                c.data_ready, c.total_count
+            ));
         }
         if p.ack_attempted {
             if c.pc_read_count != target || c.pc_read_done != 0 {
@@ -696,6 +725,73 @@ impl Engine {
         }
         writer.count_prepared(target, stream).await?;
         self.first_done(pool, &p, &row).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::test_support::receipt;
+
+    fn control() -> PlcControl {
+        let mut words = vec![0; 20];
+        words[0] = 1;
+        words[1] = 240;
+        words[2] = 2;
+        words[8] = 1;
+        decode::control(&words, as200::WordOrder::LowWordFirst).unwrap()
+    }
+
+    #[test]
+    fn idle_preparation_keeps_pc_handshake_and_checkpoint_requirements() {
+        let mut c = control();
+        for total in [0, 1, 2, 50] {
+            c.total_count = total;
+            assert!(Engine::idle_control_matches_checkpoint(&c, 1, 1));
+            // Previously observed publication history is never discarded.
+            assert!(!Engine::idle_control_matches_checkpoint(&c, 1, 2));
+        }
+        for count in [0, 2] {
+            c.pc_read_count = count;
+            assert!(!Engine::idle_control_matches_checkpoint(&c, 1, 1));
+        }
+        c.pc_read_count = 1;
+        c.pc_read_done = 1;
+        assert!(!Engine::idle_control_matches_checkpoint(&c, 1, 1));
+        c.pc_read_done = 0;
+        c.data_ready = 1;
+        assert!(!Engine::idle_control_matches_checkpoint(&c, 1, 1));
+    }
+
+    #[test]
+    fn processed_receipt_still_requires_ready_identity_and_unchanged_raw() {
+        let mut row = receipt(2);
+        row.measurement_id = Some(10);
+        row.processing_status = "PROCESSED".into();
+        let mut c = control();
+        c.data_ready = 1;
+        c.total_count = 2;
+        let snapshot = PublishedRecordSnapshot {
+            control: c,
+            buffer: Some(as200::reader::BufferSnapshot {
+                buffer_index: 0,
+                raw_registers: serde_json::from_value(row.raw_registers.clone()).unwrap(),
+                record: None,
+            }),
+            diagnostics: Vec::new(),
+        };
+        assert!(Engine::same_receipt(&row, &snapshot));
+        let mut changed = snapshot.clone();
+        changed.control.data_ready = 0;
+        changed.buffer = None;
+        assert!(!Engine::same_receipt(&row, &changed));
+        let mut changed = snapshot.clone();
+        changed.control.total_count = 3;
+        assert!(!Engine::same_receipt(&row, &changed));
+        // Even a reserved WORD differs: do not ACK an overwritten receipt.
+        let mut changed = snapshot;
+        changed.buffer.as_mut().unwrap().raw_registers[131] ^= 1;
+        assert!(!Engine::same_receipt(&row, &changed));
     }
 }
 
