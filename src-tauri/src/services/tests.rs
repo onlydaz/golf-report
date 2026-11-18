@@ -10,23 +10,100 @@ use crate::{
 };
 
 #[test]
-fn all_zero_payload_reports_missing_completion_metadata_without_mutation() {
-    for total in [0, 1] {
+fn all_zero_publication_creates_unknown_draft_without_inventing_metadata() {
+    for total in [0, 1, 2] {
         let mut row = receipt(total);
         row.record_seq = 0;
         row.raw_registers = serde_json::json!(vec![0_u16; 240]);
         let before = row.raw_registers.clone();
-        let error = draft_from_inbox(&row).unwrap_err();
-        for field in [
-            "Version=0", "Status bit0=0", "ProductCode", "OverallResult",
-            "TIP_Result", "BUTT_Result", "PointCount/AttemptCount/DecideAttempt=0",
-        ] {
-            assert!(error.contains(field), "Missing diagnostic {field}: {error}");
+        let draft = draft_from_inbox(&row).unwrap();
+        assert_eq!(draft.record_seq, 0);
+        assert_eq!(draft.publication_count, Some(total));
+        assert_eq!(draft.club_number, 0);
+        assert_eq!(draft.product_code, "SKU-FROZEN");
+        assert_eq!(draft.sku_origin, "QC");
+        assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
+        assert!(draft.quality_error.is_some());
+        for station in draft.stations {
+            assert_eq!(station.load.to_string(), "0");
+            assert_eq!(station.result, MeasurementResult::Unmeasured);
+            assert!(station.points.iter().all(|p| p.attempts.is_empty()
+                && p.position.is_none()
+                && p.decide_attempt.is_none()));
         }
         assert_eq!(row.raw_registers, before);
     }
 }
 
+#[test]
+fn manual_sparse_words_preserve_types_counts_raw_sequence_and_sku_provenance() {
+    for offset in [14, 131, 180, 239] {
+        let mut row = receipt(1);
+        let mut words = vec![0_u16; 240];
+        words[offset] = 12;
+        row.record_seq = 0;
+        row.raw_registers = serde_json::json!(words);
+        let draft = draft_from_inbox(&row).unwrap();
+        assert_eq!(draft.publication_count, Some(1));
+        assert_eq!(draft.record_seq, 0);
+        assert_eq!(draft.club_number, 0);
+        assert!(draft.stations.iter().all(|s| s.points.is_empty()));
+        assert_eq!(row.raw_registers[offset], 12);
+        assert!(draft.quality_error.is_some());
+    }
+    let mut row = receipt(1);
+    let mut raw = vec![0_u16; 240];
+    raw[22] = 999; // A raw sequence mismatch is not a new publication identity.
+    for (offset, number) in [
+        (28, 0.0_f32),
+        (124, -3.5),
+        (132, 10.0),
+        (134, 12.0),
+        (136, 0.0),
+    ] {
+        raw[offset] = number.to_bits() as u16;
+        raw[offset + 1] = (number.to_bits() >> 16) as u16;
+    }
+    raw[129] = 1; // Actual one attempt, Result/Decide remain unknown, not invented.
+    row.record_seq = 999;
+    row.raw_registers = serde_json::json!(raw);
+    let draft = draft_from_inbox(&row).unwrap();
+    let tip = &draft.stations[0];
+    assert_eq!(tip.load.to_string(), "-3.5");
+    assert_eq!(tip.points[0].position.as_ref().unwrap().to_string(), "10");
+    assert_eq!(
+        tip.points[0].attempts[0]
+            .push_dist
+            .as_ref()
+            .unwrap()
+            .to_string(),
+        "12"
+    );
+    assert_eq!(
+        tip.points[0].attempts[0].bend.as_ref().unwrap().to_string(),
+        "0"
+    );
+    assert_eq!(tip.points[0].decide_attempt, None);
+    assert_eq!(tip.points[0].result, MeasurementResult::Unmeasured);
+    assert_eq!(draft.record_seq, 999);
+    assert_eq!(draft.publication_count, Some(1));
+
+    row.assigned_sku = None;
+    let missing = draft_from_inbox(&row).unwrap();
+    assert_eq!(missing.sku_origin, "MISSING");
+    assert_eq!(missing.product_code, "");
+    assert!(missing.quality_error.is_some());
+
+    let mut complete = receipt(1);
+    let mut raw = registers(1);
+    raw[4..14].fill(0);
+    complete.raw_registers = serde_json::json!(raw);
+    let draft = draft_from_inbox(&complete).unwrap();
+    assert_eq!(draft.product_code, "SKU-FROZEN");
+    assert_eq!(draft.sku_origin, "QC");
+    assert_eq!(draft.quality_error, None);
+    assert_eq!(draft.overall_result, MeasurementResult::Ng);
+}
 #[test]
 fn completed_measurement_preserves_zero_negative_and_positive_reals_in_both_word_orders() {
     for high in [false, true] {
@@ -113,7 +190,7 @@ fn projection_preserves_frozen_sku_results_loads_attempts_and_time() {
     );
 }
 #[test]
-fn invalid_raw_zero_one_word_and_status_zero_are_preserved_without_fake_measurement() {
+fn zero_one_word_and_status_zero_project_as_unknown_without_mutating_raw() {
     for case in 0..3 {
         let mut inbox = receipt(0);
         let mut raw = vec![0_u16; 240];
@@ -125,7 +202,9 @@ fn invalid_raw_zero_one_word_and_status_zero_are_preserved_without_fake_measurem
             raw[1] = 0;
         }
         inbox.raw_registers = serde_json::to_value(&raw).unwrap();
-        assert!(draft_from_inbox(&inbox).is_err());
+        let draft = draft_from_inbox(&inbox).unwrap();
+        assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
+        assert!(draft.quality_error.is_some());
         assert_eq!(inbox.raw_registers, serde_json::to_value(raw).unwrap());
     }
 }
@@ -133,7 +212,7 @@ fn invalid_raw_zero_one_word_and_status_zero_are_preserved_without_fake_measurem
 fn missing_sku_session_and_publication_identity_have_specific_projection_errors() {
     let mut row = receipt(1);
     row.assigned_sku = None;
-    assert!(draft_from_inbox(&row).unwrap_err().contains("SKU"));
+    assert_eq!(draft_from_inbox(&row).unwrap().sku_origin, "PLC");
     row = receipt(1);
     row.publication_session = None;
     assert!(
@@ -143,7 +222,7 @@ fn missing_sku_session_and_publication_identity_have_specific_projection_errors(
     );
     row = receipt(1);
     row.publication_count = Some(2);
-    assert!(draft_from_inbox(&row).unwrap_err().contains("RecordSeq"));
+    assert!(draft_from_inbox(&row).unwrap_err().contains("Publication"));
 }
 #[test]
 fn workflow_rejects_extra_tip_points_and_inconsistent_overall_without_rewriting_raw() {
@@ -153,7 +232,9 @@ fn workflow_rejects_extra_tip_points_and_inconsistent_overall_without_rewriting_
         raw[offset] = if offset == 20 { 1 } else { 2 };
         row.raw_registers = serde_json::to_value(raw).unwrap();
         let before = row.raw_registers.clone();
-        assert!(draft_from_inbox(&row).is_err(), "offset {offset}");
+        let draft = draft_from_inbox(&row).unwrap();
+        assert!(draft.quality_error.is_some(), "offset {offset}");
+        assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
         assert_eq!(row.raw_registers, before);
     }
 }
@@ -204,7 +285,7 @@ fn unmeasured_slots_are_null_and_measured_zero_and_negative_values_remain_real_v
     assert!(real32_numeric(f32::INFINITY).is_err());
 }
 #[test]
-fn projection_rejects_metadata_nan_invalid_product_and_invalid_attempt_structure() {
+fn protocol_identity_stays_strict_and_incomplete_metadata_is_unknown() {
     for (seq, total) in [(-1, Some(1)), (999, Some(1)), (1, None), (1, Some(-1))] {
         let mut row = receipt(seq);
         row.total_count = total;
@@ -218,7 +299,10 @@ fn projection_rejects_metadata_nan_invalid_product_and_invalid_attempt_structure
         let mut raw = registers(1);
         raw[4] = value;
         row.raw_registers = serde_json::to_value(raw).unwrap();
-        assert!(draft_from_inbox(&row).unwrap_err().contains("ProductCode"));
+        assert_eq!(
+            draft_from_inbox(&row).unwrap().quality_error.is_some(),
+            value != 0
+        );
     }
     let mut draft = draft_from_inbox(&receipt(1)).unwrap();
     draft.stations[0].points[0].attempt_count = 3;

@@ -31,6 +31,7 @@ mod store;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LatestRecord {
+    pub quality_error: Option<String>,
     pub source_key: String,
     pub session_id: Option<String>,
     pub delivery_id: String,

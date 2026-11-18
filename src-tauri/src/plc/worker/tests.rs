@@ -189,6 +189,10 @@ struct Plc {
     words: Arc<Mutex<Vec<u16>>>,
     writes: Arc<Mutex<Vec<(u8, i32)>>>,
     drop_reply: Arc<Mutex<Option<u8>>>,
+    commit_probe: Arc<Mutex<Option<(PgPool, i64)>>>,
+    commit_trace: Arc<Mutex<Vec<serde_json::Value>>>,
+    reads: Arc<Mutex<Vec<(u16, u16)>>>,
+    delay_reply: Arc<Mutex<Option<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Plc {
@@ -209,12 +213,22 @@ impl Plc {
         }
         let writes = Arc::new(Mutex::new(Vec::new()));
         let drop_reply = Arc::new(Mutex::new(None));
+        let commit_probe: Arc<Mutex<Option<(PgPool, i64)>>> = Arc::new(Mutex::new(None));
+        let commit_trace = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let delay_reply = Arc::new(Mutex::new(None));
+        let (trace, read_events, delayed) =
+            (commit_trace.clone(), reads.clone(), delay_reply.clone());
+        let durable = commit_probe.clone();
         let (memory, events, fault) = (words.clone(), writes.clone(), drop_reply.clone());
         let task = tokio::spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (memory, events, fault) = (memory.clone(), events.clone(), fault.clone());
+                let durable = durable.clone();
+                let (trace, read_events, delayed) =
+                    (trace.clone(), read_events.clone(), delayed.clone());
                 clients.spawn(async move {
                     loop {
                         let mut header = [0_u8; 7];
@@ -233,6 +247,7 @@ impl Plc {
                             3 => {
                                 let count = usize::from(u16::from_be_bytes([pdu[3], pdu[4]]));
                                 assert!(count <= 100 && offset + count <= 260);
+                                read_events.lock().await.push((start as u16, count as u16));
                                 if offset == 0 {
                                     w[7] = (w[7] + 1) % 32768;
                                 }
@@ -248,6 +263,13 @@ impl Plc {
                                 w[8] = u16::from_be_bytes([pdu[6], pdu[7]]);
                                 w[9] = u16::from_be_bytes([pdu[8], pdu[9]]);
                                 let count = i32::from(w[8]) | (i32::from(w[9]) << 16);
+                                if let Some((pool, source)) = durable.lock().await.as_ref() {
+                                    let committed: Option<i64> = tokio::time::timeout(Duration::from_secs(2),
+                                        sqlx::query_scalar("SELECT m.id FROM plc_inbox i JOIN measurements m ON m.id=i.measurement_id WHERE i.publication_count=$1 AND i.source_id=$2 AND m.source_id=i.source_id AND i.processing_status='PROCESSED' AND m.publication_count=i.publication_count")
+                                            .bind(count).bind(source).fetch_optional(pool)).await.unwrap().unwrap();
+                                    assert!(committed.is_some(), "FC16 arrived before Measurement COMMIT");
+                                    trace.lock().await.push(serde_json::json!({"publicationCount":count,"measurementId":committed,"committedBeforeFc16":true}));
+                                }
                                 events.lock().await.push((16, count));
                                 pdu[..5].to_vec()
                             }
@@ -267,6 +289,12 @@ impl Plc {
                             break;
                         }
                         drop(f);
+                        let mut wait = delayed.lock().await;
+                        if *wait == Some(pdu[0]) {
+                            *wait = None;
+                            drop(wait);
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                        } else { drop(wait); }
                         let mut out = header.to_vec();
                         out[4..6].copy_from_slice(&((response.len() + 1) as u16).to_be_bytes());
                         out.extend(response);
@@ -282,6 +310,10 @@ impl Plc {
             words,
             writes,
             drop_reply,
+            commit_probe,
+            commit_trace,
+            reads,
+            delay_reply,
             task,
         }
     }
@@ -416,6 +448,33 @@ async fn projection_display_restores_measurement_link_and_never_overwrites_with_
             .inbox_id,
         Some(row.id)
     );
+}
+
+#[tokio::test]
+async fn committed_zero_publication_replaces_previous_completed_display() {
+    let dir = TestDirectory::new();
+    let e = engine(config(), &dir, 1);
+    let mut p = progress(&e.config);
+    let previous = receipt(1);
+    e.show_receipt(&previous, &p).await.unwrap();
+    let mut zero = receipt(2);
+    zero.record_seq = 0;
+    zero.raw_registers = serde_json::json!(vec![0_u16; 240]);
+    zero.received_at = previous.received_at + chrono::Duration::seconds(1);
+    zero.measurement_id = Some(43);
+    zero.processing_status = "PROCESSED".into();
+    p.pending_inbox_id = Some(zero.id);
+    e.show_receipt(&zero, &p).await.unwrap();
+    let status = e.state.status.read().await;
+    let latest = status.latest.as_ref().unwrap();
+    assert_eq!(latest.inbox_id, Some(zero.id));
+    assert_eq!(latest.record_seq, 0);
+    assert_eq!(latest.club_number, 0);
+    assert_eq!(latest.overall_result, "UNMEASURED");
+    assert!(latest.quality_error.is_some());
+    assert_eq!(latest.save_state, "PROCESSED");
+    assert_eq!(status.last_saved_id, Some(43));
+    assert!(status.raw_capture.is_none());
 }
 #[tokio::test]
 async fn database_unavailable_prevents_snapshot_and_any_ack_write() {
@@ -562,6 +621,374 @@ async fn finish(e: &Engine, plc: &Plc, pool: &PgPool, target: i32) {
     assert_eq!(p.accepted, target);
     assert!(p.pending_inbox_id.is_none());
 }
+
+#[tokio::test]
+#[ignore = "Dedicated loopback golf_report_migration_test only; isolated schema, never Neon"]
+async fn local_manual_measurement_commit_precedes_ack_and_retry_is_idempotent() {
+    let pool = crate::database::migrations::integration_tests::isolated().await;
+    crate::database::migrations::migrate(&pool).await.unwrap();
+    let plc = Plc::new().await;
+    let dir = TestDirectory::new();
+    let mut cfg = config();
+    cfg.timeout_ms = 2000;
+    cfg.address = plc.address.clone();
+    cfg.source_key = "manual-loopback-only".into();
+    cfg.operator_sku = Some("MANUAL-QC".into());
+    let e = Engine::open(cfg, dir.journal(), WorkerState::default(), &pool)
+        .await
+        .unwrap();
+    *plc.commit_probe.lock().await = Some((pool.clone(), e.source_id));
+    let raw = vec![0_u16; 240];
+    // Fail COMMIT itself, after the tree and Inbox link have been written inside
+    // the transaction. This deferred trigger is confined to the local test schema.
+    sqlx::raw_sql("CREATE FUNCTION manual_commit_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.publication_count=1 THEN RAISE EXCEPTION 'manual test: deferred Measurement COMMIT rejected'; END IF; RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER manual_fault AFTER INSERT ON measurements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION manual_commit_fault()")
+    .execute(&pool)
+    .await
+    .unwrap();
+    plc.publish(1, &raw).await;
+    assert!(e.poll_and_ack_published(&pool).await.is_err());
+    assert!(plc.writes.lock().await.is_empty());
+    let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+    assert!(!p.ack_attempted);
+    let first = InboxRepository::find(&pool, p.pending_inbox_id.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.raw_registers, serde_json::json!(raw));
+    assert!(first.measurement_id.is_none());
+    assert_eq!(first.processing_status, "FAILED");
+    assert!(
+        first
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("deferred Measurement COMMIT rejected")
+    );
+    let trees: i64 = sqlx::query_scalar("SELECT count(*) FROM measurements")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(trees, 0);
+    sqlx::raw_sql("DROP TRIGGER manual_fault ON measurements; DROP FUNCTION manual_commit_fault()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut stages = Vec::new();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let source_key = e.config.source_key.clone();
+    for count in 1..=5 {
+        let mut words = raw.clone();
+        match count {
+            2 => {
+                words[2] = 12;
+                words[129] = 1;
+                for (offset, value) in [(132, 10_f32), (134, 12_f32), (136, 0_f32)] {
+                    words[offset] = value.to_bits() as u16;
+                    words[offset + 1] = (value.to_bits() >> 16) as u16;
+                }
+            }
+            4 => words[131] = 12,
+            5 => {
+                words[0] = 1;
+                words[1] = 1;
+                words[2] = 55;
+                words[4] = 0x4241;
+                words[20] = 1;
+                words[22] = 5;
+                for (header, base, points) in [(24, 32, 4), (120, 128, 1)] {
+                    words[header] = 1;
+                    words[header + 1] = points;
+                    for point in 0..usize::from(points) {
+                        let offset = base + point * 22;
+                        words[offset] = 1;
+                        words[offset + 1] = 1;
+                        words[offset + 2] = 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        plc.publish(count, &words).await;
+        poll(&e, &pool).await;
+        let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+        let row = InboxRepository::find(&pool, p.pending_inbox_id.unwrap())
+            .await
+            .unwrap();
+        let id = row
+            .measurement_id
+            .expect("Measurement must commit before Count/Done");
+        let detail = crate::repositories::MeasurementRepository::find_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.record_seq, if count == 5 { 5 } else { 0 });
+        assert_eq!(detail.summary.publication_count, Some(count));
+        assert_eq!(
+            detail.summary.club_number,
+            match count {
+                2 => 12,
+                5 => 55,
+                _ => 0,
+            }
+        );
+        assert_eq!(detail.summary.product_code, "MANUAL-QC");
+        assert_eq!(
+            detail.summary.overall_result,
+            if count == 5 {
+                crate::enums::MeasurementResult::Ok
+            } else {
+                crate::enums::MeasurementResult::Unmeasured
+            }
+        );
+        assert_eq!(detail.summary.quality_error.is_some(), count != 5);
+        assert_eq!(detail.receipt.as_ref().unwrap().inbox_id, row.id);
+        if count == 1 {
+            assert!(
+                detail
+                    .stations
+                    .iter()
+                    .all(|s| s.result == crate::enums::MeasurementResult::Unmeasured
+                        && s.points.is_empty())
+            );
+        }
+        if count == 2 {
+            let point = &detail
+                .stations
+                .iter()
+                .find(|s| s.station_type == crate::models::StationType::Tip)
+                .unwrap()
+                .points[0];
+            assert_eq!(point.position.as_ref().unwrap().to_string(), "10");
+            assert_eq!(point.attempt_count, 1);
+            assert_eq!(point.decide_attempt, None);
+            assert_eq!(point.result, crate::enums::MeasurementResult::Unmeasured);
+            assert_eq!(
+                point.attempts[0].push_dist.as_ref().unwrap().to_string(),
+                "12"
+            );
+            assert_eq!(point.attempts[0].bend.as_ref().unwrap().to_string(), "0");
+        }
+        assert_eq!(row.raw_registers, serde_json::json!(words));
+        assert_eq!(InboxService::process(&pool, row.id).await.unwrap(), id);
+        finish(&e, &plc, &pool, count).await;
+        let request = crate::models::MeasurementListRequest {
+            page_size: Some(100),
+            product_code: e.config.operator_sku.clone(),
+            ..Default::default()
+        };
+        let history = crate::repositories::MeasurementRepository::history_page(&pool, &request)
+            .await
+            .unwrap();
+        assert_eq!(history.total, i64::from(count));
+        let mut details = Vec::new();
+        for item in &history.items {
+            details.push(
+                crate::repositories::MeasurementRepository::find_by_id(&pool, item.summary.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let snapshot = serde_json::json!({
+            "count":count,"status":e.state.status.read().await.clone(),"history":history,"measurements":details,
+            "statistics":crate::repositories::MeasurementRepository::statistics(&pool,&request).await.unwrap(),
+            "skuSummary":crate::repositories::MeasurementRepository::sku_summary(&pool,&request).await.unwrap(),
+            "quality":crate::repositories::MeasurementRepository::quality_statistics(&pool,&request).await.unwrap()
+        });
+        stages.push(snapshot);
+        let before = plc.writes.lock().await.len();
+        plc.publish(count, &words).await; // Held Ready / duplicate identity.
+        for _ in 0..5 {
+            poll(&e, &pool).await;
+        }
+        assert_eq!(plc.writes.lock().await.len(), before);
+        let (inbox_count,measurement_count):(i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM plc_inbox WHERE source_id=$1),(SELECT count(*) FROM measurements WHERE source_id=$1)")
+            .bind(e.source_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            (inbox_count, measurement_count),
+            (i64::from(count), i64::from(count))
+        );
+        plc.complete().await;
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM measurements WHERE source_id=$1")
+        .bind(e.source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 5);
+    let request = crate::models::MeasurementListRequest::default();
+    let stats = crate::repositories::MeasurementRepository::statistics(&pool, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        (stats.total_measurements, stats.total_ok, stats.total_ng),
+        (1, 1, 0)
+    );
+    assert_eq!(stats.pass_rate, 100.0);
+    assert_eq!(
+        crate::repositories::MeasurementRepository::list(&pool, &request)
+            .await
+            .unwrap()
+            .total,
+        5
+    );
+    assert_eq!(
+        crate::repositories::MeasurementRepository::quality_statistics(&pool, &request)
+            .await
+            .unwrap()
+            .points
+            .len(),
+        5
+    );
+    assert_eq!(
+        *plc.writes.lock().await,
+        vec![
+            (16, 1),
+            (6, 1),
+            (16, 2),
+            (6, 1),
+            (16, 3),
+            (6, 1),
+            (16, 4),
+            (6, 1),
+            (16, 5),
+            (6, 1)
+        ]
+    );
+    let page2 = crate::repositories::MeasurementRepository::history_page(
+        &pool,
+        &crate::models::MeasurementListRequest {
+            page: Some(2),
+            page_size: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.items.len(), 2);
+    let reads = plc.reads.lock().await.clone();
+    for chunk in [(25020, 100), (25120, 100), (25220, 40)] {
+        assert!(reads.contains(&chunk));
+    }
+    let missing_sku = crate::repositories::MeasurementRepository::history_page(
+        &pool,
+        &crate::models::MeasurementListRequest {
+            product_code: Some("NOT-THIS-SKU".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing_sku.total, 0);
+    let evidence = serde_json::json!({"database":"golf_report_migration_test","schema":schema,"sourceKey":source_key,"session":e.config.confirmed_session_id,"endpoint":plc.address,"stages":stages,"fc03":reads,"writes":plc.writes.lock().await.clone(),"commitProof":plc.commit_trace.lock().await.clone(),"paginationPage2":page2,"measurementCommitFailure":{"inboxId":first.id,"status":first.processing_status,"error":first.error_message,"measurementCount":trees,"ackAttempted":p.ack_attempted}});
+    if let Ok(directory) = std::env::var("GOLF_MANUAL_EVIDENCE_DIR") {
+        let directory = std::path::PathBuf::from(directory).canonicalize().unwrap();
+        assert!(directory.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::write(
+            directory.join("manual-evidence.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+    println!(
+        "MANUAL_SQL_EVIDENCE {}",
+        serde_json::json!({"schema":schema,"sourceKey":source_key,"measurements":5,"accepted":5})
+    );
+    drop(e);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "Dedicated loopback golf_report_migration_test only; real SQL and network faults"]
+async fn local_manual_restart_and_lost_ack_responses_do_not_replay_writes() {
+    let pool = crate::database::migrations::integration_tests::isolated().await;
+    crate::database::migrations::migrate(&pool).await.unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut evidence = Vec::new();
+    for fault in 0..3 {
+        let plc = Plc::new().await;
+        let dir = TestDirectory::new();
+        let mut cfg = config();
+        cfg.address = plc.address.clone();
+        cfg.source_key = format!("manual-recovery-{fault}");
+        cfg.timeout_ms = 300;
+        cfg.plc_heartbeat_timeout_ms = Some(60000);
+        let mut e = Engine::open(cfg, dir.journal(), WorkerState::default(), &pool)
+            .await
+            .unwrap();
+        *plc.commit_probe.lock().await = Some((pool.clone(), e.source_id));
+        let raw = vec![0_u16; 240];
+        plc.publish(1, &raw).await;
+        if fault == 0 {
+            // Real receipt/Measurement commit, then disconnect during the next
+            // FC03, before any write. Restart must hydrate that same link.
+            let snapshot = e.read_snapshot().await.unwrap();
+            let p = store::progress(&pool, e.source_id).await.unwrap().unwrap();
+            let row = e.receive(&pool, &p, &snapshot, None).await.unwrap();
+            e.process_receipt(&pool, &row).await.unwrap();
+            *plc.drop_reply.lock().await = Some(3);
+        } else if fault == 1 {
+            *plc.delay_reply.lock().await = Some(16); // actual response timeout
+        } else {
+            *plc.drop_reply.lock().await = Some(6); // Done received, response lost
+        }
+        let error = e.poll_and_ack_published(&pool).await.unwrap_err();
+        let prior_writes = plc.writes.lock().await.clone();
+        if fault == 0 {
+            assert!(prior_writes.is_empty());
+        }
+        if fault == 1 {
+            assert_eq!(prior_writes, vec![(16, 1)]);
+        }
+        if fault == 2 {
+            assert_eq!(prior_writes, vec![(16, 1), (6, 1)]);
+        }
+        let source = e.source_id;
+        let row: InboxRecord = sqlx::query_as("SELECT * FROM plc_inbox WHERE source_id=$1")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let id = row.measurement_id.unwrap();
+        e = restart(e, &dir, &pool).await;
+        assert_eq!(e.state.status.read().await.last_saved_id, Some(id));
+        poll(&e, &pool).await;
+        finish(&e, &plc, &pool, 1).await;
+        assert_eq!(*plc.writes.lock().await, vec![(16, 1), (6, 1)]);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM measurements WHERE source_id=$1")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            store::progress(&pool, source)
+                .await
+                .unwrap()
+                .unwrap()
+                .accepted,
+            1
+        );
+        evidence.push(serde_json::json!({"fault":fault,"error":error,"sourceId":source,"inboxId":row.id,"measurementId":id,"beforeRestart":prior_writes,"writes":plc.writes.lock().await.clone(),"accepted":1}));
+    }
+    if let Ok(directory) = std::env::var("GOLF_MANUAL_EVIDENCE_DIR") {
+        let directory = PathBuf::from(directory).canonicalize().unwrap();
+        assert!(directory.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::write(
+            directory.join("recovery-evidence.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"schema":schema,"cases":evidence}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    pool.close().await;
+}
 #[tokio::test]
 #[ignore = "Requires explicit verified Neon integration opt-in; exercises real production SQL and loopback PLC"]
 async fn postgres_raw_zero_one_word_counter_zero_to_one_and_distinct_identical_publications() {
@@ -598,8 +1025,8 @@ async fn postgres_raw_zero_one_word_counter_zero_to_one_and_distinct_identical_p
     assert_eq!(rows[1].raw_registers, rows[2].raw_registers);
     assert_ne!(rows[1].id, rows[2].id);
     assert!(
-        rows.iter()
-            .all(|r| r.record_seq == 0 && r.measurement_id.is_none())
+        rows.iter().all(|r| r.record_seq == 0)
+            && rows[1..].iter().all(|r| r.measurement_id.is_some())
     );
     assert_eq!(
         *plc.writes.lock().await,
@@ -610,20 +1037,14 @@ async fn postgres_raw_zero_one_word_counter_zero_to_one_and_distinct_identical_p
         InboxRepository::find(&pool, rows[3].id)
             .await
             .unwrap()
-            .decode_error
+            .measurement_id
             .is_some()
     );
     let e = restart(e, &dir, &pool).await;
+    assert_eq!(e.state.status.read().await.ack_status, "ACKNOWLEDGED");
     assert_eq!(
-        e.state
-            .status
-            .read()
-            .await
-            .raw_capture
-            .as_ref()
-            .unwrap()
-            .ack_status,
-        "ACKNOWLEDGED"
+        e.state.status.read().await.last_saved_id,
+        rows[3].measurement_id
     );
     poll(&e, &pool).await;
     assert_eq!(plc.writes.lock().await.len(), 6);

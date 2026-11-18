@@ -73,7 +73,7 @@ fn retirement_cannot_mask_missing_failed_duplicate_or_unknown_history() {
 }
 
 // Separate local database ONLY. Never read the application's Neon config/helper.
-async fn isolated() -> PgPool {
+pub(crate) async fn isolated() -> PgPool {
     let url = std::env::var("GOLF_MIGRATION_TEST_DATABASE_URL")
         .expect("Explicit local migration test URL required");
     let options = PgConnectOptions::from_str(&url).expect("Invalid local test URL");
@@ -127,13 +127,13 @@ async fn assert_retired(pool: &PgPool) {
     let mut expected = tables(false);
     expected.sort();
     assert_eq!(actual_tables, expected);
-    assert_eq!(applied.len(), 5);
+    assert_eq!(applied.len(), MIGRATOR.iter().count());
     assert!(validate_history(&actual_tables, &applied).is_ok());
 }
 
 #[tokio::test]
 #[ignore = "Requires dedicated loopback golf_report_migration_test; never use Neon"]
-async fn empty_database_runs_all_five_migrations() {
+async fn empty_database_runs_all_migrations() {
     let pool = isolated().await;
     migrate(&pool).await.unwrap();
     assert_retired(&pool).await;

@@ -37,6 +37,9 @@ export default function MeasurementDetails({
 }) {
   return (
     <div className="measurement-details">
+      {data.qualityError && <Alert type="info" showIcon
+        title="Chưa xác định chất lượng"
+        description={`Bản ghi đã lưu, không tính vào KPI sản xuất. ${data.qualityError}`} />}
       {showGeneralInformation && (
         <Card className="section-card">
           <Descriptions
@@ -76,6 +79,19 @@ export default function MeasurementDetails({
           />
         </Card>
       )}
+      {showGeneralInformation && data.receipt && <details>
+        <summary>Chi tiết kỹ thuật bản ghi</summary>
+        <Descriptions column={{ xs: 1, sm: 2 }} items={[
+          { key: "source", label: "SourceKey", children: data.receipt.sourceKey },
+          { key: "session", label: "Session", children: data.receipt.publicationSession ?? data.sessionId },
+          { key: "count", label: "Publication Count", children: data.receipt.publicationCount },
+          { key: "seq", label: "RecordSeq gốc", children: data.recordSeq },
+          { key: "sku", label: "Nguồn SKU", children: data.skuOrigin },
+          { key: "inbox", label: "Inbox liên kết", children: data.receipt.inboxId },
+          { key: "order", label: "Word order", children: data.receipt.wordOrder },
+        ]} />
+        <p>Kỹ thuật đối chiếu 240 WORD gốc qua Inbox liên kết theo hướng dẫn PLC Manual; không sửa bản ghi gốc.</p>
+      </details>}
 
       {(["TIP", "BUTT"] as const).map(type => {
         const station = data.stations.find(

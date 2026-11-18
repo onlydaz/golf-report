@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface As200Latest {
+  qualityError?: string | null;
   sourceKey: string;
   sessionId: string | null;
   deliveryId: string;

@@ -59,6 +59,9 @@ pub struct StationInput {
 pub struct MeasurementDraft {
     pub source_id: i64,
     pub confirmed_session_id: String,
+    pub publication_count: Option<i32>,
+    pub quality_error: Option<String>,
+    pub sku_origin: String,
     pub record_seq: i32,
     pub total_count: Option<i64>,
     pub product_code: String,
@@ -112,6 +115,9 @@ pub struct MeasurementSummary {
     pub id: i64,
     pub source_id: i64,
     pub session_id: Option<String>,
+    pub publication_count: Option<i32>,
+    pub quality_error: Option<String>,
+    pub sku_origin: String,
     pub record_seq: i32,
     pub total_count: Option<i64>,
     pub product_code: String,
@@ -125,10 +131,20 @@ pub struct MeasurementSummary {
     pub butt_result: Option<String>,
     pub butt_load: Option<BigDecimal>,
 }
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementReceipt {
+    pub inbox_id: i64,
+    pub source_key: String,
+    pub publication_session: Option<String>,
+    pub publication_count: Option<i32>,
+    pub word_order: String,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Measurement {
     #[serde(flatten)]
     pub summary: MeasurementSummary,
+    pub receipt: Option<MeasurementReceipt>,
     pub stations: Vec<MeasurementStation>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -129,7 +129,7 @@ impl PlcStickRecord {
                         || point.decide_attempt != 0 || point.position != 0.0
                         || point.attempts.iter().any(|a| a.push_dist != 0.0 || a.bend != 0.0))
                 {
-                    return Err(format!("AS200_WORKFLOW: {name} P{} chứa dữ liệu ngoài quy trình; giữ raw để đối chiếu, không ACK", index + 1));
+                    return Err(format!("AS200_WORKFLOW: {name} P{} chứa dữ liệu ngoài quy trình; giữ raw để đối chiếu chất lượng", index + 1));
                 }
                 let expected = if index >= measured {
                     PlcResult::Unmeasured

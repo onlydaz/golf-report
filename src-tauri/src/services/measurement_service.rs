@@ -9,6 +9,54 @@ impl MeasurementService {
         if input.product_code.chars().count() > 50 {
             return Err("ProductCode vượt 50 ký tự".into());
         }
+        if let Some(count) = input.publication_count {
+            if count < 0 || input.total_count != Some(i64::from(count)) {
+                return Err("Measurement publication context differs from receipt".into());
+            }
+        }
+        if input.quality_error.is_some() && input.publication_count.is_some() {
+            if input.overall_result != MeasurementResult::Unmeasured {
+                return Err("Incomplete publication cannot claim an Overall result".into());
+            }
+            let mut station_types = std::collections::HashSet::new();
+            for station in &input.stations {
+                if !station_types.insert(station.station_type.as_str())
+                    || !(0..=4).contains(&station.point_count)
+                    || station.ng_point.is_some_and(|n| !(0..=4).contains(&n))
+                {
+                    return Err("Invalid observation station bounds".into());
+                }
+                let limit = if station.station_type == StationType::Tip {
+                    1
+                } else {
+                    4
+                };
+                let mut points = std::collections::HashSet::new();
+                for point in &station.points {
+                    if !(1..=limit).contains(&point.point_number)
+                        || !points.insert(point.point_number)
+                        || !(0..=4).contains(&point.attempt_count)
+                        || point
+                            .decide_attempt
+                            .is_some_and(|n| n < 1 || n > point.attempt_count)
+                        || point.attempts.len() != point.attempt_count as usize
+                    {
+                        return Err("Invalid observation point bounds".into());
+                    }
+                    if point
+                        .attempts
+                        .iter()
+                        .enumerate()
+                        .any(|(i, a)| a.attempt_number != (i + 1) as i32)
+                    {
+                        return Err("Invalid observation attempt identity".into());
+                    }
+                }
+            }
+            // The bounded scalar decoder constructs this observation. No
+            // production workflow is invented for unfinished manual payloads.
+            return Ok(());
+        }
         if input.stations.len() != 2
             || !input
                 .stations

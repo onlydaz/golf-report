@@ -484,6 +484,9 @@ function AddMeasurement() {
       {holder}
 
       <PageHeader eyebrow="GIÁM SÁT" title="1 · Giám sát" description="" />
+      {displayed?.qualityError && <Alert type="info" showIcon
+        title="Đã lưu bản ghi — chất lượng chưa xác định"
+        description="Dữ liệu chưa đủ để kết luận OK/NG và không tính vào KPI sản xuất. Xem Chi tiết để đối chiếu." />}
 
       <div className="monitor-top-grid">
       <ProductionSummary productCode={currentSku}

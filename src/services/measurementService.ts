@@ -19,6 +19,9 @@ export interface BackendMeasurement {
   id: number;
   sourceId: number;
   sessionId: string | null;
+  publicationCount?: number | null;
+  qualityError?: string | null;
+  skuOrigin?: "QC" | "PLC" | "LEGACY" | "MISSING";
   recordSeq: number;
   totalCount: number | null;
   productCode: string;
@@ -64,6 +67,7 @@ export interface MeasurementStation {
 }
 
 export interface MeasurementDetail extends BackendMeasurement {
+  receipt?: { inboxId: number; sourceKey: string; publicationSession: string | null; publicationCount: number | null; wordOrder: string } | null;
   stations: MeasurementStation[];
 }
 

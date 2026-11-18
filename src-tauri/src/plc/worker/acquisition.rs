@@ -1,4 +1,4 @@
-//! One raw receipt path; decoding is optional and cannot authorize ACK.
+//! Committed raw receipt and linked Measurement precede new ACK writes.
 use super::*;
 use store::Progress;
 
@@ -186,14 +186,7 @@ impl Engine {
     }
 
     pub(super) async fn show_receipt(&self, row: &InboxRecord, p: &Progress) -> Result<(), String> {
-        let words: Vec<u16> =
-            serde_json::from_value(row.raw_registers.clone()).map_err(|e| e.to_string())?;
-        let order = if row.word_order == "LOW" {
-            as200::WordOrder::LowWordFirst
-        } else {
-            as200::WordOrder::HighWordFirst
-        };
-        let record = decode::record(&words, 0, order).ok();
+        let draft = crate::services::inbox_service::draft_from_inbox(row).ok();
         let mut status = self.state.status.write().await;
         if let Some(id) = row.measurement_id {
             status.last_saved_id = Some(id);
@@ -223,7 +216,7 @@ impl Engine {
             None
         };
         status.ack_status = self.receipt_ack_status(row, p);
-        if let Some(record) = record {
+        if let Some(draft) = draft {
             status.latest = Some(LatestRecord {
                 source_key: self.config.source_key.clone(),
                 session_id: row.publication_session.clone().or(row.session_id.clone()),
@@ -232,19 +225,25 @@ impl Engine {
                 measurement_id: row.measurement_id,
                 record_seq: row.record_seq,
                 total_count: row.total_count,
-                product_code: row
-                    .assigned_sku
-                    .clone()
-                    .or(crate::services::inbox_service::assigned_sku(
-                        &row.ingest_key,
-                        row.record_seq,
-                    )?)
-                    .unwrap_or(record.product_code),
-                club_number: record.stick_no,
+                product_code: draft.product_code,
+                club_number: draft.club_number,
                 received_at: row.received_at,
-                overall_result: format!("{:?}", record.overall_result).to_uppercase(),
-                tip_result: format!("{:?}", record.tip.result).to_uppercase(),
-                butt_result: format!("{:?}", record.butt.result).to_uppercase(),
+                quality_error: draft.quality_error,
+                overall_result: draft.overall_result.as_str().into(),
+                tip_result: draft
+                    .stations
+                    .iter()
+                    .find(|s| s.station_type == crate::models::StationType::Tip)
+                    .map(|s| s.result.as_str())
+                    .unwrap_or("UNMEASURED")
+                    .into(),
+                butt_result: draft
+                    .stations
+                    .iter()
+                    .find(|s| s.station_type == crate::models::StationType::Butt)
+                    .map(|s| s.result.as_str())
+                    .unwrap_or("UNMEASURED")
+                    .into(),
                 save_state: if row.measurement_id.is_some() {
                     "PROCESSED"
                 } else if row.processing_status == "FAILED" {
@@ -276,7 +275,7 @@ impl Engine {
         pool: &PgPool,
         row: &InboxRecord,
     ) -> Result<(), String> {
-        // Invalid payloads remain raw. No retry storm and no synthetic measurement.
+        // Receipt identity errors remain explicit; incomplete quality is a stored observation.
         if row.measurement_id.is_some() {
             return Ok(());
         }
@@ -285,7 +284,7 @@ impl Engine {
                 .bind(row.id).bind(error).execute(pool).await.map_err(|e| e.to_string())?;
             return Ok(());
         }
-        sqlx::query("UPDATE plc_inbox SET processing_status='PENDING',error_message=NULL WHERE id=$1 AND processing_status='SESSION_UNCONFIRMED' AND publication_session IS NOT NULL")
+        sqlx::query("UPDATE plc_inbox SET processing_status=CASE WHEN processing_status='SESSION_UNCONFIRMED' THEN 'PENDING' ELSE processing_status END,decode_error=NULL WHERE id=$1 AND measurement_id IS NULL AND publication_session IS NOT NULL")
             .bind(row.id).execute(pool).await.map_err(|e| e.to_string())?;
         InboxService::process(pool, row.id).await.map(|_| ())
     }
@@ -300,7 +299,7 @@ impl Engine {
         let mut cursors = self.projection_cursors.lock().await;
         let mut groups = Vec::new();
         for (failed, cursor) in [(false, cursors.0), (true, cursors.1)] {
-            let rows: Vec<InboxRecord> = sqlx::query_as("SELECT * FROM plc_inbox WHERE source_id=$1 AND measurement_id IS NULL AND decode_error IS NULL AND (session_id IS NOT NULL OR publication_session IS NOT NULL) AND (processing_status='FAILED')=$2 ORDER BY (id>$3) DESC,id LIMIT 5")
+            let rows: Vec<InboxRecord> = sqlx::query_as("SELECT * FROM plc_inbox WHERE source_id=$1 AND measurement_id IS NULL AND (decode_error IS NULL OR publication_session IS NOT NULL) AND (session_id IS NOT NULL OR publication_session IS NOT NULL) AND (processing_status='FAILED')=$2 ORDER BY (id>$3) DESC,id LIMIT 5")
                 .bind(self.source_id).bind(failed).bind(cursor).fetch_all(pool).await.map_err(|e| e.to_string())?;
             groups.push(rows);
         }
@@ -323,9 +322,9 @@ impl Engine {
             }
         }
         drop(cursors);
-        let (failed, waiting): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE processing_status='FAILED'),count(*) FILTER (WHERE processing_status<>'FAILED') FROM plc_inbox WHERE source_id=$1 AND measurement_id IS NULL AND decode_error IS NULL AND (session_id IS NOT NULL OR publication_session IS NOT NULL)")
+        let (failed, waiting): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE processing_status='FAILED'),count(*) FILTER (WHERE processing_status<>'FAILED') FROM plc_inbox WHERE source_id=$1 AND measurement_id IS NULL AND (decode_error IS NULL OR publication_session IS NOT NULL) AND (session_id IS NOT NULL OR publication_session IS NOT NULL)")
             .bind(self.source_id).fetch_one(pool).await.map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM plc_inbox WHERE source_id=$1 AND processing_status='FAILED' AND measurement_id IS NULL AND decode_error IS NULL ORDER BY id LIMIT 100")
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM plc_inbox WHERE source_id=$1 AND processing_status='FAILED' AND measurement_id IS NULL AND (decode_error IS NULL OR publication_session IS NOT NULL) ORDER BY id LIMIT 100")
             .bind(self.source_id).fetch_all(pool).await.map_err(|e| e.to_string())?;
         {
             let mut status = self.state.status.write().await;
@@ -337,6 +336,12 @@ impl Engine {
         }
         self.refresh_display(pool).await?;
         Ok(())
+    }
+
+    async fn measurement_committed(pool: &PgPool, id: i64) -> Result<bool, String> {
+        let committed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plc_inbox i JOIN measurements m ON m.id=i.measurement_id WHERE i.id=$1 AND i.processing_status='PROCESSED' AND m.source_id=i.source_id AND m.session_id=i.publication_session AND m.publication_count=i.publication_count AND m.record_seq=i.record_seq)")
+            .bind(id).fetch_one(pool).await.map_err(|e| e.to_string())?;
+        Ok(committed)
     }
 
     async fn observe_ack(
@@ -361,7 +366,8 @@ impl Engine {
             sqlx::query("UPDATE plc_acquisition SET done_observed=true WHERE source_id=$1 AND pending_inbox_id=$2 AND ack_attempted")
                 .bind(p.source_id).bind(row.id).execute(pool).await.map_err(|e| e.to_string())?;
         }
-        let complete = p.done_observed
+        let complete = row.measurement_id.is_some()
+            && p.done_observed
             && c.pc_read_done == 0
             && c.pc_read_count == target
             && ((c.total_count == target && c.data_ready == 0)
@@ -369,6 +375,11 @@ impl Engine {
                     && c.data_ready == 1
                     && snapshot.buffer.is_some()));
         if complete {
+            if !Self::measurement_committed(pool, row.id).await? {
+                return Err(
+                    "MEASUREMENT: linked identity not verified; checkpoint retained".into(),
+                );
+            }
             let changed = sqlx::query("UPDATE plc_acquisition SET accepted=$3,last_total=GREATEST(last_total,$3),anchor_inbox_id=$2,pending_inbox_id=NULL,ack_attempted=false,done_observed=false,done_started=false WHERE source_id=$1 AND pending_inbox_id=$2 AND accepted=$4 AND session_id=$5 AND binding=$6 AND blocked_reason IS NULL AND ack_attempted AND done_observed AND done_started IS DISTINCT FROM false")
                 .bind(p.source_id).bind(row.id).bind(target).bind(p.accepted).bind(&p.session_id).bind(&p.binding).execute(pool).await.map_err(|e| e.to_string())?;
             if changed.rows_affected() != 1 {
@@ -510,6 +521,28 @@ impl Engine {
         }
         let snapshot = self.read_snapshot().await?;
         let c = &snapshot.control;
+        if p.pending_inbox_id.is_none()
+            && c.data_ready == 1
+            && p.accepted > 0
+            && c.total_count == p.accepted
+            && p.last_total == p.accepted
+        {
+            let anchor =
+                InboxRepository::find(pool, p.anchor_inbox_id.ok_or("Missing ACK anchor")?).await?;
+            let unchanged = anchor.total_count == Some(i64::from(c.total_count))
+                && c.pc_read_count == p.accepted
+                && c.pc_read_done == 0
+                && snapshot.buffer.as_ref().is_some_and(|b| {
+                    serde_json::to_value(&b.raw_registers)
+                        .is_ok_and(|raw| raw == anchor.raw_registers)
+                });
+            if !unchanged {
+                self.block(pool, "PUBLICATION_CONFLICT").await?;
+                return Err("Confirmed publication changed while Ready remained high; no new identity or ACK".into());
+            }
+            self.show_receipt(&anchor, &p).await?;
+            return Ok(());
+        }
         if p.pending_inbox_id.is_none() && c.data_ready == 1 {
             self.receive(pool, &p, &snapshot, None).await?;
             p = store::progress(pool, self.source_id)
@@ -572,7 +605,7 @@ impl Engine {
             .await
             .map_err(|e| e.to_string())?;
         }
-        let Some(row) = pending else {
+        let Some(mut row) = pending else {
             if c.data_ready != 0
                 || c.total_count != p.accepted
                 || c.pc_read_count != p.accepted
@@ -606,6 +639,20 @@ impl Engine {
                 .observe_ack(pool, &p, &row, &snapshot)
                 .await
                 .map(|_| ());
+        }
+        // Do not begin/continue a write until the linked Measurement transaction
+        // has committed and the receipt has been read back. Lost COMMIT responses
+        // retry through the same locked Inbox ID, never a second Measurement.
+        if row.measurement_id.is_none() {
+            self.process_receipt(pool, &row).await?;
+            row = self.receipt(pool, row.id, &p).await?;
+            self.show_receipt(&row, &p).await?;
+        }
+        if row.measurement_id.is_none() {
+            return Err("MEASUREMENT: waiting for committed Measurement; ACK withheld".into());
+        }
+        if !Self::measurement_committed(pool, row.id).await? {
+            return Err("MEASUREMENT: committed link/identity not verified; ACK withheld".into());
         }
         if self.config.read_only || !self.config.ack_enabled {
             self.state.status.write().await.ack_status = "DISABLED";

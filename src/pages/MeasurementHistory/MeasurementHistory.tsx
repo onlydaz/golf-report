@@ -93,8 +93,8 @@ function MeasurementHistory() {
 
   useEffect(() => {
     let active = true;
-    setDetails(undefined); setDetailError(""); setDetailLoading(databaseConnected && !!selectedSku);
-    if (!databaseConnected || !selectedSku) return;
+    setDetails(undefined); setDetailError(""); setDetailLoading(databaseConnected && selectedSku !== undefined);
+    if (!databaseConnected || selectedSku === undefined) return;
     void getMeasurementHistoryPage({ ...query.filters, productCode: selectedSku, page: selection.page, pageSize }).then(data => {
       if (!active) return;
       const lastPage = Math.max(1, Math.ceil(data.total / pageSize));
@@ -116,13 +116,13 @@ function MeasurementHistory() {
   };
   const stats = databaseConnected && statistics?.scope === query.filters ? statistics.data : undefined;
   const skuPage = databaseConnected && summary?.query === query ? summary.data : undefined;
-  const detailPage = databaseConnected && details?.selection === selection && selectedSku ? details.data : undefined;
+  const detailPage = databaseConnected && details?.selection === selection && selectedSku !== undefined ? details.data : undefined;
   const cards = [
     ["Tổng số gậy", stats?.totalMeasurements, "blue"], ["Tổng OK", stats?.totalOk, "green"], ["Tổng NG", stats?.totalNg, "red"],
     ["Tỷ lệ OK", stats ? rate(stats.totalOk, stats.totalMeasurements) : undefined, "green"], ["NG Butt", stats?.buttNg, "red"], ["NG Tip", stats?.tipNg, "red"],
   ] as const;
   const skuColumns: ColumnsType<MeasurementSkuSummary> = [
-    { title: "SKU", dataIndex: "productCode", width: 160, fixed: "left" },
+    { title: "SKU", dataIndex: "productCode", render: value => value || "Chưa gán SKU", width: 160, fixed: "left" },
     { title: "Gậy đầu tiên", dataIndex: "firstMeasuredAt", render: formatReportTime, width: 180 },
     { title: "Gậy gần nhất", dataIndex: "lastMeasuredAt", render: formatReportTime, width: 180 },
     { title: "Tổng số gậy", dataIndex: "total", width: 110, align: "right" },
@@ -130,7 +130,7 @@ function MeasurementHistory() {
     { title: "NG", dataIndex: "ng", width: 85, align: "right", className: "history-value-ng" },
     { title: "NG BUTT", dataIndex: "buttNg", width: 100, align: "right" },
     { title: "NG TIP", dataIndex: "tipNg", width: 100, align: "right" },
-    { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.total), width: 110, align: "right" },
+    { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.ok + row.ng), width: 110, align: "right" },
   ];
   const stationColumns = (station: "BUTT" | "TIP"): ColumnsType<MeasurementHistoryItem> => [
     ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
@@ -155,6 +155,9 @@ function MeasurementHistory() {
 
   return <div className="measurement-history-page">
     <PageHeader eyebrow="Tra cứu" title="2 · Lịch sử" description="" />
+    {skuPage?.items.some(row => row.total > row.ok + row.ng) && <Alert type="info" showIcon
+      title="Lịch sử có bản ghi chưa xác định chất lượng"
+      description="Các bản ghi này vẫn có trong danh sách và chi tiết, nhưng không tính vào KPI OK/NG hoặc tỷ lệ đạt." />}
     <Card className="section-card history-filter-card">
       <form className="history-filter-row" onSubmit={event => { event.preventDefault(); applyFilters(); }}>
         <label className="filter-field"><span>Từ ngày</span><DatePicker value={draft.from} format="DD/MM/YYYY" placeholder="Chọn ngày" onChange={value => setDraft(current => ({ ...current, from: value ?? undefined }))} /></label>
@@ -187,11 +190,11 @@ function MeasurementHistory() {
         pagination={{ current: query.page, pageSize, total: skuPage?.total ?? 0, showSizeChanger: false, onChange: page => setQuery(current => ({ ...current, page })) }}
         scroll={{ x: 1110 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={summaryError ? "Chưa tải được tổng hợp SKU" : "Không có SKU phù hợp"} /> }} />
     </Card>
-    <Card className="section-card" title={selectedSku ? `Chi tiết gậy · ${selectedSku}` : "Chi tiết gậy"} extra={<span className="history-table-note">Hiển thị {shownFrom}–{shownTo} / {detailPage?.total ?? 0} gậy</span>}>
+    <Card className="section-card" title={selectedSku !== undefined ? `Chi tiết gậy · ${selectedSku}` : "Chi tiết gậy"} extra={<span className="history-table-note">Hiển thị {shownFrom}–{shownTo} / {detailPage?.total ?? 0} gậy</span>}>
       {detailError && <Alert type="error" showIcon title={detailError} />}
       <Table<MeasurementHistoryItem> className="history-table history-detail-table" size="small" rowKey="id" columns={columns} dataSource={detailPage?.items ?? []} loading={detailLoading}
         pagination={{ current: selection.page, pageSize, total: detailPage?.total ?? 0, showSizeChanger: false, onChange: page => setSelection(current => ({ ...current, page })) }}
-        scroll={{ x: 1450 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={detailError ? "Chưa tải được chi tiết gậy" : selectedSku ? "Không có gậy phù hợp" : "Chọn một SKU để xem chi tiết gậy"} /> }} />
+        scroll={{ x: 1450 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={detailError ? "Chưa tải được chi tiết gậy" : selectedSku !== undefined ? "Không có gậy phù hợp" : "Chọn một SKU để xem chi tiết gậy"} /> }} />
     </Card>
   </div>;
 }

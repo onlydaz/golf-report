@@ -144,7 +144,7 @@ pub fn validate_history(tables: &[String], history: &[MigrationHistory]) -> Resu
 
 #[cfg(test)]
 #[path = "migration_tests.rs"]
-mod integration_tests;
+pub(crate) mod integration_tests;
 
 #[cfg(test)]
 mod tests {

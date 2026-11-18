@@ -3,7 +3,8 @@ use crate::{
     enums::MeasurementResult,
     models::*,
     plc::as200::{
-        WordOrder, decode,
+        WordOrder, decode, map,
+        map::record as r,
         model::{PlcResult, PlcStation},
     },
     repositories::*,
@@ -87,9 +88,9 @@ fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput
             } else {
                 Some(i32::from(point.decide_attempt))
             },
-            // Workflow validation already proved unused slots contain no data.
-            // Keep only business point identities (TIP 1, BUTT 4); padding is not a measurement.
-            position: if index < value.point_count as usize && point.attempt_count > 0 {
+            // An explicit attempt count identifies a measured position. Keep
+            // business points only (TIP 1, BUTT 4), independently of station completion.
+            position: if point.attempt_count > 0 {
                 Some(real32_numeric(point.position)?)
             } else {
                 None
@@ -106,11 +107,10 @@ fn station(value: &PlcStation, station_type: StationType) -> Result<StationInput
         points,
     })
 }
-pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String> {
+fn legacy_draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String> {
     let session = inbox
-        .publication_session
+        .session_id
         .as_ref()
-        .or(inbox.session_id.as_ref())
         .filter(|s| !s.trim().is_empty())
         .ok_or("SESSION_UNCONFIRMED: cần xác nhận phiên ngoài hệ thống; không tự tạo session")?;
     let raw: Vec<u16> =
@@ -128,30 +128,22 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
     .map_err(|e| e.to_string())?;
     record.validate_metadata(inbox.total_count)?;
     record.validate_workflow()?;
-    if inbox
-        .publication_count
-        .is_some_and(|count| record.record_seq != count)
-    {
-        return Err(
-            "RecordSeq chưa khớp định danh công bố; giữ raw, không tạo Measurement.".into(),
-        );
-    }
     if !record.valid_unacknowledged || record.record_seq != inbox.record_seq {
         return Err("Status bit 0 hoặc RecordSeq không khớp inbox".into());
     }
+    if !record.complete() {
+        return Err("Legacy receipt is not a completed measurement".into());
+    }
     let input = MeasurementDraft {
+        publication_count: None,
+        quality_error: None,
+        sku_origin: "LEGACY".into(),
         source_id: inbox.source_id,
         confirmed_session_id: session.clone(),
         record_seq: record.record_seq,
         total_count: inbox.total_count,
-        product_code: if inbox.publication_session.is_some() {
-            inbox
-                .assigned_sku
-                .clone()
-                .ok_or("Chưa gán SKU lúc nhận raw; không dùng SKU của lần nhận khác.")?
-        } else {
-            assigned_sku(&inbox.ingest_key, inbox.record_seq)?.unwrap_or(record.product_code)
-        },
+        product_code: assigned_sku(&inbox.ingest_key, inbox.record_seq)?
+            .unwrap_or(record.product_code),
         club_number: record.stick_no,
         measured_at: inbox.received_at,
         overall_result: result(record.overall_result),
@@ -163,6 +155,107 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
     MeasurementService::validate(&input)?;
     Ok(input)
 }
+/// Native receipts use publication identity, independently of raw RecordSeq.
+pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String> {
+    if inbox.publication_session.is_none() {
+        return legacy_draft_from_inbox(inbox);
+    }
+    let session = inbox
+        .publication_session
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("SESSION_UNCONFIRMED")?;
+    let count = inbox
+        .publication_count
+        .filter(|c| *c >= 0)
+        .ok_or("Invalid publication counter")?;
+    if inbox.total_count != Some(i64::from(count)) || inbox.source_id <= 0 {
+        return Err("Publication identity does not match receipt".into());
+    }
+    let raw: Vec<u16> =
+        serde_json::from_value(inbox.raw_registers.clone()).map_err(|e| e.to_string())?;
+    if raw.len() != map::RECORD_SIZE || inbox.buffer_index != 0 {
+        return Err("Receipt requires 240 WORD".into());
+    }
+    let order = match inbox.word_order.as_str() {
+        "LOW" => WordOrder::LowWordFirst,
+        "HIGH" => WordOrder::HighWordFirst,
+        _ => return Err("Invalid word order".into()),
+    };
+    let seq = decode::dint32(&raw, r::SEQUENCE, order).map_err(|e| e.to_string())?;
+    if seq != inbox.record_seq {
+        return Err("Raw RecordSeq differs from receipt".into());
+    }
+    let decoded = decode::publication_record(&raw, 0, order);
+    let product_code = inbox.assigned_sku.clone().unwrap_or_else(|| {
+        decode::product_code(&raw[r::PRODUCT_CODE..r::PRODUCT_CODE + r::PRODUCT_WORDS])
+            .unwrap_or_default()
+    });
+    let sku_origin = if inbox.assigned_sku.is_some() {
+        "QC"
+    } else if !product_code.is_empty() {
+        "PLC"
+    } else {
+        "MISSING"
+    };
+    let mut quality_error = decode::record(&raw, 0, order)
+        .map_err(|e| e.to_string())
+        .and_then(|mut r| {
+            r.validate_metadata(inbox.total_count)?;
+            if !r.product_code.is_empty()
+                && !r.product_code.bytes().all(|b| (32..=126).contains(&b))
+            {
+                return Err("PLC ProductCode contains invalid characters".into());
+            }
+            // SKU is receipt metadata, never rewritten into the raw WORD array.
+            r.product_code = product_code.clone();
+            r.validate_workflow()?;
+            if !r.complete() || r.record_seq != count {
+                return Err("Incomplete results or RecordSeq/publication mismatch".into());
+            }
+            Ok(())
+        })
+        .err();
+    if product_code.is_empty() {
+        quality_error = Some("SKU not assigned at receipt; PLC ProductCode empty".into());
+    }
+    let mut stations = Vec::new();
+    if let Ok(record) = &decoded {
+        // Scalar decoding and bounded counts still apply. Unused slots do not
+        // become measured values just because their raw WORDs are nonzero.
+        stations.push(station(&record.tip, StationType::Tip)?);
+        stations.push(station(&record.butt, StationType::Butt)?);
+    } else if let Err(error) = &decoded {
+        quality_error = Some(error.to_string());
+    }
+    if quality_error.is_some() {
+        for station in &mut stations {
+            station.points.retain(|p| p.attempt_count > 0);
+        }
+    }
+    let overall_result = if quality_error.is_none() {
+        result(decoded.as_ref().unwrap().overall_result)
+    } else {
+        MeasurementResult::Unmeasured
+    };
+    let draft = MeasurementDraft {
+        source_id: inbox.source_id,
+        confirmed_session_id: session.clone(),
+        record_seq: seq,
+        publication_count: Some(count),
+        quality_error,
+        sku_origin: sku_origin.into(),
+        total_count: inbox.total_count,
+        product_code,
+        club_number: decode::dint32(&raw, r::STICK_NO, order).map_err(|e| e.to_string())?,
+        measured_at: inbox.received_at,
+        overall_result,
+        stations,
+    };
+    MeasurementService::validate(&draft)?;
+    Ok(draft)
+}
+
 pub struct InboxService;
 impl InboxService {
     pub async fn process_in_transaction(
@@ -174,16 +267,6 @@ impl InboxService {
             return Ok(measurement_id);
         }
         let draft = draft_from_inbox(&inbox)?;
-        if draft.overall_result == MeasurementResult::Unmeasured
-            || draft
-                .stations
-                .iter()
-                .any(|s| s.result == MeasurementResult::Unmeasured)
-        {
-            return Err(
-                "Bản ghi chưa hoàn tất; giữ inbox để đối chiếu, không tạo measurement".into(),
-            );
-        }
         let measurement_id = MeasurementService::insert(tx, &draft).await?;
         InboxRepository::processed(tx, id, measurement_id).await?;
         Ok(measurement_id)

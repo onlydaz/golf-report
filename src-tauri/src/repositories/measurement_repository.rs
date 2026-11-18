@@ -46,7 +46,7 @@ mod report_tests {
         sqlx::raw_sql(
             r#"
             CREATE TEMP TABLE measurements(id bigint,product_code text,club_number int,
-                measured_at timestamptz,overall_result text,source_id bigint);
+                measured_at timestamptz,overall_result text,source_id bigint,quality_error text);
             CREATE TEMP TABLE measurement_stations(id bigint,measurement_id bigint,
                 station_type text,result text,load numeric);
             CREATE TEMP TABLE measurement_points(id bigint,station_id bigint,point_number int,
@@ -189,7 +189,7 @@ mod report_tests {
         let pool=crate::database::test_support::pool(1).await;
         sqlx::raw_sql(r#"
             CREATE TEMP TABLE measurements(id bigint,product_code text,club_number int,
-                measured_at timestamptz,overall_result text,source_id bigint);
+                measured_at timestamptz,overall_result text,source_id bigint,quality_error text);
             CREATE TEMP TABLE measurement_stations(id bigint,measurement_id bigint,
                 station_type text,result text,load numeric);
             CREATE TEMP TABLE measurement_points(id bigint,station_id bigint,point_number int,
@@ -613,7 +613,7 @@ impl MeasurementRepository {
             .await
             .map_err(|e| e.to_string())?;
         let mut q = QueryBuilder::<Postgres>::new(
-            "SELECT m.product_code,min(m.measured_at) AS first_measured_at,max(m.measured_at) AS last_measured_at,count(*) AS total,count(*) FILTER(WHERE m.overall_result='OK') AS ok,count(*) FILTER(WHERE m.overall_result='NG') AS ng,count(*) FILTER(WHERE b.result='NG') AS butt_ng,count(*) FILTER(WHERE t.result='NG') AS tip_ng",
+            "SELECT m.product_code,min(m.measured_at) AS first_measured_at,max(m.measured_at) AS last_measured_at,count(*) AS total,count(*) FILTER(WHERE m.overall_result='OK') AS ok,count(*) FILTER(WHERE m.overall_result='NG') AS ng,count(*) FILTER(WHERE b.result='NG' AND m.overall_result IN ('OK','NG')) AS butt_ng,count(*) FILTER(WHERE t.result='NG' AND m.overall_result IN ('OK','NG')) AS tip_ng",
         );
         q.push(JOINS);
         filter(&mut q, request);
@@ -673,9 +673,12 @@ impl MeasurementRepository {
         pool: &PgPool,
         request: &MeasurementListRequest,
     ) -> Result<MeasurementQualityStatistics, String> {
-        let mut q = QueryBuilder::<Postgres>::new("WITH filtered AS (SELECT m.id,m.product_code,m.measured_at,m.overall_result,(m.product_code='DEMO-AS200' AND EXISTS(SELECT 1 FROM plc_sources ps WHERE ps.id=m.source_id AND ps.source_key='golf-report-simulator')) AS simulator_demo");
+        let mut q = QueryBuilder::<Postgres>::new(
+            "WITH filtered AS (SELECT m.id,m.product_code,m.measured_at,m.overall_result,(m.product_code='DEMO-AS200' AND EXISTS(SELECT 1 FROM plc_sources ps WHERE ps.id=m.source_id AND ps.source_key='golf-report-simulator')) AS simulator_demo",
+        );
         q.push(JOINS);
         filter(&mut q, request);
+        q.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
         q.push(r#"), half_hour AS (
             SELECT to_timestamp(floor(extract(epoch FROM measured_at)/1800)*1800) AS at,
                 count(*) FILTER(WHERE overall_result='OK') AS ok,
@@ -798,8 +801,8 @@ impl MeasurementRepository {
         tx: &mut Transaction<'_, Postgres>,
         input: &MeasurementDraft,
     ) -> Result<i64, String> {
-        let (id,):(i64,)=sqlx::query_as("INSERT INTO measurements(source_id,session_id,record_seq,total_count,product_code,club_number,measured_at,overall_result) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
-            .bind(input.source_id).bind(&input.confirmed_session_id).bind(input.record_seq).bind(input.total_count).bind(&input.product_code).bind(input.club_number).bind(input.measured_at).bind(input.overall_result.as_str())
+        let (id,):(i64,)=sqlx::query_as("INSERT INTO measurements(source_id,session_id,record_seq,total_count,product_code,club_number,measured_at,overall_result,publication_count,quality_error,sku_origin) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id")
+            .bind(input.source_id).bind(&input.confirmed_session_id).bind(input.record_seq).bind(input.total_count).bind(&input.product_code).bind(input.club_number).bind(input.measured_at).bind(input.overall_result.as_str()).bind(input.publication_count).bind(&input.quality_error).bind(&input.sku_origin)
             .fetch_one(&mut **tx).await.map_err(|e|format!("Lưu measurement: {e}"))?;
         Ok(id)
     }
@@ -813,6 +816,8 @@ impl MeasurementRepository {
             .bind(id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
         let measurement = match summary {
             Some(summary) => Some(Measurement {
+                receipt: sqlx::query_as::<_, MeasurementReceipt>("SELECT i.id AS inbox_id,s.source_key,i.publication_session,i.publication_count,i.word_order FROM plc_inbox i JOIN plc_sources s ON s.id=i.source_id WHERE i.measurement_id=$1")
+                    .bind(id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?,
                 summary,
                 stations: super::StationRepository::load(&mut tx, id).await?,
             }),
@@ -912,6 +917,7 @@ impl MeasurementRepository {
         let result = summaries
             .into_iter()
             .map(|summary| Measurement {
+                receipt: None,
                 stations: by_measurement.remove(&summary.id).unwrap_or_default(),
                 summary,
             })
@@ -933,6 +939,7 @@ impl MeasurementRepository {
         );
         q.push(JOINS);
         filter(&mut q, request);
+        q.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
         let row = q
             .build()
             .fetch_one(&mut *tx)
@@ -943,6 +950,7 @@ impl MeasurementRepository {
         );
         daily.push(JOINS);
         filter(&mut daily, request);
+        daily.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
         daily.push(" GROUP BY (m.measured_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date ORDER BY (m.measured_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date");
         let daily = daily
             .build_query_as()
@@ -953,6 +961,7 @@ impl MeasurementRepository {
             QueryBuilder::<Postgres>::new("SELECT m.overall_result AS result,count(*) AS count");
         distribution.push(JOINS);
         filter(&mut distribution, request);
+        distribution.push(" AND m.quality_error IS NULL AND m.overall_result IN ('OK','NG')");
         distribution.push(" GROUP BY m.overall_result ORDER BY m.overall_result");
         let overall_distribution = distribution
             .build_query_as()

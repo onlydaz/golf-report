@@ -187,11 +187,29 @@ pub fn record(
     buffer_index: usize,
     order: WordOrder,
 ) -> Result<PlcStickRecord, As200Error> {
+    record_impl(words, buffer_index, order, true)
+}
+
+/// Decode an observation without claiming production completion. The raw receipt
+/// remains authoritative; quality is checked independently by the projection.
+pub fn publication_record(
+    words: &[u16],
+    buffer_index: usize,
+    order: WordOrder,
+) -> Result<PlcStickRecord, As200Error> {
+    record_impl(words, buffer_index, order, false)
+}
+fn record_impl(
+    words: &[u16],
+    buffer_index: usize,
+    order: WordOrder,
+    strict: bool,
+) -> Result<PlcStickRecord, As200Error> {
     if words.len() != map::RECORD_SIZE || buffer_index >= map::BUFFER_COUNT {
         return Err(invalid("Record cần 240 WORD và buffer_index 0 hoặc 1"));
     }
     let version = int16(words, r::VERSION)?;
-    if version != map::FORMAT_VERSION {
+    if strict && version != map::FORMAT_VERSION {
         if words.iter().all(|word| *word == 0) {
             return Err(invalid(
                 "Bản ghi toàn 0 chưa xác định phép đo hoàn tất: Version=0 (cần 1), Status bit0=0, ProductCode trống, OverallResult/TIP_Result/BUTT_Result=0 (chưa đo), PointCount/AttemptCount/DecideAttempt=0. Số đo REAL bằng 0 hợp lệ khi có metadata và kết quả PLC đầy đủ.",
