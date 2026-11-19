@@ -6,11 +6,11 @@ import type { ReactNode } from "react";
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ResultTag } from "../../components/measurement/MeasurementDetails";
 import type { BackendMeasurement, MeasurementDetail, MeasurementHistoryItem, MeasurementStatistics } from "../../services/measurementService";
-import { displayPointResult, formatDecimal, isBusinessPoint, isUnmeasuredPoint, stationPointNumbers } from "../../utils/as200Report";
+import { displayPointResult, formatDecimal, formatLoadKg, isBusinessPoint, isUnmeasuredPoint, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime } from "../../utils/reportTime";
 import { measurementSettings } from "../../config/measurementSettings";
 import type { MeasurementChartSettings } from "../../config/measurementSettings";
-import { bendDomain, bendExcess } from "../../utils/bendChart";
+import { bendAxisTicks, bendDomain, bendExcess } from "../../utils/bendChart";
 
 export function ProductionSummary({ productCode, statistics, loading, skuEditor }: {
   productCode?: string; statistics?: MeasurementStatistics; loading: boolean; skuEditor?: ReactNode;
@@ -64,9 +64,9 @@ const compactNumber = (value: number) => value.toLocaleString("vi-VN", { maximum
 const configured = (value: number | null | undefined, unit: string) => value == null ? "Chưa cấu hình" : `${decimal(value)} ${unit}`;
 function bendLimitText(settings?: MeasurementChartSettings | null) {
   return settings?.bendLowerMm != null || settings?.bendUpperMm != null
-    ? settings.bendLowerMm == null ? `≤ ${decimal(settings.bendUpperMm!)} mm`
-      : settings.bendUpperMm == null ? `≥ ${decimal(settings.bendLowerMm)} mm`
-        : `${decimal(settings.bendLowerMm)} - ${decimal(settings.bendUpperMm)} mm`
+    ? settings.bendLowerMm == null ? `≤ ${compactNumber(settings.bendUpperMm!)} mm`
+      : settings.bendUpperMm == null ? `≥ ${compactNumber(settings.bendLowerMm)} mm`
+        : `${compactNumber(settings.bendLowerMm)} - ${compactNumber(settings.bendUpperMm)} mm`
     : "Chưa cấu hình";
 }
 
@@ -74,7 +74,7 @@ export function BendSettingsSummary({ settings, station }: {
   settings: MeasurementChartSettings; station: "BUTT" | "TIP";
 }) {
   return <div className="monitor-chart-settings">
-    <span>Lực đè<b>{settings.loadG == null ? "Chưa cấu hình" : `${compactNumber(settings.loadG)} g`}</b></span>
+    <span>Lực đè<b>{settings.loadG == null ? "Chưa cấu hình" : `${formatLoadKg(settings.loadG)} kg`}</b></span>
     <span>Khoảng cách đẩy<b>{configured(settings.pushDistMm, "mm")}</b></span>
     <span>Giới hạn độ cong<b>{bendLimitText(settings)}</b></span>
     <span>Vị trí điểm đo<b className="monitor-position-values">{settings.positionsMm.some(v => v != null)
@@ -103,6 +103,7 @@ export const BendComparison = memo(function BendComparison({ records, productCod
   const limits = settings?.bendLowerMm != null || settings?.bendUpperMm != null;
   const limitText = bendLimitText(settings);
   const keys = ["p1", "p2", "p3", "p4"] as const;
+  const yDomain = bendDomain(series.flatMap(row => keys.map(key => row[key])), settings);
   const excess = (value: number) => bendExcess(value, settings);
   const colors = ["#1769aa", "#ed8b47", "#1d9b6c", "#d4a82c"].slice(0, stationPointNumbers(station).length);
   const hasBend = series.some(row => [row.p1, row.p2, row.p3, row.p4].some(value => value != null));
@@ -119,12 +120,13 @@ export const BendComparison = memo(function BendComparison({ records, productCod
         <LineChart data={series} margin={{ top: 16, right: 18, bottom: 8, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="id" tickFormatter={id => `#${series.find(row => row.id === id)?.clubNumber ?? "—"}`} />
-          <YAxis width={65} domain={bendDomain(series.flatMap(row => keys.map(key => row[key])), settings)}
+          <YAxis width={65} domain={yDomain} ticks={bendAxisTicks(yDomain, settings)} interval={0}
+            tickFormatter={compactNumber}
             label={{ value: "Độ cong (mm)", angle: -90, position: "insideLeft" }} />
           {settings?.bendLowerMm != null && <ReferenceLine y={settings.bendLowerMm} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
-            label={{ value: `Dưới ${decimal(settings.bendLowerMm)}`, position: "insideBottomRight", fill: "#b42318", fontSize: 13 }} />}
+            label={{ value: `Dưới ${compactNumber(settings.bendLowerMm)}`, position: "insideBottomRight", fill: "#b42318", fontSize: 13 }} />}
           {settings?.bendUpperMm != null && <ReferenceLine y={settings.bendUpperMm} stroke="#d92d20" strokeDasharray="5 4" ifOverflow="extendDomain"
-            label={{ value: `Trên ${decimal(settings.bendUpperMm)}`, position: "insideTopRight", fill: "#b42318", fontSize: 13 }} />}
+            label={{ value: `Trên ${compactNumber(settings.bendUpperMm)}`, position: "insideTopRight", fill: "#b42318", fontSize: 13 }} />}
           <Tooltip content={({ active, label }) => {
             const row = series.find(item => item.id === Number(label));
             if (!active || !row) return null;
@@ -169,11 +171,11 @@ export const CurrentPointTable = memo(function CurrentPointTable({ detail, loadi
   const columns = useMemo<ColumnsType<(typeof rows)[number]>>(() => [
       { title: "Trạm / Điểm", render: (_, row) => `${row.station} · P${row.pointNumber}` },
       { title: "Vị trí (mm)", render: (_, row) => formatDecimal(isUnmeasuredPoint(row) ? null : row.position), width: "13%" },
-      { title: "Lực đo (g)", dataIndex: "load", render: formatDecimal, width: "13%" },
+      { title: "Lực đo (kg)", dataIndex: "load", render: formatLoadKg, width: "13%" },
       { title: "Khoảng cách đẩy (mm)", dataIndex: "pushDist", render: formatDecimal, width: "17%" },
       { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: "14%" },
       { title: <span className="monitor-attempt-heading">Số<br />lần đo</span>, dataIndex: "attemptCount", align: "center", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 54 },
-      { title: "Kết quả", dataIndex: "result", render: result => <ResultTag result={result} qcLabels />, width: "13%" },
+      { title: "Kết quả", dataIndex: "result", align: "center", render: result => <ResultTag result={result} qcLabels />, width: "13%" },
   ], []);
   return <Table className="monitor-point-table" size="small" rowKey="key" dataSource={rows} loading={loading} pagination={false} tableLayout="fixed"
     locale={{ emptyText: "Chưa có chi tiết đo đã lưu của gậy này." }} columns={columns} />;

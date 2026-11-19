@@ -1,6 +1,7 @@
 /**
  * DEFAULT CHART SETPOINTS — QC MUST CONFIRM BEFORE PRODUCTION USE.
- * These values come from the former DEMO source, NOT from PLC registers.
+ * Load/push/positions retain the former DEMO defaults; bend limits are 50–200 mm.
+ * These setpoints are NOT from PLC registers. loadG remains in grams internally.
  * Technicians edit this file and rebuild the application to change them.
  * They apply to every SKU, by station, and never determine PLC OK/NG or KPI.
  * TIP position 80 mm is retained from simulatorDemoSettings in Git HEAD.
@@ -15,6 +16,6 @@ export interface MeasurementChartSettings {
 }
 
 export const measurementSettings: Readonly<Record<"BUTT" | "TIP", MeasurementChartSettings>> = {
-  BUTT: { loadG: 500, pushDistMm: 10, bendLowerMm: 0, bendUpperMm: 2, positionsMm: [150, 300, 450, 600] },
-  TIP: { loadG: 200, pushDistMm: 8, bendLowerMm: 0, bendUpperMm: 2, positionsMm: [80] },
+  BUTT: { loadG: 500, pushDistMm: 10, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [150, 300, 450, 600] },
+  TIP: { loadG: 200, pushDistMm: 8, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [80] },
 };

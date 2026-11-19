@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
 
-import { buildReportTables, formatDecimal, isUnmeasuredPoint } from "./as200Report";
+import { buildReportTables, formatDecimal, gramsToKilograms, formatLoadKg, isUnmeasuredPoint } from "./as200Report";
 import { createCsvBytes, createExcelBytes } from "./as200Export";
 import dayjs from "dayjs";
 import { formatReportTime, reportDateBoundary } from "./reportTime";
@@ -13,7 +13,7 @@ import { formatReportTime, reportDateBoundary } from "./reportTime";
 const summaryHeaders = [
   "Mã phép đo", "Mã sản phẩm", "Số gậy", "Thời gian nhận",
   "Mã lượt đo (RecordSeq)", "Tổng số lượt đo", "Kết quả tổng thể",
-  "Kết quả TIP", "Tải trọng TIP (g)", "Kết quả BUTT", "Tải trọng BUTT (g)",
+  "Kết quả TIP", "Tải trọng TIP (kg)", "Kết quả BUTT", "Tải trọng BUTT (kg)",
 ];
 
 const pointHeaders = [
@@ -108,6 +108,19 @@ const record: MeasurementDetail = {
 };
 
 describe("AS200 display and export", () => {
+  it("converts grams to kilograms exactly without mutating PLC/database values", () => {
+    for (const [grams, kilograms] of [["500", "0.5"], ["200", "0.2"], ["0", "0"], ["-1250", "-1.25"],
+      ["123.123456789012345678", "0.123123456789012345678"], ["-1.25E-8", "-0.0000000000125"],
+      ["1E+6", "1000"], ["00500.000", "0.5"]]) expect(gramsToKilograms(grams)).toBe(kilograms);
+    expect(formatLoadKg(500)).toBe("0,5");
+    expect(formatLoadKg("200")).toBe("0,2");
+    expect(formatLoadKg(null)).toBe("—");
+    expect(gramsToKilograms(undefined)).toBeNull();
+    expect(gramsToKilograms("NaN")).toBeNull();
+    const original = structuredClone(record);
+    buildReportTables([record]);
+    expect(record).toEqual(original);
+  });
   it("preserves independent PLC results and detail slots beyond AttemptCount", async () => {
     const source = structuredClone(record);
     source.overallResult = "OK";
@@ -179,11 +192,11 @@ describe("AS200 display and export", () => {
     for (const product of ["=1+1", "+SUM(1,2)", "-2+3", "@SUM(A1)", "  =1+1", "\tvalue", "\r=1+1", "\n=1+1"]) {
       const source = { ...record, productCode: product };
       const tables = buildReportTables([source]);
-      tables.measurements[0]["TIP Load (g)"] = "-0.123456789012345678";
+      tables.measurements[0]["TIP Load (kg)"] = "-0.123456789012345678";
       const bytes = createCsvBytes(tables.measurements);
       const rows = XLSX.utils.sheet_to_json<Record<string, string>>(XLSX.read(bytes, { type: "array", raw: true }).Sheets.Sheet1);
       expect(rows[0]["Mã sản phẩm"]).toBe(`'${product}`);
-      expect(rows[0]["Tải trọng TIP (g)"]).toBe("-0.123456789012345678");
+      expect(rows[0]["Tải trọng TIP (kg)"]).toBe("-0.123456789012345678");
       expect(source.productCode).toBe(product);
       const workbook = new ExcelJS.Workbook();
       await workbook.xlsx.load(await createExcelBytes(tables.measurements, [source]) as unknown as Parameters<typeof workbook.xlsx.load>[0]);
@@ -192,10 +205,10 @@ describe("AS200 display and export", () => {
       expect(workbook.getWorksheet("Tổng hợp")!.getCell("B2").value).toBe(product.replace(/\r/g, "\n"));
       expect(tables.measurements[0].ProductCode).toBe(product);
     }
-    const spoofed = { ...buildReportTables([record]).measurements[0], OverallResult: "@SUM(A1)", "TIP Load (g)": "=1+1" };
+    const spoofed = { ...buildReportTables([record]).measurements[0], OverallResult: "@SUM(A1)", "TIP Load (kg)": "=1+1" };
     const rows = XLSX.utils.sheet_to_json<Record<string, string>>(XLSX.read(createCsvBytes([spoofed]), { type: "array", raw: true }).Sheets.Sheet1);
     expect(rows[0]["Kết quả tổng thể"]).toBe("'@SUM(A1)");
-    expect(rows[0]["Tải trọng TIP (g)"]).toBe("'=1+1");
+    expect(rows[0]["Tải trọng TIP (kg)"]).toBe("'=1+1");
   });
   it("formats decimal strings without losing digits, including zero and scientific notation", () => {
     expect(formatDecimal("1234.123456789012345678")).toBe("1.234,123456789012345678");
@@ -219,8 +232,8 @@ describe("AS200 display and export", () => {
     });
 
     expect(tables.measurements[0]).toMatchObject({
-      "TIP Load (g)": record.tipLoad,
-      "BUTT Load (g)": "0",
+      "TIP Load (kg)": "0.123123456789012345678",
+      "BUTT Load (kg)": "0",
       StickNo: 0,
     });
 
@@ -258,7 +271,7 @@ describe("AS200 display and export", () => {
     });
 
     expect(workbook.getWorksheet("Tổng hợp")!.rowCount).toBe(2);
-    expect(workbook.getWorksheet("Tổng hợp")!.getCell("I2").value).toBe(record.tipLoad);
+    expect(workbook.getWorksheet("Tổng hợp")!.getCell("I2").value).toBe("0.123123456789012345678");
     expect(workbook.getWorksheet("Điểm đo")!.rowCount).toBe(3);
     expect(workbook.getWorksheet("Điểm đo")!.getCell("B2").value).toBe("TIP");
     expect(workbook.getWorksheet("Điểm đo")!.getCell("E2").value).toBe("NG");
@@ -278,7 +291,7 @@ describe("AS200 display and export", () => {
     expect(rows).toHaveLength(1);
     expect(Object.keys(rows[0])).toEqual(summaryHeaders);
     expect(rows[0]["Mã sản phẩm"]).toBe(record.productCode);
-    expect(rows[0]["Tải trọng TIP (g)"]).toBe(record.tipLoad);
+    expect(rows[0]["Tải trọng TIP (kg)"]).toBe("0.123123456789012345678");
     expect(rows[0]).not.toHaveProperty("PushDist (mm)");
   });
 
@@ -290,7 +303,7 @@ describe("AS200 display and export", () => {
     );
     expect(rows).toHaveLength(3); // Two actual attempts and one point without attempts.
     expect(rows[0]).toMatchObject({
-      "Mã sản phẩm": "'=unsafe", "Trạm đo": "TIP", "Tải trọng trạm (g)": record.tipLoad,
+      "Mã sản phẩm": "'=unsafe", "Trạm đo": "TIP", "Tải trọng trạm (kg)": "0.123123456789012345678",
       "Điểm đo": "1", "Lượt quyết định": "1", "PushDist (mm)": "0", "Bend (mm)": "-0.125",
     });
     expect(rows[1]).toMatchObject({ "Lượt đo": "2", "PushDist (mm)": "", "Bend (mm)": "1.234567890123456789" });

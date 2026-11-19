@@ -3,7 +3,7 @@ import ExcelJS from "exceljs";
 import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
-import { buildReportTables, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
+import { buildReportTables, gramsToKilograms, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
 
 type ExportValue = string | number;
 type ExportRow = Record<string, ExportValue>;
@@ -17,9 +17,9 @@ const exportHeaders = [
   "TotalCount",
   "OverallResult",
   "TIP Result",
-  "TIP Load (g)",
+  "TIP Load (kg)",
   "BUTT Result",
-  "BUTT Load (g)",
+  "BUTT Load (kg)",
 ];
 
 const headerLabels: Record<string, string> = {
@@ -31,11 +31,11 @@ const headerLabels: Record<string, string> = {
   TotalCount: "Tổng số lượt đo",
   OverallResult: "Kết quả tổng thể",
   "TIP Result": "Kết quả TIP",
-  "TIP Load (g)": "Tải trọng TIP (g)",
+  "TIP Load (kg)": "Tải trọng TIP (kg)",
   "BUTT Result": "Kết quả BUTT",
-  "BUTT Load (g)": "Tải trọng BUTT (g)",
+  "BUTT Load (kg)": "Tải trọng BUTT (kg)",
   StationType: "Trạm đo",
-  "Station Load (g)": "Tải trọng trạm (g)",
+  "Station Load (kg)": "Tải trọng trạm (kg)",
   "Station Result": "Kết quả trạm",
   PointNumber: "Điểm đo",
   "Position (mm)": "Vị trí đo (mm)",
@@ -64,7 +64,7 @@ const calculateColumnWidth = (
 
 // Xuất CSV UTF-8 BOM
 export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[]): Uint8Array => {
-  const detailHeaders = ["StationType", "Station Load (g)", "Station Result", "PointNumber",
+  const detailHeaders = ["StationType", "Station Load (kg)", "Station Result", "PointNumber",
     "Position (mm)", "Result", "AttemptCount", "DecideAttempt", "AttemptNumber", "PushDist (mm)", "Bend (mm)"];
   // CSV is flat: repeat the measurement anchor for each actual point/attempt.
   // Keep an empty detail row when a station/point has no samples; NULL stays blank.
@@ -74,7 +74,7 @@ export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[])
       const base = byId.get(item.id)!;
       if (!item.stations.length) return [base];
       return item.stations.flatMap(station => {
-        const stationRow = { ...base, StationType: station.stationType, "Station Load (g)": station.load, "Station Result": station.result };
+        const stationRow = { ...base, StationType: station.stationType, "Station Load (kg)": gramsToKilograms(station.load) ?? "", "Station Result": station.result };
         const points = station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber));
         if (!points.length) return [stationRow];
         return points.flatMap(point => {
@@ -90,8 +90,8 @@ export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[])
   const headers = details ? [...exportHeaders, ...detailHeaders] : exportHeaders;
   // CSV has no text cell type. Prefix dangerous text with an apostrophe for Excel/WPS.
   // Only trusted numeric columns are exempt; never convert decimal strings to Number.
-  const numericColumns = new Set(["Measurement ID", "StickNo", "RecordSeq", "TotalCount", "TIP Load (g)", "BUTT Load (g)",
-    "Station Load (g)", "PointNumber", "Position (mm)", "AttemptCount", "DecideAttempt", "AttemptNumber", "PushDist (mm)", "Bend (mm)"]);
+  const numericColumns = new Set(["Measurement ID", "StickNo", "RecordSeq", "TotalCount", "TIP Load (kg)", "BUTT Load (kg)",
+    "Station Load (kg)", "PointNumber", "Position (mm)", "AttemptCount", "DecideAttempt", "AttemptNumber", "PushDist (mm)", "Bend (mm)"]);
   const safeRows = rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [
     key,
     typeof value === "string" && !(numericColumns.has(key) && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) &&

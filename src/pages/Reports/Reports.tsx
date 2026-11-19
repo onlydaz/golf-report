@@ -7,7 +7,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Bar, BarChart, Brush, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Bar, BarChart, CartesianGrid, Cell, LabelList, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import { useNavigate } from "react-router-dom";
 import PageHeader from "../../components/PageHeader";
@@ -19,9 +19,11 @@ import {
   type MeasurementQualityStatistics, type PointSummaryStatistics,
 } from "../../services/measurementService";
 import { createCsvBytes, createExcelBytes } from "../../utils/as200Export";
-import { buildReportTables, formatDecimal, isBusinessPoint } from "../../utils/as200Report";
+import { buildReportTables, formatDecimal, formatLoadKg, isBusinessPoint } from "../../utils/as200Report";
 import { formatReportTime, reportDateBoundary, REPORT_TIME_ZONE, vietnamNow } from "../../utils/reportTime";
-import { halfHourWindow } from "../../utils/reportBuckets";
+import { groupedReportWindow } from "../../utils/reportBuckets";
+import { measurementSettings } from "../../config/measurementSettings";
+import { bendDomain, bendIntervalZone } from "../../utils/bendChart";
 import "./Reports.css";
 
 type ResultFilter = "OK" | "NG" | "UNMEASURED" | undefined;
@@ -31,21 +33,21 @@ const numeric = (value: string | null) => value == null || !Number.isFinite(Numb
   ? "—" : Number(value).toLocaleString("vi-VN", { maximumSignificantDigits: 9 });
 
 const pointColumns: ColumnsType<PointSummaryStatistics> = [
-  { title: "Điểm đo", width: 165, render: (_, point) => `${point.station} · P${point.pointNumber} (${formatDecimal(point.position)} mm)` },
-  { title: "Lực đè TB (g)", dataIndex: "loadAvg", render: numeric, align: "right" },
+  { title: "Điểm đo", width: 145, render: (_, point) => `${point.station} · P${point.pointNumber} (${formatDecimal(point.position)} mm)` },
+  { title: "Lực đè TB (kg)", dataIndex: "loadAvg", width: 120, render: formatLoadKg, align: "right" },
   { title: "K/c đẩy TB (mm)", dataIndex: "pushDistAvg", render: numeric, align: "right" },
   { title: "Độ cong Min (mm)", dataIndex: "bendMin", render: numeric, align: "right" },
   { title: "Độ cong TB (mm)", dataIndex: "bendAvg", render: numeric, align: "right" },
   { title: "Độ cong Max (mm)", dataIndex: "bendMax", render: numeric, align: "right" },
-  { title: "Đo lại", dataIndex: "retested", width: 65, align: "right" },
-  { title: "NG", dataIndex: "ng", width: 55, align: "right", className: "reports-point-ng" },
+  { title: "Đo lại", dataIndex: "retested", width: 90, align: "center" },
+  { title: "NG", dataIndex: "ng", width: 80, align: "center", className: "reports-point-ng" },
 ];
 const columns: ColumnsType<BackendMeasurement> = [
   { title: "Thời gian nhận", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
   { title: "SKU", dataIndex: "productCode", width: 150 },
   { title: "Số gậy", dataIndex: "clubNumber", width: 80 },
-  { title: "BUTT Load (g)", dataIndex: "buttLoad", render: formatDecimal, width: 125 },
-  { title: "TIP Load (g)", dataIndex: "tipLoad", render: formatDecimal, width: 125 },
+  { title: "BUTT Load (kg)", dataIndex: "buttLoad", render: formatLoadKg, width: 125 },
+  { title: "TIP Load (kg)", dataIndex: "tipLoad", render: formatLoadKg, width: 125 },
   ...([ ["Butt", "buttResult"], ["Tip", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
     title, dataIndex, width: 90, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />,
   })),
@@ -81,9 +83,11 @@ function Reports() {
   const records = list?.key === listKey ? list.items : [];
   const total = list?.key === listKey ? list.total : 0;
   const [chartWindow, setChartWindow] = useState<{ key: string; page: number }>();
-  const buckets = useMemo(() => halfHourWindow(quality?.halfHour, query.filters.measuredFrom, query.filters.measuredTo,
-    chartWindow?.key === filterKey ? chartWindow.page : undefined), [quality?.halfHour, query.filters, chartWindow, filterKey]);
+  const buckets = useMemo(() => groupedReportWindow(quality?.halfHour, query.filters.measuredFrom, query.filters.measuredTo,
+    chartWindow?.key === filterKey ? chartWindow.page : undefined),
+  [quality?.halfHour, query.filters.measuredFrom, query.filters.measuredTo, chartWindow, filterKey]);
   const halfHour = buckets.items;
+  const bucketTitle = buckets.grouping === "halfHour" ? "30 phút" : buckets.grouping === "day" ? "ngày" : "tuần";
   const [loading, setLoading] = useState(true);
   const [listLoading, setListLoading] = useState(true);
   const [error, setError] = useState("");
@@ -173,7 +177,8 @@ function Reports() {
     finally { setExporting(false); }
   };
 
-  const { mostNg, daily, topNg, demoLimits, demoCpk, histogram, pointSummary } = useMemo(() => {
+  const bendSettings = measurementSettings.BUTT;
+  const { mostNg, daily, topNg, cpk, histogram, histogramDomain, pointSummary } = useMemo(() => {
     const points = (quality?.points ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber));
     // Each measurement belongs to one SKU/position at a given station/point.
     // Combine SKU/position groups by station/point; each record contributes once per point.
@@ -198,25 +203,24 @@ function Reports() {
       return { station, pointNumber, ng, rate, position, positionLabel: positions.length > 1 ? `${positions.length} vị trí` : `${position} mm`,
         label: `${station} · P${pointNumber}`, annotation: `${ng} (${rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%)` };
     }).sort((a, b) => b.ng - a.ng) : [];
-    const demoLimits = quality?.demoLimits;
-    const demoCpk = (() => {
+    const cpk = (() => {
       const summary = quality?.buttSummary;
-      if (!demoLimits || !summary || summary.count < 2 || summary.mean == null || summary.stddev == null) return null;
-      const lower = Number(demoLimits.lower), upper = Number(demoLimits.upper);
+      const lower = bendSettings.bendLowerMm, upper = bendSettings.bendUpperMm;
+      if (lower == null || upper == null || !summary || summary.count < 2 || summary.mean == null || summary.stddev == null) return null;
       const mean = Number(summary.mean), deviation = Number(summary.stddev);
       if (![lower, upper, mean, deviation].every(Number.isFinite) || upper <= lower || deviation <= 0) return null;
       return Math.min((upper - mean) / (3 * deviation), (mean - lower) / (3 * deviation));
     })();
-    const histogram = demoLimits ? (quality?.demoHistogram ?? []).map(bin => ({ ...bin, midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
-      label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
-      bounds: `${bin.lowerInclusive ? "[" : "("}${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${bin.upperInclusive ? "]" : ")"} mm`,
-    })) : quality?.buttHistogram?.map((bin, index) => ({ ...bin, zone: "UNKNOWN", midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
+    const histogram = quality?.buttHistogram?.map((bin, index) => ({ ...bin,
+      zone: bendIntervalZone(Number(bin.lower), Number(bin.upper), index === quality.buttHistogram.length - 1, bendSettings),
+      midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
       label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
       bounds: `[${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${index === quality.buttHistogram.length - 1 ? "]" : ")"} mm`,
     })) ?? [];
+    const histogramDomain = bendDomain(histogram.flatMap(bin => [Number(bin.lower), Number(bin.upper)]), bendSettings);
     const pointSummary = (quality?.pointSummary ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber));
-    return { mostNg, daily, topNg, demoLimits, demoCpk, histogram, pointSummary };
-  }, [quality, stats]);
+    return { mostNg, daily, topNg, cpk, histogram, histogramDomain, pointSummary };
+  }, [quality, stats, bendSettings]);
   const cards = [
     ["Tổng số gậy", stats?.totalMeasurements, "blue", undefined],
     ["Tổng OK", stats?.totalOk, "green", stats
@@ -283,94 +287,114 @@ function Reports() {
       </Card>
     </div>
     <div className="reports-chart-grid">
-      <Card className="section-card" title="Số lượng OK / NG theo 30 phút">
-        {buckets.pages > 1 && <div style={{ marginBottom: 12 }}>
-          <Pagination size="small" simple current={buckets.current} total={buckets.pages} pageSize={1}
-            onChange={page => setChartWindow({ key: filterKey, page })} />
-          <small>{halfHour[0] && formatReportTime(halfHour[0].at)} – {halfHour.length > 0 && formatReportTime(dayjs(halfHour[halfHour.length - 1].at).add(30, "minute").toISOString())}
-            {" · Cửa sổ tối đa 7 ngày; KPI và xuất báo cáo vẫn dùng toàn bộ bộ lọc."}</small>
+      <Card className="section-card reports-half-hour-card" title={`Số lượng OK / NG theo ${bucketTitle}`}
+        extra={<div className="reports-half-hour-legend" aria-label="Chú giải kết quả">
+          <span><i className="reports-half-hour-ok" />OK</span><span><i className="reports-half-hour-ng" />NG</span>
+        </div>}>
+        {halfHour.length > 0 && <div className="reports-half-hour-window">
+          <small>{dayjs(halfHour[0].from).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")} – {dayjs(halfHour[halfHour.length - 1].to).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")}</small>
+          {buckets.pages > 1 && <Pagination size="small" simple current={buckets.current} total={buckets.pages} pageSize={1}
+            onChange={page => setChartWindow({ key: filterKey, page })} />}
         </div>}
-        {halfHour.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart key={`${filterKey}-${buckets.current}`} data={halfHour}>
+        {halfHour.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart key={`${filterKey}-${buckets.current}`} data={halfHour}
+          barSize={32} barCategoryGap="18%" margin={{ top: 26, right: 12, bottom: 4, left: 0 }}>
           <CartesianGrid vertical={false} stroke="#edf2f7" />
-          <XAxis dataKey="at" tick={{ fontSize: 13 }} minTickGap={32} interval="preserveStartEnd"
-            tickFormatter={value => dayjs(value).tz(REPORT_TIME_ZONE).format("DD/MM HH:mm")} />
-          <YAxis allowDecimals={false} width={45} />
-          <Tooltip labelFormatter={value => `${dayjs(String(value)).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")}–${dayjs(String(value)).tz(REPORT_TIME_ZONE).add(30, "minute").format("HH:mm")}`} />
-          <Legend /><Bar isAnimationActive={false} dataKey="ok" stackId="quality" name="OK (gậy)" fill="#23844b" />
-          <Bar isAnimationActive={false} dataKey="ng" stackId="quality" name="NG (gậy)" fill="#cf3c48" />
-          {halfHour.length > 96 && <Brush dataKey="at" height={22} startIndex={Math.max(0, halfHour.length - 96)} endIndex={halfHour.length - 1}
-            tickFormatter={value => dayjs(value).tz(REPORT_TIME_ZONE).format("DD/MM HH:mm")} />}
+          <XAxis type="category" dataKey="at" tick={{ fontSize: 12 }} tickLine={false} interval={0}
+            tickFormatter={value => dayjs(value).tz(REPORT_TIME_ZONE).format(buckets.grouping === "halfHour" ? "HH:mm" : "DD/MM")} />
+          <YAxis domain={[0, "auto"]} allowDecimals={false} width={40} tickLine={false} axisLine={false} />
+          <Tooltip cursor={{ fill: "#f1f5f9" }} content={({ active, payload }) => {
+            const bucket = payload?.[0]?.payload;
+            return active && bucket ? <div className="report-tooltip">
+              <b>{dayjs(bucket.from).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")} – {dayjs(bucket.to).tz(REPORT_TIME_ZONE).format("DD/MM/YYYY HH:mm")}</b>
+              <div style={{ color: "#15803D" }}>OK: {bucket.ok}</div>
+              <div style={{ color: "#B91C1C" }}>NG: {bucket.ng}</div>
+              <div>Tổng: {bucket.ok + bucket.ng} gậy</div>
+            </div> : null;
+          }} />
+          <Bar isAnimationActive={false} dataKey="ok" stackId="quality" name="OK" fill="#15803D" maxBarSize={40} />
+          <Bar isAnimationActive={false} dataKey="ng" stackId="quality" name="NG" fill="#B91C1C" maxBarSize={40}>
+            <LabelList dataKey="ng" position="top" fill="#B91C1C" fontSize={12} fontWeight={600}
+              formatter={value => typeof value === "number" && value > 0 ? value.toLocaleString("vi-VN") : ""} />
+          </Bar>
         </BarChart></ResponsiveContainer></div> : empty}
       </Card>
       <Card className="section-card" title="NG theo công đoạn / điểm đo">
-        {topNg.length ? <div className="report-chart report-ng-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={topNg} layout="vertical" margin={{ left: 0, right: 80 }}>
-          <CartesianGrid horizontal={false} stroke="#edf2f7" /><XAxis type="number" allowDecimals={false} />
-          <YAxis type="category" dataKey="label" width={108} interval={0} tick={({ x, y, payload }) => {
-            const point = topNg.find(item => item.label === payload.value);
-            return point ? <text x={Number(x) - 4} y={Number(y)} textAnchor="end" fill="#526b83" fontSize={13}>
-              <tspan x={Number(x) - 4} dy={-5}>{point.label}</tspan>
-              <tspan x={Number(x) - 4} dy={16}>{point.positionLabel}</tspan>
-            </text> : <g />;
-          }} />
-          <Tooltip content={({ active, payload }) => {
-            const point = payload?.[0]?.payload;
-            return active && point ? <div className="report-tooltip"><b>{point.label}</b>
-              <div>Vị trí: {point.position} mm</div><div>{point.ng} gậy NG</div>
-              <div>{point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}% tổng gậy trong bộ lọc ({stats?.totalMeasurements.toLocaleString("vi-VN")} gậy)</div>
-            </div> : null;
-          }} />
-          <Bar isAnimationActive={false} dataKey="ng" name="Số gậy NG" fill="#cf3c48"><LabelList dataKey="annotation" position="right" fontSize={13} fill="#526b83" /></Bar>
-        </BarChart></ResponsiveContainer></div> : empty}
-        {topNg.length > 0 && <small className="report-distribution-summary">Tỷ lệ trên tổng số gậy trong bộ lọc; một gậy có thể NG tại nhiều điểm.</small>}
+        {topNg.length ? <div className="report-ng-progress-list">
+          {topNg.map(point => <div className="report-ng-progress-row" key={point.label}>
+            <span className="report-ng-progress-label">{point.label}</span>
+            <div className="report-ng-progress-track" role="meter" aria-label={`Số gậy NG tại ${point.label}`}
+              aria-valuemin={0} aria-valuemax={Math.max(1, topNg[0].ng)} aria-valuenow={point.ng}
+              aria-valuetext={`${point.ng} gậy NG · ${point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%`}>
+              <div className="report-ng-progress-fill" style={{
+                width: `${topNg[0].ng > 0 ? 100 * point.ng / topNg[0].ng : 0}%`,
+                backgroundColor: point.station === "BUTT" ? "#2878D0" : "#F0642C",
+              }} />
+            </div>
+            <span className="report-ng-progress-value">{point.ng.toLocaleString("vi-VN")} · {point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%</span>
+          </div>)}
+        </div> : empty}
       </Card>
       <Card className="section-card" title="Tỷ lệ OK theo ngày">
-        {daily.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={daily}>
-          <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="date" tick={{ fontSize: 13 }} tickFormatter={value => dayjs(value).format("DD/MM")} /><YAxis domain={[0, 100]} unit="%" width={50} />
+        {daily.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={daily} margin={{ top: 26, right: 24, bottom: 4, left: 8 }}>
+          <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="date" tick={{ fontSize: 13 }} tickFormatter={value => dayjs(value).format("DD/MM")} />
+          <YAxis domain={[75, 100]} ticks={[75, 80, 85, 90, 95, 100]} interval={0} allowDataOverflow
+            tickFormatter={value => `${value}%`} width={50} />
+          <ReferenceLine y={95} stroke="#94a3b8" strokeDasharray="5 4"
+            label={{ value: "Mục tiêu 95%", position: "insideTopRight", fill: "#64748b", fontSize: 12 }} />
           <Tooltip content={({ active, payload }) => {
             const entry = payload?.[0]?.payload;
             return active && entry ? <div className="report-tooltip"><b>{entry.date}</b><div>Tổng: {entry.total} · OK: {entry.ok} · NG: {entry.ng}</div><div>Tỷ lệ OK: {entry.rate?.toLocaleString("vi-VN", { maximumFractionDigits: 2 })}%</div></div> : null;
           }} />
-          <Line dataKey="rate" name="Tỷ lệ OK" stroke="#1769aa" strokeWidth={2} dot={daily.length < 40} isAnimationActive={false} />
+          <Line dataKey="rate" name="Tỷ lệ OK" stroke="#1769aa" strokeWidth={2} isAnimationActive={false}
+            dot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null ? <g />
+              : <circle cx={cx} cy={cy} r={4} fill={payload.rate < 95 ? "#B91C1C" : "#1769aa"} stroke="white" strokeWidth={1.5} />}
+            activeDot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null ? <g />
+              : <circle cx={cx} cy={cy} r={6} fill={payload.rate < 95 ? "#B91C1C" : "#1769aa"} stroke="white" strokeWidth={2} />}>
+            <LabelList dataKey="rate" content={({ x, y, value }) => typeof value !== "number" || x == null || y == null ? <g />
+              : <text x={Number(x)} y={Number(y) - 10} textAnchor="middle" fontSize={12} fontWeight={600}
+                fill={value < 95 ? "#B91C1C" : "#1769aa"}>
+                {value.toLocaleString("vi-VN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+              </text>} />
+          </Line>
         </LineChart></ResponsiveContainer></div> : empty}
       </Card>
     </div>
     <div className="reports-detail-grid">
       <Card className="section-card" title="Phân bố độ cong BUTT (tất cả điểm)">
         {histogram.length ? <>
-          <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={histogram}>
+          <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={histogram} margin={{ top: 12, right: 16, bottom: 8, left: 20 }}>
             <CartesianGrid vertical={false} stroke="#edf2f7" />
-            {demoLimits ? <XAxis type="number" dataKey="midpoint" domain={["auto", "auto"]} tick={{ fontSize: 13 }}
+            <XAxis type="number" dataKey="midpoint" domain={histogramDomain} tick={{ fontSize: 13 }}
               tickFormatter={value => Number(value).toLocaleString("vi-VN", { maximumFractionDigits: 2 })}
               label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />
-              : <XAxis dataKey="label" tick={{ fontSize: 13 }} interval="preserveStartEnd" label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />}
-            <YAxis allowDecimals={false} width={65} label={{ value: "Số phép đo", angle: -90, position: "insideLeft" }} />
-            {demoLimits && <>
-              <ReferenceLine x={Number(demoLimits.lower)} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
-                label={{ value: "0,00 (DEMO)", position: "insideTopRight", fontSize: 13 }} />
-              <ReferenceLine x={Number(demoLimits.upper)} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
-                label={{ value: "2,00 (DEMO)", position: "insideTopLeft", fontSize: 13 }} />
-            </>}
+            <YAxis allowDecimals={false} width={90} tickMargin={8}
+              label={{ value: "Số phép đo", angle: -90, position: "insideLeft", offset: 10, textAnchor: "middle", fontSize: 13 }} />
+            {bendSettings.bendLowerMm != null && <ReferenceLine x={bendSettings.bendLowerMm} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
+              label={{ value: `${formatDecimal(String(bendSettings.bendLowerMm))} mm`, position: "insideTopRight", fontSize: 13 }} />}
+            {bendSettings.bendUpperMm != null && <ReferenceLine x={bendSettings.bendUpperMm} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
+              label={{ value: `${formatDecimal(String(bendSettings.bendUpperMm))} mm`, position: "insideTopLeft", fontSize: 13 }} />}
             <Tooltip content={({ active, payload }) => {
               const bin = payload?.[0]?.payload;
               return active && bin ? <div className="report-tooltip"><b>{bin.bounds}</b><div>{bin.count} phép đo</div>
-                <div>{!demoLimits ? "Chưa có giới hạn được xác minh" : bin.zone === "WITHIN" ? "Trong giới hạn DEMO" : "Vượt giới hạn DEMO"}</div>
+                <div>Giới hạn: {formatDecimal(bendSettings.bendLowerMm?.toString())} – {formatDecimal(bendSettings.bendUpperMm?.toString())} mm</div>
+                <div>{bin.zone === "WITHIN" ? "Trong giới hạn" : bin.zone === "MIXED" ? "Nhóm giao giới hạn; không xác định số mẫu vượt từ dữ liệu tổng hợp"
+                  : bin.zone === "UNKNOWN" ? "Chưa có giới hạn" : "Vượt giới hạn"}</div>
               </div> : null;
             }} />
             <Bar isAnimationActive={false} dataKey="count" name="Số phép đo" fill="#3987c9" maxBarSize={40}>
-              {histogram.map((bin, index) => <Cell key={index} fill={demoLimits && bin.zone !== "WITHIN" ? "#cf3c48" : "#3987c9"} />)}
+              {histogram.map((bin, index) => <Cell key={index} fill={bin.zone === "BELOW" || bin.zone === "ABOVE" ? "#cf3c48" : bin.zone === "MIXED" ? "#d99222" : "#3987c9"} />)}
             </Bar>
           </BarChart></ResponsiveContainer></div>
           {quality?.buttSummary && <small className="report-distribution-summary">
             Trung bình: {numeric(quality.buttSummary.mean)} mm · Độ lệch chuẩn mẫu: {numeric(quality.buttSummary.stddev)} mm
-            {demoLimits ? " · Giới hạn DEMO 0,00–2,00 mm" : ""}
-            {demoLimits ? ` · Cpk DEMO: ${demoCpk == null ? "—" : demoCpk.toLocaleString("vi-VN", { maximumFractionDigits: 3 })}` : ""}
+            {` · Cpk tham chiếu: ${cpk == null ? "—" : cpk.toLocaleString("vi-VN", { maximumFractionDigits: 3 })}`}
           </small>}
         </> : empty}
       </Card>
     <Card className="section-card" title="Tổng hợp theo điểm đo">
       <Table<PointSummaryStatistics> key={JSON.stringify(query.filters)} className="reports-point-summary" tableLayout="fixed"
         rowKey={point => JSON.stringify([point.station, point.pointNumber, point.position])}
-        columns={pointColumns} dataSource={pointSummary} loading={loading} size="small" scroll={{ x: 680 }}
+        columns={pointColumns} dataSource={pointSummary} loading={loading} size="small" scroll={{ x: 1080 }}
         pagination={{ pageSize: 10, showSizeChanger: false, showTotal: value => `${value} nhóm điểm đo` }} locale={{ emptyText: empty }} />
     </Card>
     </div>

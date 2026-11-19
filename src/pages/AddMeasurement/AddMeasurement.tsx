@@ -1,5 +1,5 @@
 import { formatReportTime } from "../../utils/reportTime";
-import { formatDecimal } from "../../utils/as200Report";
+import { formatLoadKg } from "../../utils/as200Report";
 import {
   Alert,
   Button,
@@ -541,7 +541,7 @@ function AddMeasurement() {
       <Card className="section-card add-measurement-results">
         <div className="monitor-current-heading">
           <h2>Gậy vừa kiểm tra · {displayed ? `#${displayed.clubNumber}` : "Chưa có dữ liệu"}</h2>
-          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt {formatDecimal(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} g / Tip {formatDecimal(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} g</span>
+          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} kg / Tip {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} kg</span>
         </div>
         <div className="add-measurement-result-grid">
           {(["BUTT", "TIP", "OVERALL"] as const).map((station) => {

@@ -1,7 +1,7 @@
 .reports-page { width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
 .reports-page .section-card, .reports-page .page-heading { margin-bottom: 0; }
 .reports-page .ant-card-head-title { font-size: 18px; font-weight: 600; white-space: normal; }
-.reports-page .ant-card-head { padding: 0 18px; }
+.reports-page .ant-card-head { padding: 0 18px; border-bottom: 0; }
 .reports-page .ant-card-body { padding: 18px; }
 .reports-filter-card .ant-card-body { padding: 14px 18px; }
 .reports-filter-row { display: grid; grid-template-columns: auto minmax(135px, 1fr) minmax(135px, 1fr) minmax(160px, 1.4fr) minmax(100px, .8fr); gap: 12px; align-items: end; }
@@ -35,7 +35,19 @@
 .reports-chart-grid > .ant-card, .reports-detail-grid > .ant-card { min-width: 0; }
 .reports-chart-grid .ant-card-head { min-height: 76px; }
 .report-chart { height: 290px; min-width: 0; margin-top: 12px; font-size: 13px; }
-.report-ng-chart { height: 336px; }
+.report-ng-progress-list { display: flex; flex-direction: column; justify-content: center; gap: 24px; min-height: 290px; padding: 12px 0; }
+.report-ng-progress-row { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; align-items: center; gap: 12px; }
+.report-ng-progress-label { min-width: 70px; font-size: 13px; font-weight: 500; color: #334e68; white-space: nowrap; }
+.report-ng-progress-track { height: 12px; background: #edf2f7; border-radius: 4px; overflow: hidden; }
+.report-ng-progress-fill { height: 100%; border-radius: inherit; }
+.report-ng-progress-value { min-width: 76px; text-align: right; font-size: 13px; color: #526b83; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.reports-half-hour-card .ant-card-head-wrapper { gap: 12px; }
+.reports-half-hour-legend { display: flex; gap: 12px; align-items: center; font-size: 12px; color: #526b83; }
+.reports-half-hour-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.reports-half-hour-legend i { width: 10px; height: 10px; border-radius: 2px; }
+.reports-half-hour-ok { background: #15803D; }
+.reports-half-hour-ng { background: #B91C1C; }
+.reports-half-hour-window { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: #526b83; }
 .reports-stations { display: flex; gap: 8px; flex-wrap: wrap; }
 .reports-stations > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; flex: 1; padding: 8px; background: #f5f8fb; border-radius: 8px; font-size: 13px; }
 .reports-stations b { color: #334e68; }
@@ -44,6 +56,7 @@
 .reports-page .ant-table-cell { padding: 12px 10px; font-size: 14px; overflow-wrap: anywhere; }
 .reports-page .ant-table-thead .ant-table-cell { font-weight: 600; }
 .reports-page .reports-point-summary .ant-table-cell { padding: 12px 8px; }
+.reports-page .reports-point-summary .ant-table-thead .ant-table-cell { white-space: nowrap; overflow-wrap: normal; }
 .reports-page .reports-point-summary .reports-point-ng { color: #cf3c48; font-weight: 600; }
 .reports-page .ant-empty { margin: 28px 0; }
 .reports-page .ant-table-wrapper { min-width: 0; }

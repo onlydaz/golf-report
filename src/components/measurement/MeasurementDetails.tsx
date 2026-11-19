@@ -7,7 +7,7 @@ import type {
   MeasurementResult,
 } from "../../services/measurementService";
 
-import { displayPointResult, formatDecimal, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
+import { displayPointResult, formatDecimal, formatLoadKg, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
 
 export function ResultTag({
   result,
@@ -116,8 +116,8 @@ export default function MeasurementDetails({
                   items={[
                     {
                       key: "load",
-                      label: "Khối lượng đè (g)",
-                      children: formatDecimal(station.load),
+                      label: "Khối lượng đè (kg)",
+                      children: formatLoadKg(station.load),
                     },
                     {
                       key: "result",

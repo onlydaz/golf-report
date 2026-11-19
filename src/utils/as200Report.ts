@@ -49,6 +49,24 @@ export function formatDecimal(value: string | null | undefined): string {
   );
 }
 
+/** Convert stored grams at the presentation boundary, preserving decimal precision. */
+export function gramsToKilograms(value: string | number | null | undefined): string | null {
+  if (value == null) return null;
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(String(value));
+  if (!match) return null;
+  const [, sign, whole, fraction = "", exponent = "0"] = match;
+  const digits = whole + fraction;
+  const decimalAt = whole.length + Number(exponent) - 3;
+  if (!Number.isSafeInteger(decimalAt) || Math.abs(decimalAt) > 10000) return null;
+  const shifted = decimalAt <= 0 ? `0.${"0".repeat(-decimalAt)}${digits}`
+    : decimalAt >= digits.length ? digits + "0".repeat(decimalAt - digits.length)
+      : `${digits.slice(0, decimalAt)}.${digits.slice(decimalAt)}`;
+  const normalized = shifted.replace(/^0+(?=\d)/, "").replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  return `${sign === "-" && normalized !== "0" ? "-" : ""}${normalized}`;
+}
+
+export const formatLoadKg = (value: string | number | null | undefined): string => formatDecimal(gramsToKilograms(value));
+
 export function buildReportTables(records: MeasurementDetail[]) {
   const measurements = records.map(item => ({
     "Measurement ID": item.id,
@@ -59,9 +77,9 @@ export function buildReportTables(records: MeasurementDetail[]) {
     TotalCount: item.totalCount ?? "",
     OverallResult: item.overallResult,
     "TIP Result": item.tipResult ?? "",
-    "TIP Load (g)": item.tipLoad ?? "",
+    "TIP Load (kg)": gramsToKilograms(item.tipLoad) ?? "",
     "BUTT Result": item.buttResult ?? "",
-    "BUTT Load (g)": item.buttLoad ?? "",
+    "BUTT Load (kg)": gramsToKilograms(item.buttLoad) ?? "",
   }));
 
   const points = records.flatMap(item =>
