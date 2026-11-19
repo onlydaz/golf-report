@@ -1,6 +1,6 @@
 import { ApiOutlined, CheckCircleOutlined } from "@ant-design/icons";
 import { Alert, Button, Card, Form, Input, Popconfirm } from "antd";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import PageHeader from "../../components/PageHeader";
 import { usePlcMonitor } from "../../hooks/usePlcMonitor";
 import { formatReportTime } from "../../utils/reportTime";
@@ -28,7 +28,7 @@ export default function ConnectionSettings() {
   }, [connectionRunning, worker?.connectedAt]);
   const inFlight = useRef(false);
   const mounted = useRef(true);
-  useEffect(() => { if (settings) form.setFieldsValue(settings.endpoint); }, [form, settings]);
+  useEffect(() => { if (settings) form.setFieldsValue(settings.endpoint); }, [form, settings?.endpoint.ip, settings?.endpoint.port, settings?.endpoint.unitId]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
@@ -90,8 +90,8 @@ export default function ConnectionSettings() {
   ] as const;
   const ackUncertain = ["FAILED", "RECONCILIATION_REQUIRED"].includes(worker?.ackStatus ?? "");
   const logKey = (event: { at: string; message: string }) => JSON.stringify([event.at, event.message]);
-  const events = [...(worker?.connectionEvents ?? [])].reverse()
-    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const events = useMemo(() => [...(worker?.connectionEvents ?? [])].reverse()
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at)), [worker?.connectionEvents]);
   const clearLog = async () => {
     if (clearingLog) return;
     setClearingLog(true); setLogError("");

@@ -1,4 +1,4 @@
-import { useOutletContext } from "react-router-dom";
+import { createContext, useContext } from "react";
 import type { As200Status } from "../services/as200Service";
 import type { PlcConnectionSettings } from "../services/plcConnectionService";
 
@@ -10,8 +10,19 @@ export interface PlcMonitorContext {
   refresh: () => Promise<As200Status>;
 }
 
-// MainLayout owns the existing status polling loop. Pages and headings share it.
-export const usePlcMonitor = () => useOutletContext<PlcMonitorContext>();
+export const PlcStatusContext = createContext<Pick<PlcMonitorContext, "status" | "error">>({ status: undefined, error: "" });
+export const PlcSettingsContext = createContext<PlcConnectionSettings | undefined>(undefined);
+export const DatabaseConnectedContext = createContext(false);
+export const MeasurementCommitContext = createContext<number | null>(null);
+export const PlcRefreshContext = createContext<PlcMonitorContext["refresh"]>(async () => { throw new Error("PLC monitor is not mounted"); });
+export const useDatabaseConnected = () => useContext(DatabaseConnectedContext);
+export const useMeasurementCommit = () => useContext(MeasurementCommitContext);
+
+// Full status is used only by live PLC consumers. Data pages subscribe to primitives above.
+export const usePlcMonitor = (): PlcMonitorContext => ({
+  ...useContext(PlcStatusContext), settings: useContext(PlcSettingsContext),
+  databaseConnected: useDatabaseConnected(), refresh: useContext(PlcRefreshContext),
+});
 
 export function getMeasurementAvailabilityNotice(status: As200Status | undefined): string | undefined {
   return status?.state === "RAW_UNDECODED"

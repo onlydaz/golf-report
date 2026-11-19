@@ -1,6 +1,5 @@
 use golf_report_lib::database::{config::load_config, migrations};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use std::str::FromStr;
+use sqlx::postgres::PgPoolOptions;
 async fn run() -> Result<(), String> {
     let mut target = None;
     let mut apply = false;
@@ -24,25 +23,16 @@ async fn run() -> Result<(), String> {
     if apply && target.is_none() {
         return Err("--migrate bắt buộc chỉ định --database rõ ràng".into());
     }
-    let settings = load_config()?;
-    let name = target.as_deref().unwrap_or(&settings.database);
+    let mut settings = load_config()?;
     if target.is_some() && settings.connection_string.is_some() {
         return Err("--database không được dùng với connection_string; chọn database trong connection string.".into());
     }
-    let cloud = settings.connection_string.is_some();
-    let options = if let Some(connection_string) = settings.connection_string.as_deref() {
-        PgConnectOptions::from_str(connection_string)
-            .map_err(|_| "Connection string PostgreSQL không hợp lệ.".to_string())?
-            .ssl_mode(PgSslMode::VerifyFull)
-    } else {
-        PgConnectOptions::new()
-            .host(&settings.host)
-            .port(settings.port)
-            .database(name)
-            .username(&settings.username)
-            .password(&settings.password)
-    };
-    let options = if checksums || (cloud && !apply) {
+    if let Some(name) = target {
+        settings.database = name;
+    }
+    let options = settings.connect_options()?;
+    let endpoint = format!("{}:{}", options.get_host(), options.get_port());
+    let options = if !apply {
         options.options([("default_transaction_read_only", "on")])
     } else {
         options
@@ -54,7 +44,9 @@ async fn run() -> Result<(), String> {
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect_with(options)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            golf_report_lib::database::connection::connection_error(&error, &endpoint)
+        })?;
     let (database, schema, search_path, read_only, create_public):
         (String, Option<String>, String, String, bool) = sqlx::query_as(
         "SELECT current_database()::text, current_schema()::text, current_setting('search_path'), \

@@ -1,6 +1,7 @@
 ﻿import { Alert, Button, Card, Empty, Select, Spin, Table } from "antd";
 import { useNavigate } from "react-router-dom";
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
+import type { ColumnsType } from "antd/es/table";
 import type { ReactNode } from "react";
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ResultTag } from "../../components/measurement/MeasurementDetails";
@@ -14,7 +15,7 @@ import { bendDomain, bendExcess } from "../../utils/bendChart";
 export function ProductionSummary({ productCode, statistics, loading, skuEditor }: {
   productCode?: string; statistics?: MeasurementStatistics; loading: boolean; skuEditor?: ReactNode;
 }) {
-  const count = (value: number | undefined) => loading && productCode ? <Spin size="small" /> : value?.toLocaleString("vi-VN") ?? "—";
+  const count = (value: number | undefined) => loading && productCode && value === undefined ? <Spin size="small" /> : value?.toLocaleString("vi-VN") ?? "—";
   return <>
     <Card className="section-card monitor-sku">
       <div className="monitor-kicker">SKU đang chạy</div>
@@ -93,12 +94,12 @@ export function BendDot({ cx, cy, value, color, settings }: {
     fill={exceeded ? "white" : color} stroke={exceeded ? "#d92d20" : color} strokeWidth={exceeded ? 2 : 1} />;
 }
 
-export function BendComparison({ records, productCode, loading, error }: {
+export const BendComparison = memo(function BendComparison({ records, productCode, loading, error }: {
   records: MeasurementHistoryItem[]; productCode?: string; loading: boolean; error: string;
 }) {
   const [station, setStation] = useState<"BUTT" | "TIP">("BUTT");
   const settings = measurementSettings[station];
-  const series = buildBendSeries(records, productCode, station);
+  const series = useMemo(() => buildBendSeries(records, productCode, station), [records, productCode, station]);
   const limits = settings?.bendLowerMm != null || settings?.bendUpperMm != null;
   const limitText = bendLimitText(settings);
   const keys = ["p1", "p2", "p3", "p4"] as const;
@@ -155,18 +156,17 @@ export function BendComparison({ records, productCode, loading, error }: {
     </Spin>
     <div className="monitor-chart-axis"><span>Gậy cũ hơn</span><span>Thứ tự gậy →</span><span>Gậy mới nhất</span></div>
   </Card>;
-}
+});
 
-export function CurrentPointTable({ detail, loading }: { detail?: MeasurementDetail; loading: boolean }) {
-  const rows = (["BUTT", "TIP"] as const).flatMap(type => detail?.stations.filter(station => station.stationType === type).flatMap(station =>
+export const CurrentPointTable = memo(function CurrentPointTable({ detail, loading }: { detail?: MeasurementDetail; loading: boolean }) {
+  const rows = useMemo(() => (["BUTT", "TIP"] as const).flatMap(type => detail?.stations.filter(station => station.stationType === type).flatMap(station =>
     station.points.filter(point => isBusinessPoint(type, point.pointNumber)).sort((a, b) => a.pointNumber - b.pointNumber).map(point => {
       const decision = point.attempts.find(attempt => attempt.attemptNumber === point.decideAttempt);
       return { ...point, result: displayPointResult(station, point), key: `${type}-${point.id}`, station: type, load: isUnmeasuredPoint(point) ? null : station.load,
         pushDist: decision?.pushDist, bend: decision?.bend };
     })
-  ) ?? []);
-  return <Table className="monitor-point-table" size="small" rowKey="key" dataSource={rows} loading={loading} pagination={false} tableLayout="fixed"
-    locale={{ emptyText: "Chưa có chi tiết đo đã lưu của gậy này." }} columns={[
+  ) ?? []), [detail]);
+  const columns = useMemo<ColumnsType<(typeof rows)[number]>>(() => [
       { title: "Trạm / Điểm", render: (_, row) => `${row.station} · P${row.pointNumber}` },
       { title: "Vị trí (mm)", render: (_, row) => formatDecimal(isUnmeasuredPoint(row) ? null : row.position), width: "13%" },
       { title: "Lực đo (g)", dataIndex: "load", render: formatDecimal, width: "13%" },
@@ -174,16 +174,23 @@ export function CurrentPointTable({ detail, loading }: { detail?: MeasurementDet
       { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: "14%" },
       { title: <span className="monitor-attempt-heading">Số<br />lần đo</span>, dataIndex: "attemptCount", align: "center", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 54 },
       { title: "Kết quả", dataIndex: "result", render: result => <ResultTag result={result} qcLabels />, width: "13%" },
-    ]} />;
-}
+  ], []);
+  return <Table className="monitor-point-table" size="small" rowKey="key" dataSource={rows} loading={loading} pagination={false} tableLayout="fixed"
+    locale={{ emptyText: "Chưa có chi tiết đo đã lưu của gậy này." }} columns={columns} />;
+});
 
-export function RecentMeasurements({ records, loading, error, onRefresh, page, total, onPageChange }: {
+export const RecentMeasurements = memo(function RecentMeasurements({ records, loading, error, onRefresh, page, total, onPageChange }: {
   records: MeasurementHistoryItem[]; loading: boolean; error: string; onRefresh: () => void;
   page: number; total: number; onPageChange: (page: number) => void;
 }) {
   const navigate = useNavigate();
-  const bends = (row: MeasurementHistoryItem, type: "BUTT" | "TIP") =>
-    stationPointNumbers(type).map(point => formatDecimal(decisionBend(row, type, point))).join(" / ");
+  const columns = useMemo<ColumnsType<MeasurementHistoryItem>>(() => [
+        { title: "Thời gian", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
+        { title: "Số gậy", dataIndex: "clubNumber", render: value => `#${value}`, width: 80 },
+        { title: "BUTT P1 / P2 / P3 / P4 (mm)", render: (_, row) => stationPointNumbers("BUTT").map(point => formatDecimal(decisionBend(row, "BUTT", point))).join(" / "), width: 260 },
+        { title: <span title="Độ cong TIP P1 tại lượt đo quyết định">TIP (mm)</span>, render: (_, row) => stationPointNumbers("TIP").map(point => formatDecimal(decisionBend(row, "TIP", point))).join(" / "), width: 112 },
+        ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({ title, dataIndex, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />, width: 85 })),
+  ], []);
   return <Card className="section-card monitor-recent" title="Các gậy gần nhất"
     extra={<div className="monitor-recent-actions"><Button type="text" size="small" loading={loading} onClick={onRefresh}>Làm mới</Button><Button type="link" size="small" onClick={() => navigate("/measurements")}>Xem toàn bộ lịch sử →</Button></div>}>
     {error && <Alert type="error" showIcon title={error} className="add-measurement-alert" />}
@@ -191,12 +198,6 @@ export function RecentMeasurements({ records, loading, error, onRefresh, page, t
       pagination={{ current: page, total, pageSize: 6, onChange: onPageChange, hideOnSinglePage: true, showSizeChanger: false }} scroll={{ x: 950 }}
       locale={{ emptyText: "Chưa có kết quả đo đã lưu." }}
       onRow={row => ({ onClick: () => navigate(`/measurements/${row.id}`), style: { cursor: "pointer" } })}
-      columns={[
-        { title: "Thời gian", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
-        { title: "Số gậy", dataIndex: "clubNumber", render: value => `#${value}`, width: 80 },
-        { title: "BUTT P1 / P2 / P3 / P4 (mm)", render: (_, row) => bends(row, "BUTT"), width: 260 },
-        { title: <span title="Độ cong TIP P1 tại lượt đo quyết định">TIP (mm)</span>, render: (_, row) => bends(row, "TIP"), width: 112 },
-        ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({ title, dataIndex, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />, width: 85 })),
-      ]} />
+      columns={columns} />
   </Card>;
-}
+});

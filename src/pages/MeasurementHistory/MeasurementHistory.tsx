@@ -2,11 +2,11 @@ import { EyeOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
 import { Alert, Button, Card, DatePicker, Empty, InputNumber, Select, Spin, Table } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { Dayjs } from "dayjs";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ResultTag } from "../../components/measurement/MeasurementDetails";
 import PageHeader from "../../components/PageHeader";
-import { usePlcMonitor } from "../../hooks/usePlcMonitor";
+import { useDatabaseConnected, useMeasurementCommit } from "../../hooks/usePlcMonitor";
 import {
   getMeasurementHistoryPage, getMeasurementSkus, getMeasurementSkuSummary, getMeasurementStatistics,
   type MeasurementHistoryItem, type MeasurementHistoryPage, type MeasurementListRequest,
@@ -23,7 +23,8 @@ const rate = (ok: number, total: number) => `${(total ? ok * 100 / total : 0).to
 
 function MeasurementHistory() {
   const navigate = useNavigate();
-  const { databaseConnected, status } = usePlcMonitor();
+  const databaseConnected = useDatabaseConnected();
+  const commit = useMeasurementCommit();
   const [draft, setDraft] = useState<Filters>({});
   const [query, setQuery] = useState<{ filters: MeasurementListRequest; page: number }>({ filters: {}, page: 1 });
   const [reload, setReload] = useState(0);
@@ -64,7 +65,7 @@ function MeasurementHistory() {
 
   useEffect(() => {
     let active = true;
-    setSummary(undefined); setSummaryError(""); setSummaryLoading(databaseConnected);
+    setSummaryError(""); setSummaryLoading(databaseConnected);
     if (!databaseConnected) return;
     void getMeasurementSkuSummary({ ...query.filters, page: query.page, pageSize }).then(response => {
       if (!active) return;
@@ -76,24 +77,24 @@ function MeasurementHistory() {
           ? previous.sku : response.items[0]?.productCode;
         return previous.scope === query.filters && sku === previous.sku ? previous : { scope: query.filters, sku, page: 1 };
       });
-    }).catch(() => { if (active) { setSummaryError("Không thể tải tổng hợp SKU. Vui lòng thử tải lại."); setSelection({ scope: query.filters, page: 1 }); } })
+    }).catch(() => { if (active) { setSummaryError("Không thể tải tổng hợp SKU. Vui lòng thử tải lại."); } })
       .finally(() => { if (active) setSummaryLoading(false); });
     return () => { active = false; };
-  }, [query, databaseConnected, status?.lastSavedId, reload]);
+  }, [query, databaseConnected, commit, reload]);
 
   useEffect(() => {
     let active = true;
-    setStatistics(undefined); setStatisticsError(""); setStatisticsLoading(databaseConnected);
+    setStatisticsError(""); setStatisticsLoading(databaseConnected);
     if (!databaseConnected) return;
     void getMeasurementStatistics(query.filters).then(data => { if (active) setStatistics({ scope: query.filters, data }); })
       .catch(() => { if (active) setStatisticsError("Không thể tải thống kê. Vui lòng thử tải lại."); })
       .finally(() => { if (active) setStatisticsLoading(false); });
     return () => { active = false; };
-  }, [query.filters, databaseConnected, status?.lastSavedId, reload]);
+  }, [query.filters, databaseConnected, commit, reload]);
 
   useEffect(() => {
     let active = true;
-    setDetails(undefined); setDetailError(""); setDetailLoading(databaseConnected && selectedSku !== undefined);
+    setDetailError(""); setDetailLoading(databaseConnected && selectedSku !== undefined);
     if (!databaseConnected || selectedSku === undefined) return;
     void getMeasurementHistoryPage({ ...query.filters, productCode: selectedSku, page: selection.page, pageSize }).then(data => {
       if (!active) return;
@@ -103,7 +104,7 @@ function MeasurementHistory() {
     }).catch(() => { if (active) setDetailError("Không thể tải chi tiết gậy. Vui lòng thử tải lại."); })
       .finally(() => { if (active) setDetailLoading(false); });
     return () => { active = false; };
-  }, [query.filters, selection, selectedSku, databaseConnected, status?.lastSavedId, reload]);
+  }, [query.filters, selection, selectedSku, databaseConnected, commit, reload]);
 
   const applyFilters = () => {
     if (draft.from && draft.to && draft.from.isAfter(draft.to, "day")) { setFilterError("Ngày bắt đầu phải trước hoặc bằng ngày kết thúc."); return; }
@@ -121,7 +122,7 @@ function MeasurementHistory() {
     ["Tổng số gậy", stats?.totalMeasurements, "blue"], ["Tổng OK", stats?.totalOk, "green"], ["Tổng NG", stats?.totalNg, "red"],
     ["Tỷ lệ OK", stats ? rate(stats.totalOk, stats.totalMeasurements) : undefined, "green"], ["NG Butt", stats?.buttNg, "red"], ["NG Tip", stats?.tipNg, "red"],
   ] as const;
-  const skuColumns: ColumnsType<MeasurementSkuSummary> = [
+  const skuColumns = useMemo<ColumnsType<MeasurementSkuSummary>>(() => [
     { title: "SKU", dataIndex: "productCode", render: value => value || "Chưa gán SKU", width: 160, fixed: "left" },
     { title: "Gậy đầu tiên", dataIndex: "firstMeasuredAt", render: formatReportTime, width: 180 },
     { title: "Gậy gần nhất", dataIndex: "lastMeasuredAt", render: formatReportTime, width: 180 },
@@ -131,23 +132,25 @@ function MeasurementHistory() {
     { title: "NG BUTT", dataIndex: "buttNg", width: 100, align: "right" },
     { title: "NG TIP", dataIndex: "tipNg", width: 100, align: "right" },
     { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.ok + row.ng), width: 110, align: "right" },
-  ];
-  const stationColumns = (station: "BUTT" | "TIP"): ColumnsType<MeasurementHistoryItem> => [
-    ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
-      render: (_: unknown, row: MeasurementHistoryItem) => formatDecimal(row.decisionPoints.find(point => point.station === station && point.pointNumber === pointNumber)?.bend),
-    })),
-    { title: `Lực ${station} (g)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatDecimal, width: 120, align: "center" },
-  ];
-  const columns: ColumnsType<MeasurementHistoryItem> = [
-    { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, align: "center", render: formatReportTime },
-    { title: "Số gậy", dataIndex: "clubNumber", width: 90, align: "center" },
-    { title: "BUTT", align: "center", children: stationColumns("BUTT") }, { title: "TIP", align: "center", children: stationColumns("TIP") },
-    ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
-      title, dataIndex, width: 90, align: "center" as const,
-      render: (value: MeasurementHistoryItem["buttResult"]) => <ResultTag result={value} />,
-    })),
-    { title: "", key: "action", width: 150, align: "center", render: (_, row) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/measurements/${row.id}`)}>Xem chi tiết</Button> },
-  ];
+  ], []);
+  const columns = useMemo<ColumnsType<MeasurementHistoryItem>>(() => {
+    const stationColumns = (station: "BUTT" | "TIP"): ColumnsType<MeasurementHistoryItem> => [
+      ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
+        render: (_: unknown, row: MeasurementHistoryItem) => formatDecimal(row.decisionPoints.find(point => point.station === station && point.pointNumber === pointNumber)?.bend),
+      })),
+      { title: `Lực ${station} (g)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatDecimal, width: 120, align: "center" },
+    ];
+    return [
+      { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, align: "center", render: formatReportTime },
+      { title: "Số gậy", dataIndex: "clubNumber", width: 90, align: "center" },
+      { title: "BUTT", align: "center", children: stationColumns("BUTT") }, { title: "TIP", align: "center", children: stationColumns("TIP") },
+      ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
+        title, dataIndex, width: 90, align: "center" as const,
+        render: (value: MeasurementHistoryItem["buttResult"]) => <ResultTag result={value} />,
+      })),
+      { title: "", key: "action", width: 150, align: "center", render: (_, row) => <Button type="link" icon={<EyeOutlined />} onClick={() => navigate(`/measurements/${row.id}`)}>Xem chi tiết</Button> },
+    ];
+  }, [navigate]);
   const shownFrom = detailPage?.total ? (selection.page - 1) * pageSize + 1 : 0;
   const shownTo = detailPage ? Math.min(selection.page * pageSize, detailPage.total) : 0;
   const options = [...new Set([...(draft.productCode ? [draft.productCode] : []), ...skuOptions])]
@@ -179,7 +182,7 @@ function MeasurementHistory() {
     {!databaseConnected && <Alert type="error" showIcon title="Chưa kết nối cơ sở dữ liệu. Hãy kết nối lại để tải lịch sử." />}
     {statisticsError && <Alert type="error" showIcon title={statisticsError} />}
     <section aria-label="Thống kê theo bộ lọc" className="history-statistics">{cards.map(([label, value, tone]) => <Card className={`history-stat history-stat-${tone}`} key={label}>
-      <span className="history-stat-label">{label}</span><strong>{statisticsLoading ? <Spin size="small" /> : typeof value === "number" ? value.toLocaleString("vi-VN") : value ?? "—"}</strong>
+      <span className="history-stat-label">{label}</span><strong>{statisticsLoading && !stats ? <Spin size="small" /> : typeof value === "number" ? value.toLocaleString("vi-VN") : value ?? "—"}</strong>
     </Card>)}</section>
     <Card className="section-card" title="Các lần chạy theo SKU" extra={<span className="history-table-note">Hiển thị {skuPage?.items.length ?? 0} / {skuPage?.total ?? 0} SKU · Chọn một dòng để xem chi tiết từng gậy bên dưới</span>}>
       {summaryError && <Alert type="error" showIcon title={summaryError} />}

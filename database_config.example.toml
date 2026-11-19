@@ -1,3 +1,6 @@
+# Local PostgreSQL uses TLS disabled. Fill password before use; an empty password is rejected.
+# Runtime DEV reads src-tauri/resources/database_config.toml; RELEASE reads resources/database_config.toml beside the EXE.
+# Do not combine these fields with connection_string. This example is not loaded automatically.
 # Có thể sao chép vào %APPDATA%\com.golf.report\database_config.toml để ghi đè cấu hình tích hợp.
 # PostgreSQL local: dùng các trường bên dưới.
 # Neon development: thay bằng một dòng connection_string, ví dụ:

@@ -1,10 +1,6 @@
 use crate::database::config::load_config;
 use serde::Serialize;
-use sqlx::{
-    PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
-};
-use std::str::FromStr;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -25,6 +21,49 @@ pub enum DatabaseConnectionState {
 pub struct DatabaseStatus {
     pub state: DatabaseConnectionState,
     pub message: String,
+}
+
+fn server_error_message(code: &str, endpoint: &str) -> Option<String> {
+    match code {
+        "28P01" | "28000" => Some(format!(
+            "PostgreSQL tại {endpoint} từ chối xác thực. Kiểm tra tài khoản, mật khẩu và quyền kết nối."
+        )),
+        "3D000" => Some(format!(
+            "Database được cấu hình không tồn tại trên PostgreSQL tại {endpoint}. Kiểm tra trường database; ứng dụng không tự tạo database."
+        )),
+        "53300" => Some(format!(
+            "PostgreSQL tại {endpoint} đã hết kết nối khả dụng. Hãy thử lại sau."
+        )),
+        "57P03" => Some(format!(
+            "PostgreSQL tại {endpoint} chưa sẵn sàng nhận kết nối. Kiểm tra dịch vụ và thử lại."
+        )),
+        _ => None,
+    }
+}
+
+/// Never forward driver errors: they may contain usernames or server details.
+pub fn connection_error(error: &sqlx::Error, endpoint: &str) -> String {
+    if let Some(message) = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .and_then(|code| server_error_message(&code, endpoint))
+    {
+        return message;
+    }
+    match error {
+        sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => format!(
+            "PostgreSQL tại {endpoint} từ chối kết nối TCP. Kiểm tra dịch vụ PostgreSQL đang chạy và đúng cổng cấu hình."
+        ),
+        sqlx::Error::PoolTimedOut => format!(
+            "Hết thời gian kết nối PostgreSQL tại {endpoint}. Kiểm tra dịch vụ PostgreSQL, cổng, firewall, tài khoản, mật khẩu và database."
+        ),
+        sqlx::Error::Tls(_) => format!(
+            "Không thể xác minh kết nối TLS PostgreSQL tại {endpoint}. Kiểm tra cấu hình TLS và chứng chỉ máy chủ."
+        ),
+        _ => format!(
+            "Không thể kết nối PostgreSQL tại {endpoint}. Kiểm tra dịch vụ PostgreSQL, tài khoản, mật khẩu và database."
+        ),
+    }
 }
 
 struct DatabaseInner {
@@ -125,55 +164,26 @@ impl DatabaseState {
         let config = load_config()
             .map_err(|message| (DatabaseConnectionState::ConnectionFailed, message))?;
         let cloud = config.connection_string.is_some();
-        let options = if let Some(connection_string) = config.connection_string.as_deref() {
-            if connection_string.trim().is_empty() {
-                return Err((
-                    DatabaseConnectionState::ConnectionFailed,
-                    "Connection string PostgreSQL đang trống.".into(),
-                ));
-            }
-            PgConnectOptions::from_str(connection_string)
-                .map_err(|_| {
-                    (
-                        DatabaseConnectionState::ConnectionFailed,
-                        "Connection string PostgreSQL không hợp lệ.".into(),
-                    )
-                })?
-                .ssl_mode(PgSslMode::VerifyFull)
-        } else {
-            if config.host.trim().is_empty()
-                || config.port == 0
-                || config.database.trim().is_empty()
-                || config.username.trim().is_empty()
-            {
-                return Err((
-                    DatabaseConnectionState::ConnectionFailed,
-                    "Thiếu host, port, database hoặc username trong cấu hình PostgreSQL.".into(),
-                ));
-            }
-            PgConnectOptions::new()
-                .host(&config.host)
-                .port(config.port)
-                .database(&config.database)
-                .username(&config.username)
-                .password(&config.password)
-        };
+        let options = config
+            .connect_options()
+            .map_err(|message| (DatabaseConnectionState::ConnectionFailed, message))?;
+        let endpoint = format!("{}:{}", options.get_host(), options.get_port());
         eprintln!(
-            "DATABASE_CONNECT host={} port={} database={}",
+            "DATABASE_CONNECT host={} port={} database={} ssl={:?}",
             options.get_host(),
             options.get_port(),
             options.get_database().unwrap_or("<default>"),
+            options.get_ssl_mode(),
         );
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(if cloud { 15 } else { 3 }))
             .connect_with(options)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 (
                     DatabaseConnectionState::ConnectionFailed,
-                    if cloud { "Không thể kết nối PostgreSQL Cloud qua TLS. Kiểm tra connection string, mạng và chứng chỉ máy chủ." }
-                    else { "Không thể kết nối cơ sở dữ liệu. Hãy kiểm tra PostgreSQL và cấu hình." }.to_string(),
+                    connection_error(&error, &endpoint),
                 )
             })?;
         super::migrations::migrate(&pool)
@@ -208,10 +218,47 @@ async fn health_with_timeout(
 #[cfg(test)]
 mod health_tests {
     use super::*;
+    #[test]
+    fn connection_errors_are_specific_and_do_not_expose_driver_details() {
+        let endpoint = "localhost:5432";
+        assert!(
+            server_error_message("28P01", endpoint)
+                .unwrap()
+                .contains("xác thực")
+        );
+        assert!(
+            server_error_message("28000", endpoint)
+                .unwrap()
+                .contains("xác thực")
+        );
+        assert!(
+            server_error_message("3D000", endpoint)
+                .unwrap()
+                .contains("không tồn tại")
+        );
+        assert!(
+            server_error_message("57P03", endpoint)
+                .unwrap()
+                .contains("chưa sẵn sàng")
+        );
+        assert!(server_error_message("unknown", endpoint).is_none());
+        for error in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "fixture-password",
+            )),
+            sqlx::Error::PoolTimedOut,
+        ] {
+            let message = connection_error(&error, endpoint);
+            assert!(message.contains(endpoint));
+            assert!(!message.contains("fixture-password"));
+            assert!(!message.contains("Cloud"));
+        }
+    }
     #[tokio::test]
     #[ignore = "Explicit Neon integration opt-in; SELECT only, no real database outage"]
     async fn postgres_health_probe_recovers_status_on_the_same_pool_read_only() {
-        let pool=crate::database::test_support::readonly_pool(1).await;
+        let pool = crate::database::test_support::readonly_pool(1).await;
         let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
             .fetch_one(&pool)
             .await

@@ -12,7 +12,7 @@ import {
   Input,
 } from "antd";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRef } from "react";
 import { EditOutlined, LoadingOutlined, PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
 import { getMeasurementAvailabilityNotice, getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
@@ -204,6 +204,8 @@ const states: Record<string, string> = {
   PAUSED: "Đã tạm dừng",
 };
 
+const emptyHistory: MeasurementHistoryItem[] = [];
+
 function AddMeasurement() {
   const { status, settings, error, databaseConnected, refresh: refreshWorker } = usePlcMonitor();
   const [collectionError, setCollectionError] = useState("");
@@ -255,28 +257,33 @@ function AddMeasurement() {
   }, [settings, savedSku, skuDraft, skuLocked, databaseConnected]);
   const [retryId, setRetryId] = useState<number | null>(null);
   const [messageApi, holder] = message.useMessage();
-  const [recent, setRecent] = useState<MeasurementHistoryItem[]>([]);
-  const [storedLatest, setStoredLatest] = useState<MeasurementHistoryItem>();
-  const [recentTotal, setRecentTotal] = useState(0);
+  const [recentResult, setRecentResult] = useState<{ sku?: string; page: number; items: MeasurementHistoryItem[]; total: number }>();
+  const [storedReceipt, setStoredLatest] = useState<MeasurementHistoryItem>();
   const [recentPagination, setRecentPagination] = useState<{ sku?: string; page: number }>({ page: 1 });
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState("");
-  const [chartRecords, setChartRecords] = useState<MeasurementHistoryItem[]>([]);
+  const [chartResult, setChartResult] = useState<{ sku: string; items: MeasurementHistoryItem[] }>();
   const [statistics, setStatistics] = useState<{ productCode: string; value: MeasurementStatistics }>();
   const [monitorLoading, setMonitorLoading] = useState(false);
   const [monitorError, setMonitorError] = useState("");
   const [refreshIndex, setRefreshIndex] = useState(0);
   const currentSku = savedSku || undefined;
+  const storedLatest = !currentSku || storedReceipt?.productCode === currentSku ? storedReceipt : undefined;
   const skuStatistics = databaseConnected && currentSku && statistics?.productCode === currentSku
     ? statistics.value : undefined;
   const recentPage = recentPagination.sku === currentSku ? recentPagination.page : 1;
+
+  const recentMatches = recentResult?.sku === currentSku && recentResult?.page === recentPage;
+  const recent = recentMatches ? recentResult!.items : emptyHistory;
+  const recentTotal = recentMatches ? recentResult!.total : 0;
+  const chartRecords = chartResult && chartResult.sku === currentSku ? chartResult.items : emptyHistory;
+  const changeRecentPage = useCallback((page: number) => setRecentPagination({ sku: currentSku, page }), [currentSku]);
+  const refreshMeasurements = useCallback(() => setRefreshIndex(value => value + 1), []);
 
   // Refresh stored data on the existing Worker's commit signal, not a second
   // polling timer. Read-only API calls do not receive or process PLC deliveries.
   useEffect(() => {
     let active = true;
-    setStatistics(undefined);
-    setChartRecords([]);
     if (!databaseConnected || !currentSku) {
       setMonitorLoading(false);
       setMonitorError(databaseConnected ? "" : "Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
@@ -290,7 +297,7 @@ function AddMeasurement() {
           getMeasurementStatistics({ productCode: currentSku }),
         ]);
         if (!active) return;
-        setChartRecords(response.items);
+        setChartResult({ sku: currentSku, items: response.items });
         setStatistics({ productCode: currentSku, value: stats });
       } catch {
         if (active) setMonitorError("Không tải được dữ liệu giám sát đã lưu. Vui lòng thử làm mới.");
@@ -301,7 +308,7 @@ function AddMeasurement() {
 
   useEffect(() => {
     let active = true;
-    setRecent([]); setRecentTotal(0); setRecentError("");
+    setRecentError("");
     if (!databaseConnected) {
       setRecentLoading(false);
       setRecentError("Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
@@ -311,7 +318,7 @@ function AddMeasurement() {
     void getMeasurementHistoryPage({ page: recentPage, pageSize: 6, productCode: currentSku })
       .then(response => {
         if (!active) return;
-        setRecent(response.items); setRecentTotal(response.total);
+        setRecentResult({ sku: currentSku, page: recentPage, items: response.items, total: response.total });
         if (recentPage === 1) setStoredLatest(response.items[0]);
       })
       .catch(() => { if (active) setRecentError("Không tải được các gậy gần nhất. Vui lòng thử làm mới."); })
@@ -444,7 +451,6 @@ function AddMeasurement() {
   useEffect(() => {
     let active = true;
 
-    setDetail(undefined);
     setDetailError("");
     setDetailLoading(!!committedId && databaseConnected);
 
@@ -603,8 +609,8 @@ function AddMeasurement() {
       )}
 
       <RecentMeasurements records={recent} loading={recentLoading} error={recentError}
-        page={recentPage} total={recentTotal} onPageChange={page => setRecentPagination({ sku: currentSku, page })}
-        onRefresh={() => setRefreshIndex((value) => value + 1)} />
+        page={recentPage} total={recentTotal} onPageChange={changeRecentPage}
+        onRefresh={refreshMeasurements} />
 
     </div>
   );
