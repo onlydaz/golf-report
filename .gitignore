@@ -24,7 +24,6 @@ dist-ssr
 *.sw?
 
 database_config.toml
-/src-tauri/resources/database_config.toml
 as200_config.toml
 as200_config.*.backup.toml
 as200_capture_journal.*.backup.json
