@@ -197,6 +197,8 @@ impl SimulatorConfig {
 
     /// Resolve the retained legacy evidence/Worker lock path. Acquisition no
     /// longer writes a JSON Journal; the configured path stays stable for cutover.
+    /// Relative paths are anchored to the TOML's directory, never the process cwd.
+    /// Linux release uses AppConfig; Windows release keeps the executable directory.
     pub(super) fn journal_file(&self, configuration: &Path) -> PathBuf {
         let journal = self
             .journal_path

@@ -26,6 +26,48 @@ pub(crate) fn application_directory() -> Result<std::path::PathBuf, String> {
     }
 }
 
+// Keep PLC storage separate from the installation/resource directory. A Linux
+// package normally installs its executable under /usr/bin, which is not writable.
+fn plc_configuration_directory(_app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    #[cfg(all(target_os = "linux", not(debug_assertions)))]
+    {
+        let dir = _app
+            .path()
+            .app_config_dir()
+            .map_err(|e| format!("Không xác định được AppConfig cho PLC trên Linux: {e}"))?;
+        if !dir.is_absolute() {
+            return Err("AppConfig PLC phải là đường dẫn tuyệt đối; kiểm tra HOME/XDG_CONFIG_HOME.".into());
+        }
+        // Do not silently start a fresh namespace/lock while an older deployment
+        // retains config or evidence beside its executable. No automatic migration.
+        let installed = application_directory()?;
+        if installed != dir
+            && [
+                "as200_config.toml",
+                "local-runtime",
+                "as200_capture_journal.json",
+                "as200_capture_journal.lock",
+                "as200_config.connection-pending",
+                "as200_config.connection-draft",
+            ]
+            .iter()
+            .any(|name| installed.join(name).exists())
+        {
+            return Err(format!(
+                "Còn cấu hình/runtime PLC tại {}. Cần kỹ thuật đối chiếu và chuyển nguyên cấu hình cùng bằng chứng sang {}; không tự tạo Session, checkpoint hoặc lock thay thế.",
+                installed.display(), dir.display()
+            ));
+        }
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Không tạo được thư mục cấu hình PLC {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+    #[cfg(not(all(target_os = "linux", not(debug_assertions))))]
+    {
+        application_directory()
+    }
+}
+
 pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
     use std::{fs, fs::OpenOptions, io::Write};
     fn probe(dir: &std::path::Path) -> Result<(), String> {
@@ -98,14 +140,14 @@ pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
             || dir.join("as200_capture_journal.json").exists()
             || dir.join("as200_capture_journal.lock").exists()
         {
-            return Err("Đã có lịch sử PLC nhưng thiếu as200_config.toml cạnh ứng dụng. Cần kỹ thuật đối chiếu; không tự tạo phiên hoặc cấu hình thay thế.".into());
+            return Err(format!("Đã có lịch sử PLC nhưng thiếu {}. Cần kỹ thuật đối chiếu; không tự tạo phiên hoặc cấu hình thay thế.", file.display()));
         }
     }
     if file.exists() {
         inspect(&file)?;
-        OpenOptions::new().write(true).open(&file).map_err(
-            |_| "Không có quyền cập nhật as200_config.toml cạnh ứng dụng; chưa bật thu hoặc ACK.",
-        )?;
+        OpenOptions::new().write(true).open(&file).map_err(|_| {
+            format!("Không có quyền cập nhật {}; chưa bật thu hoặc ACK.", file.display())
+        })?;
         if let Some((config, journal)) = plc::simulator_config::load(Some(dir))? {
             if config.enabled && config.journal_path.is_none() {
                 return Err("Cấu hình PLC đang bật nhưng thiếu đường dẫn Journal trong local-runtime; cần kỹ thuật đối chiếu, chưa bật thu hoặc ACK.".into());
@@ -116,7 +158,7 @@ pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
                         .components()
                         .any(|c| matches!(c, std::path::Component::ParentDir)))
             {
-                return Err("Journal phải nằm trong local-runtime cạnh ứng dụng. Giữ nguyên lịch sử cũ và yêu cầu kỹ thuật đối chiếu; không tự di chuyển.".into());
+                return Err(format!("Journal phải nằm trong {}. Giữ nguyên lịch sử cũ và yêu cầu kỹ thuật đối chiếu; không tự di chuyển.", runtime.display()));
             }
         }
     }
@@ -138,7 +180,12 @@ pub fn run() {
             let database_state = app.state::<database::DatabaseState>().inner().clone();
             let worker = app.state::<plc::worker::WorkerState>().inner().clone();
             let worker_database = database_state.clone();
-            let config_dir = application_directory().and_then(|dir| {
+            let config_dir = plc_configuration_directory(&app_handle).and_then(|dir| {
+                eprintln!(
+                    "PLC_STORAGE config={} runtime={}",
+                    dir.join("as200_config.toml").display(),
+                    dir.join("local-runtime").display()
+                );
                 check_plc_directory(&dir)?;
                 plc::connection_settings::ensure_config(&dir)?;
                 Ok(dir)
