@@ -7,7 +7,7 @@ import type {
   MeasurementResult,
 } from "../../services/measurementService";
 
-import { displayPointResult, formatDecimal, formatLoadKg, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
+import { displayPointResult, formatClubNumber, formatDecimal, formatLoadKg, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
 
 export function ResultTag({
   result,
@@ -58,7 +58,7 @@ export default function MeasurementDetails({
               {
                 key: "club",
                 label: "Số gậy",
-                children: data.clubNumber,
+                children: formatClubNumber(data.clubNumber),
               },
               {
                 key: "time",
@@ -79,19 +79,6 @@ export default function MeasurementDetails({
           />
         </Card>
       )}
-      {showGeneralInformation && data.receipt && <details>
-        <summary>Chi tiết kỹ thuật bản ghi</summary>
-        <Descriptions column={{ xs: 1, sm: 2 }} items={[
-          { key: "source", label: "SourceKey", children: data.receipt.sourceKey },
-          { key: "session", label: "Session", children: data.receipt.publicationSession ?? data.sessionId },
-          { key: "count", label: "Publication Count", children: data.receipt.publicationCount },
-          { key: "seq", label: "RecordSeq gốc", children: data.recordSeq },
-          { key: "sku", label: "Nguồn SKU", children: data.skuOrigin },
-          { key: "inbox", label: "Inbox liên kết", children: data.receipt.inboxId },
-          { key: "order", label: "Word order", children: data.receipt.wordOrder },
-        ]} />
-        <p>Kỹ thuật đối chiếu 240 WORD gốc qua Inbox liên kết theo hướng dẫn PLC Manual; không sửa bản ghi gốc.</p>
-      </details>}
 
       {(["TIP", "BUTT"] as const).map(type => {
         const station = data.stations.find(
@@ -116,7 +103,7 @@ export default function MeasurementDetails({
                   items={[
                     {
                       key: "load",
-                      label: "Khối lượng đè (kg)",
+                      label: "Lực đè (kg)",
                       children: formatLoadKg(station.load),
                     },
                     {
@@ -150,6 +137,7 @@ export default function MeasurementDetails({
                   dataSource={station.points.filter(point => isBusinessPoint(type, point.pointNumber)).sort(
                     (a, b) => a.pointNumber - b.pointNumber
                   )}
+                  tableLayout="fixed"
                   scroll={{ x: 1040 }}
                   columns={[
                     {
@@ -198,20 +186,20 @@ export default function MeasurementDetails({
                       width: 120,
                     },
                     {
-                      title: "PushDist quyết định (mm)",
+                      title: <>Khoảng cách đẩy<br />quyết định (mm)</>,
                       render: (_, point) => formatDecimal(point.attempts.find(
                         attempt => attempt.attemptNumber === point.decideAttempt
                       )?.pushDist),
-                      align: "right",
+                      align: "center",
                       width: 170,
                     },
                     {
-                      title: "Bend quyết định (mm)",
+                      title: <>Độ cong quyết<br />định (mm)</>,
                       render: (_, point) => formatDecimal(point.attempts.find(
                         attempt => attempt.attemptNumber === point.decideAttempt
                       )?.bend),
-                      align: "right",
-                      width: 160,
+                      align: "center",
+                      width: 150,
                     },
                   ]}
                   expandable={{
@@ -222,6 +210,8 @@ export default function MeasurementDetails({
                         size="small"
                         rowKey="id"
                         pagination={false}
+                        tableLayout="fixed"
+                        scroll={{ x: 580 }}
                         dataSource={[...point.attempts].sort(
                           (a, b) => a.attemptNumber - b.attemptNumber
                         )}
@@ -230,21 +220,21 @@ export default function MeasurementDetails({
                             title: "Lượt đo",
                             dataIndex: "attemptNumber",
                             align: "center",
-                            width: "20%",
+                            width: 100,
                           },
                           {
-                            title: "PushDist (mm)",
+                            title: "Khoảng cách đẩy (mm)",
                             dataIndex: "pushDist",
                             render: formatDecimal,
                             align: "right",
-                            width: "40%",
+                            width: 270,
                           },
                           {
-                            title: "Bend (mm)",
+                            title: "Độ cong (mm)",
                             dataIndex: "bend",
                             render: formatDecimal,
                             align: "right",
-                            width: "40%",
+                            width: 210,
                           },
                         ]}
                       />

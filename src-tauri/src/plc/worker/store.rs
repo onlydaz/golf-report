@@ -111,7 +111,7 @@ impl Engine {
             sqlx::query_as("INSERT INTO plc_inbox(source_id,session_id,ingest_key,record_seq,total_count,buffer_index,raw_registers,word_order,received_at,processing_status,publication_session,publication_count,assigned_sku) VALUES($1,NULL,$2,$3,$4,0,$5,$6,now(),'SESSION_UNCONFIRMED',$7,$8,$9) RETURNING *")
                 .bind(p.source_id).bind(format!("publication-v1:{}:{}:{total}", p.session_id.len(), p.session_id))
                 .bind(seq).bind(i64::from(total)).bind(raw).bind(self.config.word_order.as_str())
-                .bind(&p.session_id).bind(total).bind(&self.config.operator_sku)
+                .bind(&p.session_id).bind(total).bind(Option::<String>::None)
                 .fetch_one(&mut *tx).await.map_err(|e| e.to_string())?
         };
         // Receipt and pending pointer commit atomically. Counter 0 is kept, never renamed to 1.

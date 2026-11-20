@@ -1,14 +1,3 @@
-# Local PostgreSQL uses TLS disabled. Fill password before use; an empty password is rejected.
-# Runtime DEV reads src-tauri/resources/database_config.toml; RELEASE reads resources/database_config.toml beside the EXE.
-# Do not combine these fields with connection_string. This example is not loaded automatically.
-# Có thể sao chép vào %APPDATA%\com.golf.report\database_config.toml để ghi đè cấu hình tích hợp.
-# PostgreSQL local: dùng các trường bên dưới.
-# Neon development: thay bằng một dòng connection_string, ví dụ:
-# connection_string = "postgresql://neondb_owner:<PASSWORD>@<NEON_HOST>/golf_report?sslmode=verify-full"
-# Connection string luôn được xác minh TLS (certificate và hostname).
-# Bản demo nội bộ: sao chép cấu hình thật vào src-tauri/resources/database_config.toml trên máy build.
-# Rust nhúng file này vào .exe; AppData nếu có sẽ được ưu tiên.
-# File chứa mật khẩu phải được Git ignore; không commit credentials.
 host = "localhost"
 port = 5432
 database = "golf_report"

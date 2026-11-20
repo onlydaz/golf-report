@@ -3,7 +3,7 @@ import ExcelJS from "exceljs";
 import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
-import { buildReportTables, gramsToKilograms, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
+import { buildReportTables, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
 
 type ExportValue = string | number;
 type ExportRow = Record<string, ExportValue>;
@@ -31,11 +31,11 @@ const headerLabels: Record<string, string> = {
   TotalCount: "Tổng số lượt đo",
   OverallResult: "Kết quả tổng thể",
   "TIP Result": "Kết quả TIP",
-  "TIP Load (kg)": "Tải trọng TIP (kg)",
+  "TIP Load (kg)": "Lực đè TIP (kg)",
   "BUTT Result": "Kết quả BUTT",
-  "BUTT Load (kg)": "Tải trọng BUTT (kg)",
+  "BUTT Load (kg)": "Lực đè BUTT (kg)",
   StationType: "Trạm đo",
-  "Station Load (kg)": "Tải trọng trạm (kg)",
+  "Station Load (kg)": "Lực đè trạm (kg)",
   "Station Result": "Kết quả trạm",
   PointNumber: "Điểm đo",
   "Position (mm)": "Vị trí đo (mm)",
@@ -52,14 +52,14 @@ const calculateColumnWidth = (
   rows: ExportRow[],
   header: string
 ): number => {
-  let maxLength = header.length;
+  let maxLength = headerLabel(header).length;
 
   for (const row of rows) {
     const value = String(row[header] ?? "");
     maxLength = Math.max(maxLength, value.length);
   }
 
-  return Math.min(Math.max(maxLength + 4, 12), 45);
+  return Math.min(Math.max(maxLength + 4, 12), 60);
 };
 
 // Xuất CSV UTF-8 BOM
@@ -74,7 +74,7 @@ export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[])
       const base = byId.get(item.id)!;
       if (!item.stations.length) return [base];
       return item.stations.flatMap(station => {
-        const stationRow = { ...base, StationType: station.stationType, "Station Load (kg)": gramsToKilograms(station.load) ?? "", "Station Result": station.result };
+        const stationRow = { ...base, StationType: station.stationType, "Station Load (kg)": station.load ?? "", "Station Result": station.result };
         const points = station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber));
         if (!points.length) return [stationRow];
         return points.flatMap(point => {
@@ -120,8 +120,12 @@ export const createExcelBytes = async (
   details: MeasurementDetail[]
 ): Promise<Uint8Array> => {
   const workbook = new ExcelJS.Workbook();
+  const realColumns = new Set([
+    "TIP Load (kg)", "BUTT Load (kg)", "Station Load (kg)",
+    "Position (mm)", "PushDist (mm)", "Bend (mm)",
+  ]);
 
-  workbook.creator = "Golf Measurement Report";
+  workbook.creator = "Phần Mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf";
   workbook.created = new Date();
 
   const worksheet = workbook.addWorksheet("Tổng hợp", {
@@ -146,61 +150,24 @@ export const createExcelBytes = async (
     worksheet.addRow(row);
   }
 
-  // Định dạng hàng tiêu đề
-  const headerRow = worksheet.getRow(1);
-  headerRow.height = 32;
+  // Apply the same formatting to every sheet, preserving the original cell values.
+  const styleSheet = (worksheet: ExcelJS.Worksheet, filterable = true) => {
+    // Định dạng hàng tiêu đề
+    const headerRow = worksheet.getRow(1);
+    headerRow.height = 32;
 
-  headerRow.eachCell(cell => {
-    cell.font = {
-      name: "Calibri",
-      size: 11,
-      bold: true,
-      color: { argb: "FFFFFFFF" },
-    };
-
-    cell.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF1769AA" },
-    };
-
-    cell.alignment = {
-      horizontal: "center",
-      vertical: "middle",
-      wrapText: true,
-    };
-
-    cell.border = {
-      top: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      bottom: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      left: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-      right: {
-        style: "thin",
-        color: { argb: "FFB8C9DA" },
-      },
-    };
-  });
-
-  // Định dạng các dòng dữ liệu
-  worksheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-
-    row.height = 26;
-
-    row.eachCell({ includeEmpty: true }, cell => {
+    headerRow.eachCell(cell => {
       cell.font = {
         name: "Calibri",
         size: 11,
-        color: { argb: "FF243B53" },
+        bold: true,
+        color: { argb: "FFFFFFFF" },
+      };
+
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF123B5D" },
       };
 
       cell.alignment = {
@@ -209,56 +176,141 @@ export const createExcelBytes = async (
         wrapText: true,
       };
 
-      // Màu nền xen kẽ giữa các hàng
-      cell.fill = {
-        type: "pattern",
-        pattern: "solid",
-        fgColor: {
-          argb: rowNumber % 2 === 0 ? "FFFFFFFF" : "FFF3F7FB",
-        },
-      };
-
       cell.border = {
+        top: {
+          style: "thin",
+          color: { argb: "FFB8C9DA" },
+        },
         bottom: {
-          style: "hair",
-          color: { argb: "FFE1E8EF" },
+          style: "thin",
+          color: { argb: "FFB8C9DA" },
+        },
+        left: {
+          style: "thin",
+          color: { argb: "FFB8C9DA" },
+        },
+        right: {
+          style: "thin",
+          color: { argb: "FFB8C9DA" },
         },
       };
-
-      // Tô màu kết quả OK và NG
-      const value = String(cell.value ?? "");
-
-      if (value === "OK") {
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFE3F5EB" },
-        };
-
-        cell.font = {
-          name: "Calibri",
-          size: 11,
-          bold: true,
-          color: { argb: "FF167451" },
-        };
-      } else if (value === "NG") {
-        cell.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFFFEBEB" },
-        };
-
-        cell.font = {
-          name: "Calibri",
-          size: 11,
-          bold: true,
-          color: { argb: "FFB43F49" },
-        };
-      }
     });
-  });
+
+    // Định dạng các dòng dữ liệu
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+
+      row.height = 26;
+
+      row.eachCell({ includeEmpty: true }, cell => {
+        cell.font = {
+          name: "Calibri",
+          size: 11,
+          color: { argb: "FF243B53" },
+        };
+
+        cell.alignment = {
+          horizontal: "center",
+          vertical: "middle",
+          wrapText: true,
+        };
+
+        // Màu nền xen kẽ giữa các hàng
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: {
+            argb: rowNumber % 2 === 0 ? "FFFFFFFF" : "FFF3F7FB",
+          },
+        };
+
+        cell.border = {
+          bottom: {
+            style: "hair",
+            color: { argb: "FFE1E8EF" },
+          },
+        };
+
+        const key = worksheet.getColumn(cell.col).key;
+        // PostgreSQL NUMERIC arrives as decimal text. XLSX needs numeric cells
+        // for number formats/calculations; format only, without rounding values.
+        // Blank/NULL/unmeasured cells and integer columns remain unchanged.
+        if (realColumns.has(String(key))) {
+          const original = cell.value;
+          const number = typeof original === "number" ? original
+            : typeof original === "string" && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(original.trim())
+              ? Number(original) : NaN;
+          if (Number.isFinite(number)) {
+            cell.value = number;
+            cell.numFmt = "0.00";
+          }
+        }
+
+        // Only result columns carry result colors, never a SKU that happens to be OK/NG.
+        if (!["OverallResult", "TIP Result", "BUTT Result", "Result"].includes(String(key))) return;
+        const value = String(cell.value ?? "");
+
+        if (value === "OK") {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFE3F5EB" },
+          };
+
+          cell.font = {
+            name: "Calibri",
+            size: 11,
+            bold: true,
+            color: { argb: "FF167451" },
+          };
+        } else if (value === "NG") {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFFFEBEB" },
+          };
+
+          cell.font = {
+            name: "Calibri",
+            size: 11,
+            bold: true,
+            color: { argb: "FFB43F49" },
+          };
+        } else if (value === "SKIPPED") {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEEF0F2" } };
+          cell.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FF627D98" } };
+        }
+      });
+    });
+    if (filterable) {
+      worksheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: worksheet.rowCount, column: worksheet.columnCount },
+      };
+    }
+  };
+  styleSheet(worksheet);
 
   const tables = buildReportTables(details);
+  // Join by PostgreSQL Measurement ID, never by a potentially repeated StickNo.
+  const anchors = new Map(details.map(item => [item.id, { ProductCode: item.productCode, StickNo: item.clubNumber }]));
+
+  // Compare the original rows, not merged cell values. Merge only adjacent runs;
+  // station/point keys always include their parent Measurement ID.
+  const mergeConsecutive = (sheet: ExcelJS.Worksheet, records: ExportRow[], groupKeys: string[], columns: string[]) => {
+    for (let start = 0; start < records.length;) {
+      let end = start + 1;
+      while (end < records.length && groupKeys.every(key => records[end][key] === records[start][key])) end++;
+      if (end - start > 1) {
+        for (const key of columns) {
+          const column = sheet.getColumn(key).number;
+          sheet.mergeCells(start + 2, column, end + 1, column);
+          sheet.getCell(start + 2, column).alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+        }
+      }
+      start = end;
+    }
+  };
 
   for (const [name, records, headers] of [
     [
@@ -266,6 +318,8 @@ export const createExcelBytes = async (
       tables.points,
       [
         "Measurement ID",
+        "ProductCode",
+        "StickNo",
         "StationType",
         "PointNumber",
         "Position (mm)",
@@ -279,6 +333,8 @@ export const createExcelBytes = async (
       tables.attempts,
       [
         "Measurement ID",
+        "ProductCode",
+        "StickNo",
         "StationType",
         "PointNumber",
         "AttemptNumber",
@@ -288,22 +344,28 @@ export const createExcelBytes = async (
     ],
   ] as const) {
     const sheet = workbook.addWorksheet(name, {
-      views: [{ state: "frozen", ySplit: 1 }],
+      views: [{ state: "frozen", ySplit: 1, showGridLines: false }],
     });
+    const detailRows = records.map(record => ({ ...record, ...anchors.get(record["Measurement ID"])! }));
 
     sheet.columns = headers.map(header => ({
       header: headerLabel(header),
       key: header,
-      width: 22,
+      width: calculateColumnWidth(detailRows, header),
     }));
 
-    records.forEach(record => sheet.addRow(record));
-
-    sheet.getRow(1).font = { bold: true };
-    sheet.autoFilter = {
-      from: { row: 1, column: 1 },
-      to: { row: 1, column: headers.length },
-    };
+    detailRows.forEach(record => sheet.addRow(record));
+    // Merged detail sheets are presentation views. Keep full filtering/sorting on
+    // the unmerged summary; the existing CSV export retains flat detailed rows.
+    styleSheet(sheet, false);
+    mergeConsecutive(sheet, detailRows, ["Measurement ID"], ["Measurement ID", "ProductCode", "StickNo"]);
+    mergeConsecutive(sheet, detailRows, ["Measurement ID", "StationType"], ["StationType"]);
+    if (name === "Lượt đo") {
+      mergeConsecutive(sheet, detailRows, ["Measurement ID", "StationType", "PointNumber"], ["PointNumber"]);
+    }
+    sheet.getCell("A1").note = "Sheet trình bày theo nhóm có ô gộp, không bật bộ lọc/sắp xếp để tránh sai nhóm. "
+      + "Dùng sheet Tổng hợp để lọc/sắp xếp phép đo; xuất CSV nếu cần lọc từng dòng chi tiết. "
+      + "Các dòng bên dưới cùng một ô gộp thuộc phép đo, trạm hoặc điểm ghi ở ô đó.";
   }
 
   const buffer = await workbook.xlsx.writeBuffer();

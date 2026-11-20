@@ -251,26 +251,6 @@ impl WorkerState {
         Ok(())
     }
 
-    // Caller holds settings_gate through the manual operation, preventing a
-    // concurrent collection start. Do not infer safety from enabled alone.
-    pub(super) async fn ensure_register_writes_stopped(&self) -> Result<(), String> {
-        if !self.settings_ready.load(Ordering::SeqCst)
-            || self.runtime_error.lock().await.is_some()
-            || self.status.read().await.enabled
-            || self.status.read().await.state == "STOPPING"
-            || !self.tasks.lock().await.is_empty()
-            || self
-                .engine
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|e| e.upgrade())
-                .is_some()
-        {
-            return Err("Chưa xác minh bộ thu/ACK đã dừng hoàn toàn. Hãy dừng thu và xử lý lỗi runtime trước khi ghi thanh ghi.".into());
-        }
-        Ok(())
-    }
 
     async fn error_status(&self, error: String) {
         let mut status = self.status.write().await;

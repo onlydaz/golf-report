@@ -19,13 +19,11 @@ export interface PlcRuntimeParameters {
   ackEnabled: boolean;
 }
 export interface PlcConnectionSettings {
-  operatorSku?: string | null;
   parameters: PlcRuntimeParameters;
   endpoint: PlcEndpoint;
   configured: boolean;
 }
 export const getPlcConnectionSettings = () => invoke<PlcConnectionSettings>("get_plc_connection_settings");
-export const saveOperatorSku = (sku: string) => invoke<PlcConnectionSettings>("save_operator_sku", { sku });
 export const clearPlcConnectionLog = () => invoke<void>("clear_plc_connection_log");
 export interface PlcInspectionReport {
   tcpConnected: boolean;

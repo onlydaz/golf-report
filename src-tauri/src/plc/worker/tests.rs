@@ -917,7 +917,7 @@ async fn local_manual_measurement_commit_precedes_ack_and_retry_is_idempotent() 
                 _ => 0,
             }
         );
-        assert_eq!(detail.summary.product_code, "MANUAL-QC");
+        assert_eq!(detail.summary.product_code, if count == 5 { "AB" } else { "N/A" });
         assert_eq!(
             detail.summary.overall_result,
             if count == 5 {
@@ -959,7 +959,7 @@ async fn local_manual_measurement_commit_precedes_ack_and_retry_is_idempotent() 
         finish(&e, &plc, &pool, count).await;
         let request = crate::models::MeasurementListRequest {
             page_size: Some(100),
-            product_code: e.config.operator_sku.clone(),
+            product_code: None, // Include both blank (N/A) and explicit PLC ProductCodes.
             ..Default::default()
         };
         let history = crate::repositories::MeasurementRepository::history_page(&pool, &request)

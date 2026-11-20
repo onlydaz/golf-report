@@ -1,5 +1,5 @@
 import { formatReportTime } from "../../utils/reportTime";
-import { formatLoadKg } from "../../utils/as200Report";
+import { formatClubNumber, formatLoadKg } from "../../utils/as200Report";
 import {
   Alert,
   Button,
@@ -9,12 +9,11 @@ import {
   Tag,
   message,
   InputNumber,
-  Input,
 } from "antd";
 
 import { useCallback, useEffect, useState } from "react";
 import { useRef } from "react";
-import { EditOutlined, LoadingOutlined, PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
+import { PauseCircleOutlined, PlayCircleOutlined, WifiOutlined } from "@ant-design/icons";
 import { getMeasurementAvailabilityNotice, getPlcDisplayStatus, usePlcMonitor } from "../../hooks/usePlcMonitor";
 import PageHeader from "../../components/PageHeader";
 import { BendComparison, CurrentPointTable, ProductionSummary, RecentMeasurements } from "./MonitorPanels";
@@ -24,7 +23,7 @@ import {
 } from "../../services/as200Service";
 
 import "./AddMeasurement.css";
-import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, saveOperatorSku, stopPlcCollection } from "../../services/plcConnectionService";
+import { connectPlcCollection, getPlcConnectionSettings, plcConnectionError, stopPlcCollection } from "../../services/plcConnectionService";
 import { reconnectAs200Plc } from "../../services/as200Service";
 
 import {
@@ -211,80 +210,33 @@ function AddMeasurement() {
   const [collectionError, setCollectionError] = useState("");
   const [collectionAction, setCollectionAction] = useState<"stop" | "start" | "reconnect" | null>(null);
   const collectionInFlight = useRef(false);
-  const [skuDraft, setSkuDraft] = useState("");
-  const [skuSaving, setSkuSaving] = useState(false);
-  const [skuError, setSkuError] = useState("");
-  const [skuNotice, setSkuNotice] = useState("");
-  const [savedSku, setSavedSku] = useState<string>();
-  const skuInFlight = useRef(false);
-  const defaultSkuAttempted = useRef(false);
-  useEffect(() => {
-    setSavedSku(settings?.operatorSku ?? undefined);
-    setSkuDraft(settings?.operatorSku ?? "");
-  }, [settings?.operatorSku]);
-  const skuLocked = !settings || !status || !!status.enabled || status.connection === "CONNECTED"
-    || status?.state === "STOPPING" || !!collectionAction || skuSaving;
-  const persistSku = async (draft = skuDraft) => {
-    const value = draft.trim();
-    if (!value) throw "Nhập mã SKU trước khi kết nối PLC.";
-    if (value !== savedSku) {
-      const saved = await saveOperatorSku(value);
-      setSavedSku(saved.operatorSku ?? undefined);
-    }
-    setSkuDraft(value);
-  };
-  const saveSku = async (draft = skuDraft) => {
-    if (skuLocked || skuInFlight.current || collectionInFlight.current) return;
-    if (draft.trim() === savedSku) { setSkuDraft(savedSku); return; }
-    skuInFlight.current = true; setSkuSaving(true); setSkuError(""); setSkuNotice("");
-    try {
-      await persistSku(draft);
-      setSkuNotice("Đã lưu SKU.");
-      await refreshWorker().catch(() => undefined);
-    }
-    catch (reason) {
-      setSkuDraft(savedSku ?? "");
-      setSkuError(plcConnectionError(reason, "Không thể lưu SKU; cần ngắt kết nối an toàn và xử lý dữ liệu đang chờ."));
-    }
-    finally { skuInFlight.current = false; setSkuSaving(false); }
-  };
-  useEffect(() => {
-    if (!settings || settings.operatorSku || savedSku || skuDraft.trim() || skuLocked || !databaseConnected || defaultSkuAttempted.current) return;
-    // The default uses the same backend Journal/Inbox/ACK checks as a QC edit.
-    // A failed safety check leaves operator_sku unchanged and shows the reason.
-    defaultSkuAttempted.current = true;
-    void saveSku("GOLD-X1");
-  }, [settings, savedSku, skuDraft, skuLocked, databaseConnected]);
   const [retryId, setRetryId] = useState<number | null>(null);
   const [messageApi, holder] = message.useMessage();
-  const [recentResult, setRecentResult] = useState<{ sku?: string; page: number; items: MeasurementHistoryItem[]; total: number }>();
+  const [recentResult, setRecentResult] = useState<{ page: number; items: MeasurementHistoryItem[]; total: number }>();
   const [storedReceipt, setStoredLatest] = useState<MeasurementHistoryItem>();
-  const [recentPagination, setRecentPagination] = useState<{ sku?: string; page: number }>({ page: 1 });
+  const [recentPage, setRecentPage] = useState(1);
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState("");
-  const [chartResult, setChartResult] = useState<{ sku: string; items: MeasurementHistoryItem[] }>();
-  const [statistics, setStatistics] = useState<{ productCode: string; value: MeasurementStatistics }>();
+  const [chartResult, setChartResult] = useState<MeasurementHistoryItem[]>(emptyHistory);
+  const [statistics, setStatistics] = useState<MeasurementStatistics>();
   const [monitorLoading, setMonitorLoading] = useState(false);
   const [monitorError, setMonitorError] = useState("");
   const [refreshIndex, setRefreshIndex] = useState(0);
-  const currentSku = savedSku || undefined;
-  const storedLatest = !currentSku || storedReceipt?.productCode === currentSku ? storedReceipt : undefined;
-  const skuStatistics = databaseConnected && currentSku && statistics?.productCode === currentSku
-    ? statistics.value : undefined;
-  const recentPage = recentPagination.sku === currentSku ? recentPagination.page : 1;
+  const storedLatest = storedReceipt;
+  const monitorStatistics = databaseConnected ? statistics : undefined;
 
-  const recentMatches = recentResult?.sku === currentSku && recentResult?.page === recentPage;
+  const recentMatches = recentResult?.page === recentPage;
   const recent = recentMatches ? recentResult!.items : emptyHistory;
   const recentTotal = recentMatches ? recentResult!.total : 0;
-  const chartRecords = chartResult && chartResult.sku === currentSku ? chartResult.items : emptyHistory;
-  const changeRecentPage = useCallback((page: number) => setRecentPagination({ sku: currentSku, page }), [currentSku]);
+  const chartRecords = chartResult;
+  const changeRecentPage = useCallback((page: number) => setRecentPage(page), []);
   const refreshMeasurements = useCallback(() => setRefreshIndex(value => value + 1), []);
 
   // Refresh stored data on the existing Worker's commit signal, not a second
   // polling timer. Read-only API calls do not receive or process PLC deliveries.
   useEffect(() => {
     let active = true;
-    if (!databaseConnected || !currentSku) {
+    if (!databaseConnected) {
       setMonitorLoading(false);
       setMonitorError(databaseConnected ? "" : "Chưa thể cập nhật dữ liệu đã lưu. Vui lòng kiểm tra kết nối cơ sở dữ liệu.");
       return;
@@ -293,18 +245,21 @@ function AddMeasurement() {
     void (async () => {
       try {
         const [response, stats] = await Promise.all([
-          getMeasurementHistoryPage({ page: 1, pageSize: 30, productCode: currentSku }),
-          getMeasurementStatistics({ productCode: currentSku }),
+          getMeasurementHistoryPage({ page: 1, pageSize: 30 }),
+          getMeasurementStatistics({}),
         ]);
         if (!active) return;
-        setChartResult({ sku: currentSku, items: response.items });
-        setStatistics({ productCode: currentSku, value: stats });
+        setChartResult(response.items);
+        // Always read page 1 for the display-only SKU, even when the recent
+        // table is showing an older page. Never use live/uncommitted PLC data.
+        setStoredLatest(response.items[0]);
+        setStatistics(stats);
       } catch {
         if (active) setMonitorError("Không tải được dữ liệu giám sát đã lưu. Vui lòng thử làm mới.");
       } finally { if (active) setMonitorLoading(false); }
     })();
     return () => { active = false; };
-  }, [databaseConnected, status?.lastSavedId, currentSku, refreshIndex]);
+  }, [databaseConnected, status?.lastSavedId, refreshIndex]);
 
   useEffect(() => {
     let active = true;
@@ -315,16 +270,15 @@ function AddMeasurement() {
       return;
     }
     setRecentLoading(true);
-    void getMeasurementHistoryPage({ page: recentPage, pageSize: 6, productCode: currentSku })
+    void getMeasurementHistoryPage({ page: recentPage, pageSize: 6 })
       .then(response => {
         if (!active) return;
-        setRecentResult({ sku: currentSku, page: recentPage, items: response.items, total: response.total });
-        if (recentPage === 1) setStoredLatest(response.items[0]);
+        setRecentResult({ page: recentPage, items: response.items, total: response.total });
       })
       .catch(() => { if (active) setRecentError("Không tải được các gậy gần nhất. Vui lòng thử làm mới."); })
       .finally(() => { if (active) setRecentLoading(false); });
     return () => { active = false; };
-  }, [databaseConnected, status?.lastSavedId, currentSku, recentPage, refreshIndex]);
+  }, [databaseConnected, status?.lastSavedId, recentPage, refreshIndex]);
 
   useEffect(() => {
     if (status?.enabled && status.connection === "CONNECTED" && !status.pauseReason) {
@@ -342,7 +296,7 @@ function AddMeasurement() {
           : status.connection === "DISCONNECTED" ? "Mất kết nối PLC"
             : status.enabled && status.connection === "CONNECTED" ? "Đang thu" : status.enabled ? "Đang kết nối lại" : "Chưa bắt đầu";
   const changeCollection = async (action: "stop" | "start" | "reconnect") => {
-    if (collectionInFlight.current || skuInFlight.current) return;
+    if (collectionInFlight.current) return;
     collectionInFlight.current = true;
     setCollectionAction(action);
     setCollectionError("");
@@ -350,9 +304,6 @@ function AddMeasurement() {
       if (action === "stop") await stopPlcCollection();
       else if (action === "reconnect") await reconnectAs200Plc();
       else {
-        // Without a saved SKU, backend may still allow recovery of old deliveries.
-        // It rejects new collection until QC has safely saved a SKU.
-        if (skuDraft.trim() || settings?.operatorSku) await persistSku();
         const current = await getPlcConnectionSettings();
         if (!current.configured || !current.endpoint) {
           throw "Chưa có cấu hình kết nối có thể tiếp tục an toàn.";
@@ -503,18 +454,11 @@ function AddMeasurement() {
           : "Kết quả và KPI giữ theo Overall do PLC cung cấp. Xem Chi tiết để đối chiếu thông tin bản ghi."} />}
 
       <div className="monitor-top-grid">
-      <ProductionSummary productCode={currentSku}
-        statistics={skuStatistics} loading={monitorLoading}
-        skuEditor={<div className="monitor-sku-editor">
-          <Input value={skuDraft} placeholder="Nhập mã SKU" maxLength={50} aria-label="SKU QC đang chạy"
-            disabled={skuLocked} status={skuError ? "error" : undefined}
-            suffix={skuSaving ? <LoadingOutlined spin /> : <EditOutlined />}
-            onChange={event => { setSkuDraft(event.target.value); setSkuNotice(""); }}
-            onPressEnter={event => { if (!event.nativeEvent.isComposing) void saveSku(); }}
-            onBlur={() => void saveSku()} />
-          {skuError && <span className="monitor-sku-error" role="alert">{skuError}</span>}
-          {!skuError && skuNotice && <span className="monitor-sku-notice" role="status">{skuNotice}</span>}
-        </div>} />
+      <Card className="section-card monitor-sku">
+        <div className="monitor-kicker">SKU đang chạy</div>
+        <strong className="monitor-sku-value">{storedLatest?.productCode?.trim() ? storedLatest.productCode : "N/A"}</strong>
+      </Card>
+      <ProductionSummary statistics={monitorStatistics} loading={monitorLoading} />
       <Card className="section-card add-measurement-plc-card">
         <div className="add-measurement-plc-main">
           <div className="add-measurement-plc-copy">
@@ -540,7 +484,7 @@ function AddMeasurement() {
       <div className="monitor-result-grid">
       <Card className="section-card add-measurement-results">
         <div className="monitor-current-heading">
-          <h2>Gậy vừa kiểm tra · {displayed ? `#${displayed.clubNumber}` : "Chưa có dữ liệu"}</h2>
+          <h2>Gậy vừa kiểm tra · {displayed ? formatClubNumber(displayed.clubNumber) : "Chưa có dữ liệu"}</h2>
           <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} kg / Tip {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} kg</span>
         </div>
         <div className="add-measurement-result-grid">
@@ -561,7 +505,7 @@ function AddMeasurement() {
         {detailError && <Alert type="error" showIcon message={detailError} />}
         <CurrentPointTable detail={activeDetail} loading={detailLoading} />
       </Card>
-      <BendComparison records={chartRecords} productCode={currentSku} loading={monitorLoading} error={monitorError} />
+      <BendComparison records={chartRecords} loading={monitorLoading} error={monitorError} />
       </div>
 
       {showSystemNotice && !!systemNotice && !resetConfirmationReady && !hasSpecificPauseError && !resetActionError && (status?.connection !== "DISCONNECTED" || !!error || !!status?.pauseReason) && <Alert

@@ -26,11 +26,20 @@ export function bendDomain(values: Array<number | null>, settings?: MeasurementC
   return [lo - padding, hi + padding];
 }
 
-/** Keep configured limits as explicit axis ticks rather than relying on automatic ticks. */
+/** Fit measured values only, with 5–10 mm of padding; limits must not stretch this view. */
+export function bendDataDomain(values: Array<number | null>): [number, number] {
+  const finite = values.filter((value): value is number => value != null && Number.isFinite(value));
+  if (!finite.length) return [0, 1];
+  const lo = Math.min(...finite), hi = Math.max(...finite);
+  const padding = Math.min(10, Math.max(5, (hi - lo) * 0.1));
+  return [lo - padding, hi + padding];
+}
+
+/** Keep visible limits as explicit ticks without pulling off-screen limits into the domain. */
 export function bendAxisTicks(domain: [number, number], settings: MeasurementChartSettings): number[] {
   const [lo, hi] = domain;
   const limits = [settings.bendLowerMm, settings.bendUpperMm]
-    .filter((value): value is number => value != null && Number.isFinite(value));
+    .filter((value): value is number => value != null && Number.isFinite(value) && value >= lo && value <= hi);
   const step = (hi - lo) / 4;
   const regular = Array.from({ length: 5 }, (_, index) => Number((lo + index * step).toPrecision(6)))
     .filter(value => value >= lo && value <= hi && limits.every(limit => Math.abs(value - limit) > step * 0.35));

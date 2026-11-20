@@ -15,14 +15,14 @@ pub(crate) fn application_directory() -> Result<std::path::PathBuf, String> {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .map(std::path::Path::to_path_buf)
-            .ok_or_else(|| "Không xác định được thư mục project Golf Report.".into())
+            .ok_or_else(|| "Không xác định được thư mục project của Phần Mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf.".into())
     }
     #[cfg(not(debug_assertions))]
     {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .ok_or_else(|| "Không xác định được thư mục cài đặt Golf Report.".into())
+            .ok_or_else(|| "Không xác định được thư mục cài đặt Phần Mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf.".into())
     }
 }
 
@@ -167,7 +167,6 @@ pub fn run() {
             plc::worker::get_as200_worker_status,
             plc::worker::reconnect_as200_plc,
             plc::connection_settings::get_plc_connection_settings,
-            plc::connection_settings::save_operator_sku,
             plc::connection_settings::stop_plc_collection,
             plc::connection_settings::clear_plc_connection_log,
             plc::connection_settings::connect_plc_collection,

@@ -49,7 +49,6 @@ pub struct RuntimeParameters {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    operator_sku: Option<String>,
     endpoint: Endpoint,
     parameters: RuntimeParameters,
     configured: bool,
@@ -183,7 +182,6 @@ async fn ready(state: &WorkerState) -> Result<PathBuf, String> {
 fn settings(config: &SimulatorConfig) -> Settings {
     let address: std::net::SocketAddr = config.address.parse().expect("validated PLC address");
     Settings {
-        operator_sku: config.operator_sku.clone(),
         endpoint: Endpoint {
             ip: address.ip().to_string(),
             port: address.port().into(),
@@ -253,34 +251,6 @@ pub async fn get_plc_connection_settings(
     Ok(settings(&config))
 }
 
-#[tauri::command]
-pub async fn save_operator_sku(
-    sku: String,
-    state: tauri::State<'_, WorkerState>,
-    database: tauri::State<'_, crate::database::DatabaseState>,
-) -> Result<Settings, String> {
-    let sku = sku.trim().to_string();
-    crate::services::inbox_service::validate_operator_sku(&sku)?;
-    let _gate = state.settings_gate.lock().await;
-    let dir = ready(&state).await?;
-    let (path, before, config) = current_config(&state, &dir).await?;
-    if config.operator_sku.as_deref() == Some(sku.as_str()) {
-        return Ok(settings(&config));
-    }
-    let pool = database.pool().await?;
-    let _journal_lock = state.verify_sku_change(&dir, &config, &pool).await?;
-    let mut document: toml::Value =
-        toml::from_str(&before).map_err(|_| "Cấu hình PLC không hợp lệ.")?;
-    document
-        .as_table_mut()
-        .ok_or("Cấu hình PLC không hợp lệ.")?
-        .insert("operator_sku".into(), sku.into());
-    let after = toml::to_string_pretty(&document).map_err(|_| "Không tạo được cấu hình SKU.")?;
-    let saved = simulator_config::parse(&after)?;
-    validate_config(&saved)?;
-    replace_config(&path, &before, &after)?;
-    Ok(settings(&saved))
-}
 #[tauri::command]
 pub async fn test_plc_connection(
     state: tauri::State<'_, WorkerState>,

@@ -12,7 +12,7 @@ use crate::{
 use bigdecimal::BigDecimal;
 use sqlx::PgPool;
 
-pub(crate) fn validate_operator_sku(sku: &str) -> Result<(), String> {
+fn validate_historical_sku(sku: &str) -> Result<(), String> {
     if sku.is_empty()
         || sku.len() > 50
         || sku != sku.trim()
@@ -23,7 +23,7 @@ pub(crate) fn validate_operator_sku(sku: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Read the assigned SKU in historical Inbox keys; new receipts use assigned_sku.
+// Read only historical delivery keys; native receipts derive ProductCode from raw.
 pub(crate) fn assigned_sku(key: &str, sequence: i32) -> Result<Option<String>, String> {
     let Some(rest) = key.strip_prefix("published-sku-v1:") else {
         return Ok(None);
@@ -43,7 +43,7 @@ pub(crate) fn assigned_sku(key: &str, sequence: i32) -> Result<Option<String>, S
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "SKU delivery lỗi mã hóa; không tự thay bằng SKU hiện hành.".to_string())?;
     let sku = String::from_utf8(bytes).map_err(|_| "SKU delivery lỗi ký tự.".to_string())?;
-    validate_operator_sku(&sku)?;
+    validate_historical_sku(&sku)?;
     Ok(Some(sku))
 }
 
@@ -281,16 +281,22 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
         return Err("Raw RecordSeq differs from receipt".into());
     }
     let decoded = decode::publication_record(&raw, 0, order);
-    let product_code = inbox.assigned_sku.clone().unwrap_or_else(|| {
-        decode::product_code(&raw[r::PRODUCT_CODE..r::PRODUCT_CODE + r::PRODUCT_WORDS])
-            .unwrap_or_default()
-    });
-    let sku_origin = if inbox.assigned_sku.is_some() {
-        "QC"
-    } else if !product_code.is_empty() {
-        "PLC"
-    } else {
-        "MISSING"
+    let plc_product = decode::product_code(&raw[r::PRODUCT_CODE..r::PRODUCT_CODE + r::PRODUCT_WORDS])
+        .map_err(|e| e.to_string())
+        .and_then(|code| {
+            if !code.bytes().all(|b| (32..=126).contains(&b)) {
+                return Err("PLC ProductCode contains invalid characters".into());
+            }
+            Ok(code)
+        });
+    // Immutable raw receipt is the only source on first projection and retries.
+    // Historical assigned_sku remains evidence, never a native product fallback.
+    let (product_code, sku_origin, plc_product_error) = match plc_product {
+        Ok(code) if !code.trim().is_empty() => (code, "PLC", None),
+        Ok(_) => ("N/A".into(), "MISSING", None),
+        // Preserve the existing diagnostic projection for malformed data; do not
+        // disguise a decode failure as a valid blank ProductCode (N/A).
+        Err(error) => (String::new(), "MISSING", Some(error)),
     };
     let mut quality_error = decode::record(&raw, 0, order)
         .map_err(|e| e.to_string())
@@ -310,8 +316,12 @@ pub fn draft_from_inbox(inbox: &InboxRecord) -> Result<MeasurementDraft, String>
             Ok(())
         })
         .err();
-    if product_code.is_empty() {
-        quality_error = Some("SKU not assigned at receipt; PLC ProductCode empty".into());
+    if let Some(error) = plc_product_error {
+        let diagnostic = format!("PLC ProductCode invalid: {error}; no manual fallback; invalid code is not N/A");
+        quality_error = Some(match quality_error {
+            Some(existing) => format!("{existing}; {diagnostic}"),
+            None => diagnostic,
+        });
     }
     let mut stations = if let Ok(record) = &decoded {
         vec![

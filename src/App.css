@@ -42,7 +42,7 @@ select {
   height: 100%;
   min-height: 0;
   min-width: 0;
-  margin-left: 232px;
+  margin-left: 220px;
 }
 
 .main-sider {
@@ -55,40 +55,34 @@ select {
 }
 
 .brand {
-  height: 88px;
-  padding: 22px 24px;
+  padding: 20px 16px 12px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 12px;
   color: white;
 }
 
-.brand-mark {
-  width: 40px;
-  height: 40px;
-  display: grid;
-  place-items: center;
-  border-radius: 12px;
-  background: #2f80c1;
-  color: white;
-  font-family: "Space Grotesk";
-  font-size: 19px;
-  font-weight: 700;
+.brand-logo {
+  width: 100%;
+  max-width: 175px;
+  padding: 4px 0;
+  background: transparent;
+  box-sizing: border-box;
 }
+.brand-logo img { display: block; width: 100%; height: auto; object-fit: contain; }
+.brand-logo .brand-logo-symbol { display: none; }
+.main-sider.ant-layout-sider-collapsed .brand { padding-inline: 12px; }
+.main-sider.ant-layout-sider-collapsed .brand-title,
+.main-sider.ant-layout-sider-collapsed .brand-logo-full { display: none; }
+.main-sider.ant-layout-sider-collapsed .brand-logo-symbol { display: block; }
 
 .brand-title {
-  font-family: "Space Grotesk";
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: -0.3px;
-}
-
-.brand-subtitle {
-  color: #9fb3c8;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 1.2px;
-  margin-top: 2px;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-align: center;
+  overflow-wrap: break-word;
 }
 
 .side-section {

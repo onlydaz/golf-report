@@ -12,7 +12,7 @@ import {
   type MeasurementHistoryItem, type MeasurementHistoryPage, type MeasurementListRequest,
   type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics,
 } from "../../services/measurementService";
-import { formatDecimal, formatLoadKg, stationPointNumbers } from "../../utils/as200Report";
+import { formatClubNumber, formatDecimal, formatLoadKg, stationPointNumbers } from "../../utils/as200Report";
 import { formatReportTime, reportDateBoundary } from "../../utils/reportTime";
 import "./MeasurementHistory.css";
 
@@ -126,23 +126,23 @@ function MeasurementHistory() {
     { title: "SKU", dataIndex: "productCode", render: value => value || "Chưa gán SKU", width: 160, fixed: "left" },
     { title: "Gậy đầu tiên", dataIndex: "firstMeasuredAt", render: formatReportTime, width: 180 },
     { title: "Gậy gần nhất", dataIndex: "lastMeasuredAt", render: formatReportTime, width: 180 },
-    { title: "Tổng số gậy", dataIndex: "total", width: 110, align: "right" },
-    { title: "OK", dataIndex: "ok", width: 85, align: "right", className: "history-value-ok" },
-    { title: "NG", dataIndex: "ng", width: 85, align: "right", className: "history-value-ng" },
-    { title: "NG BUTT", dataIndex: "buttNg", width: 100, align: "right" },
-    { title: "NG TIP", dataIndex: "tipNg", width: 100, align: "right" },
-    { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.ok + row.ng), width: 110, align: "right" },
+    { title: "Tổng số gậy", dataIndex: "total", width: 110, align: "center" },
+    { title: "OK", dataIndex: "ok", width: 85, align: "center", className: "history-value-ok" },
+    { title: "NG", dataIndex: "ng", width: 85, align: "center", className: "history-value-ng" },
+    { title: "NG BUTT", dataIndex: "buttNg", width: 100, align: "center" },
+    { title: "NG TIP", dataIndex: "tipNg", width: 100, align: "center" },
+    { title: "Tỷ lệ OK", render: (_, row) => rate(row.ok, row.ok + row.ng), width: 110, align: "center" },
   ], []);
   const columns = useMemo<ColumnsType<MeasurementHistoryItem>>(() => {
     const stationColumns = (station: "BUTT" | "TIP"): ColumnsType<MeasurementHistoryItem> => [
       ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
         render: (_: unknown, row: MeasurementHistoryItem) => formatDecimal(row.decisionPoints.find(point => point.station === station && point.pointNumber === pointNumber)?.bend),
       })),
-      { title: `Lực ${station} (kg)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatLoadKg, width: 120, align: "center" },
+      { title: `Lực đè ${station} (kg)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatLoadKg, width: 120, align: "center" },
     ];
     return [
       { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, align: "center", render: formatReportTime },
-      { title: "Số gậy", dataIndex: "clubNumber", width: 90, align: "center" },
+      { title: "Số gậy", dataIndex: "clubNumber", render: formatClubNumber, width: 90, align: "center" },
       { title: "BUTT", align: "center", children: stationColumns("BUTT") }, { title: "TIP", align: "center", children: stationColumns("TIP") },
       ...([ ["BUTT", "buttResult"], ["TIP", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
         title, dataIndex, width: 90, align: "center" as const,

@@ -1,8 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { measurementSettings } from "../config/measurementSettings";
-import { bendAxisTicks, bendDomain, bendExcess, bendIntervalZone } from "./bendChart";
+import { bendAxisTicks, bendDataDomain, bendDomain, bendExcess, bendIntervalZone } from "./bendChart";
 
 describe("fixed chart setpoints", () => {
+  it("fits the monitor to real values with small padding instead of expanding to limits", () => {
+    expect(bendDataDomain([100, 101, 104, null, NaN, Infinity])).toEqual([95, 109]);
+    expect(bendDataDomain([100, 300])).toEqual([90, 310]);
+    expect(bendDataDomain([0, 0])).toEqual([-5, 5]);
+    expect(bendDataDomain([-3.5])).toEqual([-8.5, 1.5]);
+    expect(bendDataDomain([null, NaN])).toEqual([0, 1]);
+    const ticks = bendAxisTicks(bendDataDomain([100, 104]), measurementSettings.BUTT);
+    expect(ticks).not.toContain(50);
+    expect(ticks).not.toContain(200);
+    expect(ticks.every(value => value >= 95 && value <= 109)).toBe(true);
+  });
+  it("keeps a nearby limit visible while retaining outlier classification", () => {
+    for (const settings of [measurementSettings.BUTT, measurementSettings.TIP]) {
+      const domain = bendDataDomain([49, 51]);
+      expect(bendAxisTicks(domain, settings)).toContain(50);
+      expect(bendAxisTicks(domain, settings)).not.toContain(200);
+      expect(bendExcess(49, settings)).toBe(1);
+      expect(bendExcess(51, settings)).toBe(0);
+      expect(bendExcess(201, settings)).toBe(1);
+    }
+  });
   it.each(["BUTT", "TIP"] as const)("always includes both limit ticks for %s across different measurement ranges", station => {
     const settings = measurementSettings[station];
     for (const values of [[0, 2], [80, 120], [-500, 5000], [null], []]) {
@@ -14,9 +35,9 @@ describe("fixed chart setpoints", () => {
       expect(ticks.every(value => value >= domain[0] && value <= domain[1])).toBe(true);
     }
   });
-  it("uses shared 50–200 mm limits for both stations and retains load in grams internally", () => {
-    expect(measurementSettings.BUTT).toEqual({ loadG: 500, pushDistMm: 10, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [150, 300, 450, 600] });
-    expect(measurementSettings.TIP).toEqual({ loadG: 200, pushDistMm: 8, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [80] });
+  it("uses shared 50–200 mm limits for both stations and uses kilogram setpoints", () => {
+    expect(measurementSettings.BUTT).toEqual({ loadKg: 2.5, pushDistMm: 10, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [150, 300, 450, 600] });
+    expect(measurementSettings.TIP).toEqual({ loadKg: 0.2, pushDistMm: 8, bendLowerMm: 50, bendUpperMm: 200, positionsMm: [80] });
   });
   it.each(["BUTT", "TIP"] as const)("classifies report bins conservatively using the same %s limits", station => {
     const settings = measurementSettings[station];

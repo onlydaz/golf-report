@@ -1,6 +1,13 @@
 import { formatReportTime } from "./reportTime";
 import type { MeasurementDetail, MeasurementPoint, MeasurementStation } from "../services/measurementService";
 
+/** Presentation only: keep the stored PLC club number unchanged. */
+export function formatClubNumber(value: number | string | null | undefined): string {
+  if (value == null) return "—";
+  const number = String(value).trim().replace(/^#+\s*/, "");
+  return number ? `#${number}` : "—";
+}
+
 export function stationPointNumbers(station: "TIP" | "BUTT"): readonly number[] {
   return station === "TIP" ? [1] : [1, 2, 3, 4];
 }
@@ -22,50 +29,17 @@ export function isUnmeasuredPoint(point: Pick<MeasurementPoint, "attemptCount" |
     && (point.position == null || Number(point.position) === 0);
 }
 
-export function formatDecimal(value: string | null | undefined): string {
-  if (value == null) return "—";
-
-  const scientific = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(value);
-
-  if (scientific) {
-    const [, sign, whole, fraction = "", exponent] = scientific;
-    const digits = whole + fraction;
-    const decimalAt = whole.length + Number(exponent);
-
-    value =
-      sign +
-      (decimalAt <= 0
-        ? `0.${"0".repeat(-decimalAt)}${digits}`
-        : decimalAt >= digits.length
-          ? digits + "0".repeat(decimalAt - digits.length)
-          : `${digits.slice(0, decimalAt)}.${digits.slice(decimalAt)}`);
-  }
-
-  return value.replace(
-    /^(-?\d+)(?:\.(\d+))?$/,
-    (_, integer: string, fraction?: string) =>
-      integer.replace(/\B(?=(\d{3})+(?!\d))/g, ".") +
-      (fraction ? `,${fraction}` : "")
-  );
+/** Format for display only; raw decimal strings stay unchanged in exports and storage. */
+export function formatDecimal(value: string | number | null | undefined): string {
+  if (value == null || (typeof value === "string" && !value.trim())) return "—";
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString("vi-VN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : "—";
 }
 
-/** Convert stored grams at the presentation boundary, preserving decimal precision. */
-export function gramsToKilograms(value: string | number | null | undefined): string | null {
-  if (value == null) return null;
-  const match = /^([+-]?)(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(String(value));
-  if (!match) return null;
-  const [, sign, whole, fraction = "", exponent = "0"] = match;
-  const digits = whole + fraction;
-  const decimalAt = whole.length + Number(exponent) - 3;
-  if (!Number.isSafeInteger(decimalAt) || Math.abs(decimalAt) > 10000) return null;
-  const shifted = decimalAt <= 0 ? `0.${"0".repeat(-decimalAt)}${digits}`
-    : decimalAt >= digits.length ? digits + "0".repeat(decimalAt - digits.length)
-      : `${digits.slice(0, decimalAt)}.${digits.slice(decimalAt)}`;
-  const normalized = shifted.replace(/^0+(?=\d)/, "").replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
-  return `${sign === "-" && normalized !== "0" ? "-" : ""}${normalized}`;
-}
-
-export const formatLoadKg = (value: string | number | null | undefined): string => formatDecimal(gramsToKilograms(value));
+// PLC and PostgreSQL Load values are already kilograms.
+export const formatLoadKg = formatDecimal;
 
 export function buildReportTables(records: MeasurementDetail[]) {
   const measurements = records.map(item => ({
@@ -77,9 +51,9 @@ export function buildReportTables(records: MeasurementDetail[]) {
     TotalCount: item.totalCount ?? "",
     OverallResult: item.overallResult,
     "TIP Result": item.tipResult ?? "",
-    "TIP Load (kg)": gramsToKilograms(item.tipLoad) ?? "",
+    "TIP Load (kg)": item.tipLoad ?? "",
     "BUTT Result": item.buttResult ?? "",
-    "BUTT Load (kg)": gramsToKilograms(item.buttLoad) ?? "",
+    "BUTT Load (kg)": item.buttLoad ?? "",
   }));
 
   const points = records.flatMap(item =>

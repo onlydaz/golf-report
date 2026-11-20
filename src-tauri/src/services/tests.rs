@@ -20,8 +20,8 @@ fn all_zero_publication_creates_unknown_draft_without_inventing_metadata() {
         assert_eq!(draft.record_seq, 0);
         assert_eq!(draft.publication_count, Some(total));
         assert_eq!(draft.club_number, 0);
-        assert_eq!(draft.product_code, "SKU-FROZEN");
-        assert_eq!(draft.sku_origin, "QC");
+        assert_eq!(draft.product_code, "N/A");
+        assert_eq!(draft.sku_origin, "MISSING");
         assert_eq!(draft.overall_result, MeasurementResult::Unmeasured);
         assert!(draft.quality_error.is_some());
         for station in draft.stations {
@@ -91,7 +91,7 @@ fn manual_sparse_words_preserve_types_counts_raw_sequence_and_sku_provenance() {
     row.assigned_sku = None;
     let missing = draft_from_inbox(&row).unwrap();
     assert_eq!(missing.sku_origin, "MISSING");
-    assert_eq!(missing.product_code, "");
+    assert_eq!(missing.product_code, "N/A");
     assert!(missing.quality_error.is_some());
 
     let mut complete = receipt(1);
@@ -99,8 +99,8 @@ fn manual_sparse_words_preserve_types_counts_raw_sequence_and_sku_provenance() {
     raw[4..14].fill(0);
     complete.raw_registers = serde_json::json!(raw);
     let draft = draft_from_inbox(&complete).unwrap();
-    assert_eq!(draft.product_code, "SKU-FROZEN");
-    assert_eq!(draft.sku_origin, "QC");
+    assert_eq!(draft.product_code, "N/A");
+    assert_eq!(draft.sku_origin, "MISSING");
     assert_eq!(draft.quality_error, None);
     assert_eq!(draft.overall_result, MeasurementResult::Ng);
 }
@@ -158,11 +158,12 @@ fn completed_measurement_preserves_zero_negative_and_positive_reals_in_both_word
 }
 
 #[test]
-fn projection_preserves_frozen_sku_results_loads_attempts_and_time() {
+fn projection_preserves_plc_product_results_loads_attempts_and_time() {
     let inbox = receipt(10);
     let draft = draft_from_inbox(&inbox).unwrap();
     assert_eq!(draft.measured_at, inbox.received_at);
-    assert_eq!(draft.product_code, "SKU-FROZEN");
+    assert_eq!(draft.product_code, "AB");
+    assert_eq!(draft.sku_origin, "PLC");
     assert_eq!(draft.overall_result, MeasurementResult::Ng);
     assert_eq!(draft.club_number, 42);
     assert_eq!(draft.stations.len(), 2);
@@ -188,6 +189,89 @@ fn projection_preserves_frozen_sku_results_loads_attempts_and_time() {
             .to_string(),
         "1.25"
     );
+}
+#[test]
+fn native_product_uses_only_plc_or_na_without_changing_raw_or_results() {
+    for (plc, qc, expected, origin) in [
+        ("X212PI", Some("GOLD-X1"), "X212PI", "PLC"),
+        ("GOLD-X1", Some("GOLD-X1"), "GOLD-X1", "PLC"),
+        ("GOLD-X2", Some("GOLD-X1"), "GOLD-X2", "PLC"),
+        ("GOLD-X2", None, "GOLD-X2", "PLC"),
+        ("GOLD-X2", Some(""), "GOLD-X2", "PLC"),
+        ("N/A", Some("GOLD-X1"), "N/A", "PLC"),
+        ("", Some("GOLD-X1"), "N/A", "MISSING"),
+        ("", None, "N/A", "MISSING"),
+        ("", Some(""), "N/A", "MISSING"),
+        ("   ", Some("GOLD-X1"), "N/A", "MISSING"),
+        ("   ", None, "N/A", "MISSING"),
+    ] {
+        let mut row = receipt(1);
+        let mut raw = registers(1);
+        raw[4..14].fill(0);
+        for (index, bytes) in plc.as_bytes().chunks(2).enumerate() {
+            raw[4 + index] = u16::from_le_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]);
+        }
+        row.raw_registers = serde_json::json!(raw);
+        row.assigned_sku = qc.map(str::to_owned);
+        let before = row.raw_registers.clone();
+        let draft = draft_from_inbox(&row).unwrap();
+        assert_eq!(draft.product_code, expected);
+        assert_eq!(draft.sku_origin, origin);
+        assert_eq!(draft.overall_result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[0].result, MeasurementResult::Ng);
+        assert_eq!(draft.stations[1].result, MeasurementResult::Ok);
+        assert_eq!(row.raw_registers, before);
+        assert_eq!(draft.quality_error, None);
+    }
+}
+
+#[test]
+fn invalid_plc_product_keeps_error_without_manual_or_na_fallback() {
+    // Non-ASCII, nonzero after NUL, and ASCII control characters are invalid, not blank.
+    for words in [[0x00ff, 0], [0x0041, 0x0042], [0x0009, 0]] {
+        for qc in [Some("GOLD-X1"), None] {
+            let mut row = receipt(1);
+            let mut raw = registers(1);
+            raw[4..14].fill(0);
+            raw[4..6].copy_from_slice(&words);
+            row.raw_registers = serde_json::json!(raw);
+            row.assigned_sku = qc.map(str::to_owned);
+            let draft = draft_from_inbox(&row).unwrap();
+            assert_eq!(draft.product_code, "");
+            assert_eq!(draft.sku_origin, "MISSING");
+            let diagnostic = draft.quality_error.unwrap();
+            assert!(diagnostic.contains("PLC ProductCode invalid"));
+            assert!(diagnostic.contains("no manual fallback; invalid code is not N/A"));
+            assert_eq!(draft.overall_result, MeasurementResult::Ng);
+            assert_eq!(row.raw_registers, serde_json::json!(raw));
+        }
+    }
+}
+
+#[test]
+fn projection_retry_uses_receipt_metadata_after_operator_config_changes() {
+    for plc_has_code in [false, true] {
+        let mut row = receipt(1);
+        let mut raw = registers(1);
+        if !plc_has_code {
+            raw[4..14].fill(0);
+        }
+        row.raw_registers = serde_json::json!(raw);
+        row.assigned_sku = Some("GOLD-X1".into());
+        let first = draft_from_inbox(&row).unwrap();
+        let mut current_config = crate::plc::simulator_config::SimulatorConfig::default();
+        current_config.operator_sku = Some("GOLD-X2".into());
+        // A restart reloads the same persisted raw receipt, not live PLC/config.
+        let restored: InboxRecord = row.clone();
+        let retry = draft_from_inbox(&restored).unwrap();
+        assert_eq!(current_config.operator_sku.as_deref(), Some("GOLD-X2"));
+        assert_eq!(first.product_code, if plc_has_code { "AB" } else { "N/A" });
+        assert_eq!(retry.product_code, first.product_code);
+        assert_eq!(retry.sku_origin, if plc_has_code { "PLC" } else { "MISSING" });
+        assert_eq!(retry.publication_count, first.publication_count);
+        assert_eq!(row.assigned_sku.as_deref(), Some("GOLD-X1"));
+        assert_eq!(row.raw_registers, serde_json::json!(raw));
+    }
 }
 #[test]
 fn zero_and_status_diagnostics_do_not_rewrite_plc_results() {
@@ -432,8 +516,10 @@ async fn postgres_projection_transaction_retry_idempotency_and_history() {
     let key = crate::database::test_support::source_key("services");
     let source = SourceRepository::upsert(&pool, &key, None).await.unwrap();
     // Fixture setup inserts raw exactly as the schema requires. Worker/store integration separately exercises production receive.
+    let mut raw = registers(1);
+    raw[4..14].fill(0); // A valid blank PLC ProductCode becomes N/A despite assigned_sku.
     let row:InboxRecord=sqlx::query_as("INSERT INTO plc_inbox(source_id,ingest_key,record_seq,total_count,buffer_index,raw_registers,word_order,received_at,processing_status,publication_session,publication_count,assigned_sku) VALUES($1,'fixture',1,1,0,$2,'LOW',now(),'PENDING',$3,1,$4) RETURNING *")
-        .bind(source.id).bind(serde_json::to_value(registers(1)).unwrap()).bind(crate::database::test_support::session()).bind(crate::database::test_support::sku()).fetch_one(&pool).await.unwrap();
+        .bind(source.id).bind(serde_json::to_value(raw).unwrap()).bind(crate::database::test_support::session()).bind(crate::database::test_support::sku()).fetch_one(&pool).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
     let rolled_back_id = InboxService::process_in_transaction(&mut tx, row.id)
         .await
@@ -464,12 +550,9 @@ async fn postgres_projection_transaction_retry_idempotency_and_history() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.stations.len(), 2);
-    assert_eq!(
-        saved.summary.product_code,
-        crate::database::test_support::sku()
-    );
+    assert_eq!(saved.summary.product_code, "N/A");
     let request = MeasurementListRequest {
-        product_code: Some(crate::database::test_support::sku()),
+        product_code: Some("N/A".into()),
         ..Default::default()
     };
     assert!(

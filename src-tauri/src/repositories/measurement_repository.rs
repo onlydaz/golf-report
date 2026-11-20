@@ -281,11 +281,18 @@ mod report_tests {
         let key=crate::database::test_support::source_key("report");
         let source=super::super::SourceRepository::upsert(&write_pool,&key,None).await.unwrap();
         let mut row=crate::database::test_support::receipt(1);row.source_id=source.id;
+        // Use an isolated ASCII ProductCode in raw, rather than a QC fallback.
+        let product = format!("IT-{}", source.id);
+        assert!(product.len() <= 20);
+        for word in 4..14 { row.raw_registers[word] = serde_json::json!(0); }
+        for (index, bytes) in product.as_bytes().chunks(2).enumerate() {
+            row.raw_registers[4 + index] = serde_json::json!(u16::from_le_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]));
+        }
         row.publication_session=Some(crate::database::test_support::session());row.assigned_sku=Some(crate::database::test_support::sku());
         let draft=crate::services::inbox_service::draft_from_inbox(&row).unwrap();
         let mut tx=write_pool.begin().await.unwrap();crate::services::MeasurementService::insert(&mut tx,&draft).await.unwrap();tx.commit().await.unwrap();write_pool.close().await;
         let pool=crate::database::test_support::readonly_pool(2).await;
-        let scope=MeasurementListRequest{product_code:Some(crate::database::test_support::sku()),..Default::default()};
+        let scope=MeasurementListRequest{product_code:Some(product),..Default::default()};
         let all = MeasurementRepository::report(&pool, &scope)
             .await
             .unwrap();

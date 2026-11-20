@@ -33,7 +33,7 @@ describe("stored monitor decision bends", () => {
     const first = record(1), second = { ...record(2), recordSeq: 1, sessionId: "another-session" };
     const records = [record(60, "OTHER"), first, second, first];
     expect(buildBendSeries(records, "SKU-A", "TIP").map(row => [row.id, row.p1, row.p2])).toEqual([[1, 9.5, null], [2, 9.5, null]]);
-    expect(buildBendSeries(records, undefined, "BUTT")).toEqual([]);
+    expect(buildBendSeries(records, undefined, "BUTT").map(row => row.id)).toEqual([1, 2, 60]);
     expect(buildBendSeries(records, "MISSING", "BUTT")).toEqual([]);
     expect(records).toHaveLength(4);
   });
@@ -60,5 +60,12 @@ describe("stored monitor decision bends", () => {
     expect(new Set(next.map(row => row.id)).size).toBe(30);
     const sameTime = { ...record(100), measuredAt: records[0].measuredAt };
     expect(buildBendSeries([sameTime, records[0]], "SKU-A", "BUTT").map(row => row.id)).toEqual([1, 100]);
+  });
+  it("shows the newest 30 across PLC ProductCodes including N/A when no SKU filter is supplied", () => {
+    const records = Array.from({ length: 35 }, (_, index) => record(index + 1, ["X212PI", "GOLD-X2", "N/A"][index % 3]));
+    const series = buildBendSeries(records, undefined, "BUTT");
+    expect(series.map(row => row.id)).toEqual(Array.from({ length: 30 }, (_, index) => index + 6));
+    expect(series.every(row => row.p1 === -0.5)).toBe(true);
+    expect(records.some(row => row.productCode === "N/A")).toBe(true);
   });
 });

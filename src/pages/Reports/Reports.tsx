@@ -19,37 +19,40 @@ import {
   type MeasurementQualityStatistics, type PointSummaryStatistics,
 } from "../../services/measurementService";
 import { createCsvBytes, createExcelBytes } from "../../utils/as200Export";
-import { buildReportTables, formatDecimal, formatLoadKg, isBusinessPoint } from "../../utils/as200Report";
+import { buildReportTables, formatClubNumber, formatDecimal, formatLoadKg, isBusinessPoint } from "../../utils/as200Report";
 import { formatReportTime, reportDateBoundary, REPORT_TIME_ZONE, vietnamNow } from "../../utils/reportTime";
 import { groupedReportWindow } from "../../utils/reportBuckets";
 import { measurementSettings } from "../../config/measurementSettings";
-import { bendDomain, bendIntervalZone } from "../../utils/bendChart";
+import { buildBendHistogram } from "../../utils/bendHistogram";
+import { buildButtAttempts } from "../../utils/reportAttempts";
 import "./Reports.css";
 
 type ResultFilter = "OK" | "NG" | "UNMEASURED" | undefined;
 type Period = "today" | "week" | "custom";
 const defaultRange = (): [Dayjs, Dayjs] => [vietnamNow().subtract(6, "day"), vietnamNow()];
-const numeric = (value: string | null) => value == null || !Number.isFinite(Number(value))
-  ? "—" : Number(value).toLocaleString("vi-VN", { maximumSignificantDigits: 9 });
+const numeric = formatDecimal;
+const binNumber = (value: number) => value.toLocaleString("vi-VN", { maximumFractionDigits: 2 });
+const binLabel = (bin: { lower: number | null; upper: number | null }) => bin.lower == null ? `< ${binNumber(bin.upper!)}`
+  : bin.upper == null ? `> ${binNumber(bin.lower)}` : `${binNumber(bin.lower)}–${binNumber(bin.upper)}`;
 
 const pointColumns: ColumnsType<PointSummaryStatistics> = [
   { title: "Điểm đo", width: 145, render: (_, point) => `${point.station} · P${point.pointNumber} (${formatDecimal(point.position)} mm)` },
-  { title: "Lực đè TB (kg)", dataIndex: "loadAvg", width: 120, render: formatLoadKg, align: "right" },
-  { title: "K/c đẩy TB (mm)", dataIndex: "pushDistAvg", render: numeric, align: "right" },
-  { title: "Độ cong Min (mm)", dataIndex: "bendMin", render: numeric, align: "right" },
-  { title: "Độ cong TB (mm)", dataIndex: "bendAvg", render: numeric, align: "right" },
-  { title: "Độ cong Max (mm)", dataIndex: "bendMax", render: numeric, align: "right" },
+  { title: "Lực đè TB (kg)", dataIndex: "loadAvg", width: 120, render: formatLoadKg, align: "center" },
+  { title: "K/c đẩy TB (mm)", dataIndex: "pushDistAvg", render: numeric, align: "center" },
+  { title: "Độ cong Min (mm)", dataIndex: "bendMin", render: numeric, align: "center" },
+  { title: "Độ cong TB (mm)", dataIndex: "bendAvg", render: numeric, align: "center" },
+  { title: "Độ cong Max (mm)", dataIndex: "bendMax", render: numeric, align: "center" },
   { title: "Đo lại", dataIndex: "retested", width: 90, align: "center" },
   { title: "NG", dataIndex: "ng", width: 80, align: "center", className: "reports-point-ng" },
 ];
 const columns: ColumnsType<BackendMeasurement> = [
   { title: "Thời gian nhận", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
   { title: "SKU", dataIndex: "productCode", width: 150 },
-  { title: "Số gậy", dataIndex: "clubNumber", width: 80 },
-  { title: "BUTT Load (kg)", dataIndex: "buttLoad", render: formatLoadKg, width: 125 },
-  { title: "TIP Load (kg)", dataIndex: "tipLoad", render: formatLoadKg, width: 125 },
+  { title: "Số gậy", dataIndex: "clubNumber", render: formatClubNumber, width: 80, align: "center" },
+  { title: "Lực đè BUTT (kg)", dataIndex: "buttLoad", render: formatLoadKg, width: 125, align: "center" },
+  { title: "Lực đè TIP (kg)", dataIndex: "tipLoad", render: formatLoadKg, width: 125, align: "center" },
   ...([ ["Butt", "buttResult"], ["Tip", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
-    title, dataIndex, width: 90, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />,
+    title, dataIndex, width: 90, align: "center" as const, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />,
   })),
 ];
 
@@ -93,6 +96,25 @@ function Reports() {
   const [error, setError] = useState("");
   const [listError, setListError] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [attemptData, setAttemptData] = useState<{ key: string; items: ReturnType<typeof buildButtAttempts> }>();
+  const [attemptLoading, setAttemptLoading] = useState(true);
+  const [attemptError, setAttemptError] = useState("");
+  const [attemptView, setAttemptView] = useState<{ key: string; point: number }>();
+  const attemptPoint = attemptView?.key === filterKey ? attemptView.point : 0;
+  const allAttempts = attemptData?.key === filterKey ? attemptData.items : undefined;
+  const filteredAttempts = useMemo(() => (allAttempts ?? []).filter(attempt => !attemptPoint || attempt.pointNumber === attemptPoint), [allAttempts, attemptPoint]);
+
+  useEffect(() => {
+    let active = true;
+    setAttemptError(""); setAttemptLoading(databaseConnected);
+    if (!databaseConnected) return;
+    // Existing report API loads the full tree in four batch queries, without N+1.
+    void getMeasurementReport(query.filters).then(data => {
+      if (active) setAttemptData({ key: filterKey, items: buildButtAttempts(data) });
+    }).catch(() => { if (active) setAttemptError("Không thể tải các lượt đo độ cong. Vui lòng tạo báo cáo lại."); })
+      .finally(() => { if (active) setAttemptLoading(false); });
+    return () => { active = false; };
+  }, [query.filters, databaseConnected]);
 
   useEffect(() => {
     let active = true;
@@ -163,10 +185,12 @@ function Reports() {
     if (exporting) return;
     setExporting(true);
     try {
-      // Explicit export is the only path loading full nested details, without pagination.
+      // Export keeps its own fresh snapshot for the requested filters.
       const all = await getMeasurementReport(query.filters);
       if (!all.length) { void messageApi.info("Không có dữ liệu phù hợp để xuất."); return; }
-      const path = await save({ defaultPath: `bao-cao-do-gay-${vietnamNow().format("YYYYMMDD-HHmmss")}.${format}`,
+      const defaultPath = format === "xlsx" ? `New-Ocean-${dayjs().format("YYYYMMDD-HHmmss")}.xlsx`
+        : `bao-cao-do-gay-${vietnamNow().format("YYYYMMDD-HHmmss")}.csv`;
+      const path = await save({ defaultPath,
         filters: [{ name: format === "csv" ? "CSV" : "Excel", extensions: [format] }] });
       if (!path) return;
       const rows = buildReportTables(all).measurements;
@@ -178,8 +202,11 @@ function Reports() {
   };
 
   const bendSettings = measurementSettings.BUTT;
-  const { mostNg, daily, topNg, cpk, histogram, histogramDomain, pointSummary } = useMemo(() => {
+  const bendHistogram = useMemo(() => buildBendHistogram(filteredAttempts.map(attempt => attempt.bend),
+    bendSettings.bendLowerMm, bendSettings.bendUpperMm), [filteredAttempts, bendSettings]);
+  const { mostNg, daily, topNg, hasPointMeasurements, cpk, pointSummary } = useMemo(() => {
     const points = (quality?.points ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber));
+    const hasPointMeasurements = points.some(point => point.measured > 0);
     // Each measurement belongs to one SKU/position at a given station/point.
     // Combine SKU/position groups by station/point; each record contributes once per point.
     const ngByPoint = new Map<string, { station: string; pointNumber: number; ng: number }>();
@@ -189,7 +216,11 @@ function Reports() {
       entry.ng += point.ng;
       ngByPoint.set(key, entry);
     }
-    const mostNg = stats?.totalNg ? [...ngByPoint.values()].filter(point => point.ng > 0).sort((a, b) => b.ng - a.ng)[0] : undefined;
+    const pointTotals = [...ngByPoint.values()];
+    const maxNg = Math.max(0, ...pointTotals.map(point => point.ng));
+    const mostNg = stats?.totalNg && maxNg > 0
+      ? { ng: maxNg, points: pointTotals.filter(point => point.ng === maxNg) }
+      : undefined;
     const daily = stats?.daily.map(item => ({ ...item, rate: item.total ? 100 * item.ok / item.total : null })) ?? [];
     const topNg = quality && stats ? ([
       ["BUTT", 1, 150], ["BUTT", 2, 300], ["BUTT", 3, 450], ["BUTT", 4, 600], ["TIP", 1, 80],
@@ -211,15 +242,8 @@ function Reports() {
       if (![lower, upper, mean, deviation].every(Number.isFinite) || upper <= lower || deviation <= 0) return null;
       return Math.min((upper - mean) / (3 * deviation), (mean - lower) / (3 * deviation));
     })();
-    const histogram = quality?.buttHistogram?.map((bin, index) => ({ ...bin,
-      zone: bendIntervalZone(Number(bin.lower), Number(bin.upper), index === quality.buttHistogram.length - 1, bendSettings),
-      midpoint: (Number(bin.lower) + Number(bin.upper)) / 2,
-      label: bin.lower === bin.upper ? numeric(bin.lower) : `${numeric(bin.lower)}–${numeric(bin.upper)}`,
-      bounds: `[${formatDecimal(bin.lower)}; ${formatDecimal(bin.upper)}${index === quality.buttHistogram.length - 1 ? "]" : ")"} mm`,
-    })) ?? [];
-    const histogramDomain = bendDomain(histogram.flatMap(bin => [Number(bin.lower), Number(bin.upper)]), bendSettings);
     const pointSummary = (quality?.pointSummary ?? []).filter(point => isBusinessPoint(point.station, point.pointNumber));
-    return { mostNg, daily, topNg, cpk, histogram, histogramDomain, pointSummary };
+    return { mostNg, daily, topNg, hasPointMeasurements, cpk, pointSummary };
   }, [quality, stats, bendSettings]);
   const cards = [
     ["Tổng số gậy", stats?.totalMeasurements, "blue", undefined],
@@ -266,10 +290,12 @@ function Reports() {
             options={[{ value: "OK", label: "OK" }, { value: "NG", label: "NG" }, { value: "UNMEASURED", label: "Chưa đo" }]} /></label>
         ))}
         </div>
+        <div className="reports-action-buttons">
         <Space wrap className="reports-main-actions"><Button className="reports-apply" type="primary" icon={<FilterOutlined />} onClick={apply} loading={loading} disabled={!databaseConnected || exporting}>Tạo báo cáo</Button>
           <Button className="reports-reset" icon={<ReloadOutlined />} onClick={reset} disabled={exporting}>Đặt lại</Button></Space>
         <Space wrap className="reports-export-actions"><Button className="reports-excel" icon={<FileExcelOutlined />} loading={exporting} disabled={!databaseConnected || loading || !stats || exporting} onClick={() => void exportReport("xlsx")}>Xuất Excel</Button>
           <Button className="reports-csv" icon={<FileTextOutlined />} loading={exporting} disabled={!databaseConnected || loading || !stats || exporting} onClick={() => void exportReport("csv")}>Xuất CSV</Button></Space>
+        </div>
       </div>
     </Card>
     {error && <Alert type="error" showIcon title={error} />}
@@ -278,8 +304,14 @@ function Reports() {
       {subtitle && <small>{subtitle}</small>}
     </Card>)}
       <Card className="report-stat"><span>NG nhiều nhất tại</span>
-        <strong>{loading && !stats ? <Spin size="small" /> : quality && stats ? mostNg ? `${mostNg.station} · P${mostNg.pointNumber}` : "Chưa có" : "—"}</strong>
-        <small>{quality && stats ? <>{mostNg?.ng.toLocaleString("vi-VN") ?? "0"} gậy · {mostNg && stats.totalNg ? (100 * mostNg.ng / stats.totalNg).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng NG</> : "—"}</small>
+        <strong className={mostNg && mostNg.points.length > 1 ? "report-stat-tied-points" : undefined}>
+          {loading && !stats ? <Spin size="small" /> : quality && stats ? mostNg
+            ? mostNg.points.map(point => <span key={`${point.station}-${point.pointNumber}`}>{point.station} · P{point.pointNumber}</span>)
+            : "Chưa có" : "—"}
+        </strong>
+        <small>{quality && stats ? mostNg
+          ? <>{mostNg.points.length > 1 ? "Mỗi điểm " : ""}{mostNg.ng.toLocaleString("vi-VN")} gậy · {stats.totalNg ? (100 * mostNg.ng / stats.totalNg).toLocaleString("vi-VN", { maximumFractionDigits: 1 }) : "0"}% tổng NG</>
+          : "Chưa có điểm NG" : "—"}</small>
       </Card>
       <Card className="report-stat"><span>Gậy phải đo lại (≥ 2 lần)</span>
         <strong>{loading && !stats ? <Spin size="small" /> : quality && stats ? stats.totalMeasurements ? quality.retestedClubs.toLocaleString("vi-VN") : "0" : "—"}</strong>
@@ -319,23 +351,29 @@ function Reports() {
         </BarChart></ResponsiveContainer></div> : empty}
       </Card>
       <Card className="section-card" title="NG theo công đoạn / điểm đo">
-        {topNg.length ? <div className="report-ng-progress-list">
-          {topNg.map(point => <div className="report-ng-progress-row" key={point.label}>
+        {loading ? <div className="reports-loading" role="status"><Spin tip="Đang tải dữ liệu điểm đo"><div style={{ height: 100 }} /></Spin></div>
+          : error ? empty
+          : !hasPointMeasurements ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Chưa có dữ liệu điểm đo" />
+          : <div className="report-ng-progress-list">
+          {topNg.map(point => <div className={`report-ng-progress-row${point.ng > 0 && point.ng === topNg[0].ng ? " report-ng-progress-highest" : ""}`} key={point.label}>
             <span className="report-ng-progress-label">{point.label}</span>
             <div className="report-ng-progress-track" role="meter" aria-label={`Số gậy NG tại ${point.label}`}
-              aria-valuemin={0} aria-valuemax={Math.max(1, topNg[0].ng)} aria-valuenow={point.ng}
+              aria-valuemin={0} aria-valuemax={100} aria-valuenow={point.rate}
               aria-valuetext={`${point.ng} gậy NG · ${point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%`}>
               <div className="report-ng-progress-fill" style={{
-                width: `${topNg[0].ng > 0 ? 100 * point.ng / topNg[0].ng : 0}%`,
-                backgroundColor: point.station === "BUTT" ? "#2878D0" : "#F0642C",
+                width: `${point.ng === 0 ? 100 : point.rate}%`,
+                backgroundColor: point.ng === 0 ? "#dcfce7" : "#B91C1C",
               }} />
             </div>
-            <span className="report-ng-progress-value">{point.ng.toLocaleString("vi-VN")} · {point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%</span>
+            <span className={`report-ng-progress-value${point.ng === 0 ? " report-ng-zero" : ""}`}>
+              {point.ng.toLocaleString("vi-VN")} · {point.rate.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%
+              {point.ng === 0 && <small>Đạt yêu cầu</small>}
+            </span>
           </div>)}
-        </div> : empty}
+        </div>}
       </Card>
       <Card className="section-card" title="Tỷ lệ OK theo ngày">
-        {daily.length ? <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={daily} margin={{ top: 26, right: 24, bottom: 4, left: 8 }}>
+        {daily.length ? <div className="report-chart reports-daily-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={daily} margin={{ top: 26, right: 24, bottom: 4, left: 8 }}>
           <CartesianGrid vertical={false} stroke="#edf2f7" /><XAxis dataKey="date" tick={{ fontSize: 13 }} tickFormatter={value => dayjs(value).format("DD/MM")} />
           <YAxis domain={[75, 100]} ticks={[75, 80, 85, 90, 95, 100]} interval={0} allowDataOverflow
             tickFormatter={value => `${value}%`} width={50} />
@@ -346,9 +384,9 @@ function Reports() {
             return active && entry ? <div className="report-tooltip"><b>{entry.date}</b><div>Tổng: {entry.total} · OK: {entry.ok} · NG: {entry.ng}</div><div>Tỷ lệ OK: {entry.rate?.toLocaleString("vi-VN", { maximumFractionDigits: 2 })}%</div></div> : null;
           }} />
           <Line dataKey="rate" name="Tỷ lệ OK" stroke="#1769aa" strokeWidth={2} isAnimationActive={false}
-            dot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null ? <g />
+            dot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null || payload.rate < 75 || payload.rate > 100 ? <g />
               : <circle cx={cx} cy={cy} r={4} fill={payload.rate < 95 ? "#B91C1C" : "#1769aa"} stroke="white" strokeWidth={1.5} />}
-            activeDot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null ? <g />
+            activeDot={({ cx, cy, payload }) => cx == null || cy == null || payload?.rate == null || payload.rate < 75 || payload.rate > 100 ? <g />
               : <circle cx={cx} cy={cy} r={6} fill={payload.rate < 95 ? "#B91C1C" : "#1769aa"} stroke="white" strokeWidth={2} />}>
             <LabelList dataKey="rate" content={({ x, y, value }) => typeof value !== "number" || x == null || y == null ? <g />
               : <text x={Number(x)} y={Number(y) - 10} textAnchor="middle" fontSize={12} fontWeight={600}
@@ -360,36 +398,66 @@ function Reports() {
       </Card>
     </div>
     <div className="reports-detail-grid">
-      <Card className="section-card" title="Phân bố độ cong BUTT (tất cả điểm)">
-        {histogram.length ? <>
-          <div className="report-chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={histogram} margin={{ top: 12, right: 16, bottom: 8, left: 20 }}>
-            <CartesianGrid vertical={false} stroke="#edf2f7" />
-            <XAxis type="number" dataKey="midpoint" domain={histogramDomain} tick={{ fontSize: 13 }}
-              tickFormatter={value => Number(value).toLocaleString("vi-VN", { maximumFractionDigits: 2 })}
-              label={{ value: "Độ cong (mm)", position: "insideBottom", offset: -5 }} height={50} />
-            <YAxis allowDecimals={false} width={90} tickMargin={8}
-              label={{ value: "Số phép đo", angle: -90, position: "insideLeft", offset: 10, textAnchor: "middle", fontSize: 13 }} />
-            {bendSettings.bendLowerMm != null && <ReferenceLine x={bendSettings.bendLowerMm} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
-              label={{ value: `${formatDecimal(String(bendSettings.bendLowerMm))} mm`, position: "insideTopRight", fontSize: 13 }} />}
-            {bendSettings.bendUpperMm != null && <ReferenceLine x={bendSettings.bendUpperMm} stroke="#b42318" strokeDasharray="4 4" ifOverflow="extendDomain"
-              label={{ value: `${formatDecimal(String(bendSettings.bendUpperMm))} mm`, position: "insideTopLeft", fontSize: 13 }} />}
-            <Tooltip content={({ active, payload }) => {
-              const bin = payload?.[0]?.payload;
-              return active && bin ? <div className="report-tooltip"><b>{bin.bounds}</b><div>{bin.count} phép đo</div>
-                <div>Giới hạn: {formatDecimal(bendSettings.bendLowerMm?.toString())} – {formatDecimal(bendSettings.bendUpperMm?.toString())} mm</div>
-                <div>{bin.zone === "WITHIN" ? "Trong giới hạn" : bin.zone === "MIXED" ? "Nhóm giao giới hạn; không xác định số mẫu vượt từ dữ liệu tổng hợp"
-                  : bin.zone === "UNKNOWN" ? "Chưa có giới hạn" : "Vượt giới hạn"}</div>
-              </div> : null;
-            }} />
-            <Bar isAnimationActive={false} dataKey="count" name="Số phép đo" fill="#3987c9" maxBarSize={40}>
-              {histogram.map((bin, index) => <Cell key={index} fill={bin.zone === "BELOW" || bin.zone === "ABOVE" ? "#cf3c48" : bin.zone === "MIXED" ? "#d99222" : "#3987c9"} />)}
-            </Bar>
-          </BarChart></ResponsiveContainer></div>
-          {quality?.buttSummary && <small className="report-distribution-summary">
-            Trung bình: {numeric(quality.buttSummary.mean)} mm · Độ lệch chuẩn mẫu: {numeric(quality.buttSummary.stddev)} mm
-            {` · Cpk tham chiếu: ${cpk == null ? "—" : cpk.toLocaleString("vi-VN", { maximumFractionDigits: 3 })}`}
-          </small>}
-        </> : empty}
+      <Card className="section-card report-histogram-card" title="Phân bố độ cong BUTT (tất cả điểm)"
+        extra={<Select className="report-histogram-filter" aria-label="Lọc điểm đo BUTT" value={attemptPoint}
+            options={[{ value: 0, label: "Tất cả điểm" }, ...[1, 2, 3, 4].map(value => ({ value, label: `P${value}` }))]}
+            onChange={point => setAttemptView({ key: filterKey, point })} />}>
+        {attemptError ? <Alert type="error" showIcon title={attemptError} />
+          : attemptLoading ? <div className="reports-loading" role="status"><Spin tip="Đang tải phân bố độ cong"><div style={{ height: 160 }} /></Spin></div>
+          : !bendHistogram ? <Alert type="warning" showIcon title="Chưa có cấu hình giới hạn độ cong hợp lệ" />
+          : bendHistogram.total ? <>
+            <div className="report-histogram-info">
+              <div className="report-histogram-summary">
+              <span>Tổng lượt đo: <b>{bendHistogram.total.toLocaleString("vi-VN")}</b></span>
+              <span>Trong giới hạn: <b>{bendHistogram.within.toLocaleString("vi-VN")}</b></span>
+              <span className="report-histogram-outside">Vượt giới hạn: <b>{bendHistogram.outside.toLocaleString("vi-VN")}</b></span>
+              <span>Tỷ lệ đạt: <b>{bendHistogram.passRate?.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%</b></span>
+              </div>
+              <div className="report-bend-legend">
+                <span><i style={{ backgroundColor: "#1769aa" }} />Trong giới hạn</span>
+                <span><i style={{ backgroundColor: "#B91C1C" }} />Vượt giới hạn</span>
+              </div>
+            </div>
+            <div className="report-attempt-scroll">
+              <div className="report-attempt-chart" style={{ minWidth: Math.max(650, bendHistogram.bins.length * 48) }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={bendHistogram.bins} barCategoryGap="10%" margin={{ top: 30, right: 24, bottom: 8, left: 12 }}>
+                    <CartesianGrid vertical={false} stroke="#edf2f7" />
+                    <XAxis type="number" dataKey="index" domain={[-0.5, bendHistogram.bins.length - 0.5]}
+                      ticks={bendHistogram.bins.map(bin => bin.index)} interval={0} height={80}
+                      tick={{ fontSize: 11 }} angle={-45} textAnchor="end"
+                      tickFormatter={value => bendHistogram.bins[Number(value)] ? binLabel(bendHistogram.bins[Number(value)]) : ""}
+                      label={{ value: "Khoảng độ cong (mm)", position: "insideBottom", offset: -2 }} />
+                    <YAxis type="number" domain={[0, "auto"]} allowDecimals={false} width={82}
+                      label={{ value: "Số lượt đo", angle: -90, position: "insideLeft", textAnchor: "middle" }} />
+                    <ReferenceLine x={0.5} stroke="#B91C1C" strokeDasharray="5 4"
+                      label={{ value: `Min ${binNumber(bendSettings.bendLowerMm!)} mm`, position: "insideTopRight", fill: "#B91C1C", fontSize: 12 }} />
+                    <ReferenceLine x={bendHistogram.bins.length - 1.5} stroke="#B91C1C" strokeDasharray="5 4"
+                      label={{ value: `Max ${binNumber(bendSettings.bendUpperMm!)} mm`, position: "insideTopLeft", fill: "#B91C1C", fontSize: 12 }} />
+                    <Tooltip cursor={false} content={({ active, payload }) => {
+                      const bin = payload?.[0]?.payload;
+                      if (!active || !bin) return null;
+                      return <div className="report-tooltip">
+                        <b>Khoảng: {binLabel(bin)} mm</b>
+                        <div>Số lượt đo: {bin.count.toLocaleString("vi-VN")}</div>
+                        <div>Tỷ lệ: {bin.percent.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}%</div>
+                      </div>;
+                    }} />
+                    <Bar dataKey="count" name="Số lượt đo" isAnimationActive={false} maxBarSize={44} radius={[3, 3, 0, 0]}>
+                      {bendHistogram.bins.map(bin => <Cell key={bin.index} fill={bin.outside ? "#B91C1C" : "#1769aa"} />)}
+                      <LabelList dataKey="count" position="top" fontSize={12} fill="#334e68"
+                        formatter={value => typeof value === "number" && value > 0 ? value.toLocaleString("vi-VN") : ""} />
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={databaseConnected ? "Chưa có lượt đo BUTT có độ cong trong bộ lọc" : "Chưa kết nối cơ sở dữ liệu"} />}
+        {quality?.buttSummary && <small className="report-distribution-summary">
+          Trung bình: {numeric(quality.buttSummary.mean)} mm · Độ lệch chuẩn mẫu: {numeric(quality.buttSummary.stddev)} mm
+          {` · Cpk tham chiếu: ${cpk == null ? "—" : cpk.toLocaleString("vi-VN", { maximumFractionDigits: 3 })}`}
+        </small>}
       </Card>
     <Card className="section-card" title="Tổng hợp theo điểm đo">
       <Table<PointSummaryStatistics> key={JSON.stringify(query.filters)} className="reports-point-summary" tableLayout="fixed"

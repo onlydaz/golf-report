@@ -267,12 +267,6 @@
 .monitor-kicker { color: #486581; font-size: 17px; font-weight: 600; margin-bottom: 8px; letter-spacing: .03em; }
 .monitor-sku { order: 1; }
 .monitor-sku-value { display: block; font-size: 20px; color: #243b53; overflow-wrap: anywhere; line-height: 1.25; }
-.monitor-sku-editor { margin-top: 6px; min-width: 0; }
-.monitor-sku-editor .ant-input-affix-wrapper { padding: 7px 10px; border-radius: 8px; }
-.monitor-sku-editor .ant-input { font-size: 18px; font-weight: 600; }
-.monitor-sku-editor .ant-input-suffix { color: #627d98; }
-.monitor-sku-error { display: block; margin-top: 6px; color: #b42318; font-size: 13px; line-height: 1.4; }
-.monitor-sku-notice { display: block; margin-top: 6px; color: #19764d; font-size: 13px; line-height: 1.4; }
 .monitor-count small { font-size: 13px; line-height: 1.5; display: block; color: #627d98; margin: 7px 0 0; }
 .monitor-top-grid .add-measurement-plc-card { order: 2; margin-bottom: 0; }
 .monitor-count-ok { order: 3; background: #19764d; border-color: #19764d; }

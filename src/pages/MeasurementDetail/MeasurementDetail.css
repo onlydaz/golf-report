@@ -38,6 +38,12 @@
   margin-inline-end: 0;
 }
 
+.measurement-detail-page .measurement-point-table .ant-table-thead > tr > th,
+.measurement-detail-page .measurement-attempt-table .ant-table-thead > tr > th {
+  text-align: center;
+  white-space: nowrap;
+}
+
 @media (max-width: 520px) {
   .measurement-detail-page .measurement-details > .ant-card:first-child > .ant-card-body {
     padding: 16px;

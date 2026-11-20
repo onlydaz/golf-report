@@ -20,16 +20,16 @@ const zero: MeasurementDetail = {
 };
 
 describe("manual publications in the existing Measurement UI", () => {
-  it("displays stored station loads as kilograms while preserving the source grams", () => {
+  it("displays stored station loads in native kilograms with exactly two decimals", () => {
     const data = structuredClone(zero);
-    data.stations[0].load = "200";
-    data.stations[1].load = "500";
+    data.stations[0].load = "2.1";
+    data.stations[1].load = "2.5";
     const html = renderToStaticMarkup(<MeasurementDetails data={data} />);
-    expect(html).toContain("Khối lượng đè (kg)");
-    expect(html).toContain(">0,2<");
-    expect(html).toContain(">0,5<");
-    expect(html).not.toContain("Khối lượng đè (g)");
-    expect(data.stations.map(station => station.load)).toEqual(["200", "500"]);
+    expect(html).toContain("Lực đè (kg)");
+    expect(html).toContain(">2,10<");
+    expect(html).toContain(">2,50<");
+    expect(html).not.toContain("Lực đo");
+    expect(data.stations.map(station => station.load)).toEqual(["2.1", "2.5"]);
   });
   it("shows the stored Overall independently of station results and diagnostics", () => {
     const data: MeasurementDetail = { ...zero, overallResult: "OK", buttResult: "NG", tipResult: "NG" };
@@ -47,7 +47,7 @@ describe("manual publications in the existing Measurement UI", () => {
     expect(html).toContain("manual-session");
     expect(html).toContain("manual-only");
     expect(html).toContain("Inbox liên kết");
-    expect(html).toContain("Khối lượng đè (kg)");
+    expect(html).toContain("Lực đè (kg)");
     expect(html).not.toContain("Raw PLC đã nhận");
     expect(html).not.toContain("measurement-attempt-table");
     expect(renderToStaticMarkup(<ResultTag result="UNMEASURED" />)).toContain("Chưa đo");

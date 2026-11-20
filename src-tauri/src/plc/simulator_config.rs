@@ -37,6 +37,24 @@ pub fn ack_scope_allows(config: &SimulatorConfig) -> bool {
         && config.record_size == super::as200::map::RECORD_SIZE
 }
 
+fn deserialize_local_bind_ip<'de, D>(deserializer: D) -> Result<Option<std::net::IpAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom("local_bind_ip phải là chuỗi IP hoặc chuỗi rỗng để tự chọn IP nguồn")
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse().map(Some).map_err(|_| {
+        serde::de::Error::custom(
+            "local_bind_ip không hợp lệ: cần địa chỉ IPv4/IPv6, không kèm port; để chuỗi rỗng nếu muốn tự chọn IP nguồn",
+        )
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SimulatorConfig {
@@ -60,6 +78,7 @@ pub struct SimulatorConfig {
     pub ack_enabled: bool,
     pub ack_protocol: Option<String>,
     pub address: String,
+    #[serde(default, deserialize_with = "deserialize_local_bind_ip")]
     pub local_bind_ip: Option<std::net::IpAddr>,
     #[serde(rename = "plc_local_ip")]
     pub(super) _plc_local_ip: Option<std::net::IpAddr>,
@@ -76,6 +95,7 @@ pub struct SimulatorConfig {
     // Legacy TOML option; acquisition has one pending PostgreSQL receipt.
     pub max_queue: usize,
     pub journal_path: Option<PathBuf>,
+    // Legacy TOML compatibility only; never used to assign native ProductCode.
     pub operator_sku: Option<String>,
 }
 impl Default for SimulatorConfig {
@@ -244,9 +264,6 @@ impl SimulatorConfig {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.validate_read()?;
-        if let Some(sku) = &self.operator_sku {
-            crate::services::inbox_service::validate_operator_sku(sku)?;
-        }
         if self.read_only
             && (self.ack_enabled || self.pc_heartbeat_enabled || self.allow_plc_heartbeat_write)
         {
@@ -440,6 +457,48 @@ pub(super) fn parse(text: &str) -> Result<SimulatorConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_operator_sku_is_accepted_but_has_no_validation_effect() {
+        for value in ["GOLD-X1", "", "  old SKU  "] {
+            let config = parse(&format!("source_key='test'\noperator_sku='{value}'")).unwrap();
+            assert_eq!(config.operator_sku.as_deref(), Some(value));
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_bind_ip_missing_or_blank_uses_system_routing() {
+        for text in ["", "local_bind_ip=''", "local_bind_ip='   '"] {
+            let config = parse(text).unwrap();
+            assert_eq!(config.local_bind_ip, None);
+            assert_eq!(config.reader().local_bind_ip, None);
+        }
+    }
+
+    #[test]
+    fn local_bind_ip_valid_addresses_are_preserved_in_reader_config() {
+        for ip in ["192.168.1.100", "::1"] {
+            let config = parse(&format!("local_bind_ip='  {ip}  '")).unwrap();
+            let expected = Some(ip.parse::<std::net::IpAddr>().unwrap());
+            assert_eq!(config.local_bind_ip, expected);
+            assert_eq!(config.reader().local_bind_ip, expected);
+        }
+    }
+
+    #[test]
+    fn local_bind_ip_invalid_values_report_the_configuration_field() {
+        for text in [
+            "local_bind_ip='not-an-ip'",
+            "local_bind_ip='192.168.1.999'",
+            "local_bind_ip='192.168.1.100:502'",
+            "local_bind_ip=123",
+            "local_bind_ip=false",
+        ] {
+            let error = parse(text).unwrap_err();
+            assert!(error.contains("local_bind_ip"), "{error}");
+        }
+    }
+
     #[test]
     fn ack_heartbeat_requirement_defaults_true_and_requires_restart_when_changed() {
         let omitted = parse("").unwrap();

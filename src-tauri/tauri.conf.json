@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "golf-report",
+  "productName": "Phần Mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf",
+  "mainBinaryName": "golf-report",
   "version": "0.1.0",
   "identifier": "com.golf.report",
   "build": {
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "golf-report",
+        "title": "Phần Mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf",
         "width": 800,
         "height": 600
       }
@@ -29,10 +30,13 @@
     },
     "windows": {
       "wix": {
+        "upgradeCode": "9c4c0768-b21a-5fb4-9388-c4953f8a84ed",
         "fragmentPaths": ["installer-permissions.wxs"],
         "componentRefs": ["ApplicationRuntimePermissions"]
       },
       "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
         "installMode": "perMachine",
         "installerHooks": "installer-hooks.nsh"
       }

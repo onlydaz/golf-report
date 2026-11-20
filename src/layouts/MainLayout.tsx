@@ -7,6 +7,7 @@ import { getAs200WorkerStatus, type As200Status } from "../services/as200Service
 import { getPlcConnectionSettings, plcConnectionError, type PlcConnectionSettings } from "../services/plcConnectionService";
 import { DatabaseConnectedContext, MeasurementCommitContext, PlcRefreshContext, PlcSettingsContext, PlcStatusContext } from "../hooks/usePlcMonitor";
 import { singleFlight, stableSnapshot } from "../utils/stableSnapshot";
+import newOceanLogo from "../assets/logo-new-ocean.png";
 
 import {
   getDatabaseStatus,
@@ -185,14 +186,13 @@ const LayoutShell = memo(function LayoutShell() {
 
   return (
     <Layout className="app-layout">
-      <Sider width={232} className="main-sider">
+      <Sider width={220} className="main-sider">
         <div className="brand">
-          <div className="brand-mark">G</div>
-
-          <div>
-            <div className="brand-title">Golf Report</div>
-            <div className="brand-subtitle">Báo cáo kết quả đo</div>
+          <div className="brand-logo">
+            <img className="brand-logo-full" src={newOceanLogo} alt="New Ocean Group" />
+            <img className="brand-logo-symbol" src={`${import.meta.env.BASE_URL}favicon.png`} alt="New Ocean Group" />
           </div>
+          <div className="brand-title">Thu Thập Dữ Liệu<br />Độ Cong Gậy Golf</div>
         </div>
 
         <div className="side-section">
