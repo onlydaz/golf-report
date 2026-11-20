@@ -30,7 +30,7 @@ fn missing_config_creates_disabled_fixed_profile_without_runtime_or_ack() {
     ensure_config(&dir.0).unwrap();
     let (_, before, cfg) = read_config(&dir.0).unwrap();
     assert_eq!(cfg.address, PLC_ADDRESS);
-    assert_eq!(cfg.source_key, SOURCE_KEY);
+    assert!(!cfg.source_key.trim().is_empty()); // The example's key is not a production allowlist.
     assert_eq!(cfg.unit_id, 1);
     assert_eq!(cfg.journal_path.as_deref(), Some(Path::new(JOURNAL)));
     assert!(!cfg.enabled && !cfg.ack_enabled && cfg.read_only && !cfg.technical_setup_confirmed);
@@ -78,8 +78,8 @@ fn fixed_identity_and_ack_permission_cannot_be_changed_by_connect() {
             _ => other.journal_path = Some("../capture.json".into()),
         }
         assert!(!cfg.same_environment(&other)); // Runtime identity changes require restart.
-        if mutate == 1 {
-            assert!(validate_config(&other).is_ok()); // Explicit Unit ID 2 is a legal configured endpoint.
+        if matches!(mutate, 1 | 2) {
+            assert!(validate_config(&other).is_ok()); // Profile validation permits other Unit IDs/SourceKeys; startup binding still changes.
         } else {
             assert!(validate_config(&other).is_err());
         }

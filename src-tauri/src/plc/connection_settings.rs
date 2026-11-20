@@ -14,7 +14,6 @@ use std::{
 
 #[cfg(test)]
 const PLC_ADDRESS: &str = "192.168.1.5:502";
-pub(super) const SOURCE_KEY: &str = "golf-report-plc-01";
 const JOURNAL: &str = "local-runtime/capture.json";
 const SIMULATOR_SOURCE_KEY: &str = "golf-report-simulator";
 const SIMULATOR_JOURNAL: &str = "local-runtime/simulator/capture.json";
@@ -71,24 +70,40 @@ pub(super) fn validate_config(config: &SimulatorConfig) -> Result<(), String> {
         .parse()
         .map_err(|_| "Address cần IP:port cụ thể")?;
     let simulator = endpoint.ip().is_loopback();
-    let (source_key, journal) = if simulator {
-        (SIMULATOR_SOURCE_KEY, SIMULATOR_JOURNAL)
-    } else {
-        (SOURCE_KEY, JOURNAL)
-    };
-    if config.mode != "modbus"
-        || config.source_key != source_key
-        || config.journal_path.as_deref() != Some(Path::new(journal))
-        || config
-            .confirmed_session_id
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-        || config
-            .confirmed_session_id
-            .as_deref()
-            .is_some_and(|s| s.starts_with("simulator-") != simulator)
+    if config.mode != "modbus" {
+        return Err("Kết nối này yêu cầu mode=modbus.".into());
+    }
+    let source = config.source_key.as_str();
+    if source.trim().is_empty()
+        || source != source.trim()
+        || source.chars().count() > 100
+        || source.chars().any(|c| c.is_control() || c == '|')
     {
-        return Err("Cấu hình môi trường chưa tách biệt: Simulator dùng SourceKey=golf-report-simulator, Session bắt đầu simulator-, Journal=local-runtime/simulator/capture.json; PLC dùng SourceKey=golf-report-plc-01, Session không bắt đầu simulator-, Journal=local-runtime/capture.json. Không đổi danh tính của Journal cũ để vượt lỗi.".into());
+        return Err("SourceKey cần 1–100 ký tự, không có khoảng trắng đầu/cuối, ký tự điều khiển hoặc dấu |; giữ ổn định danh tính nguồn đã xác nhận.".into());
+    }
+    let session = config.confirmed_session_id.as_deref().ok_or("Thiếu confirmed_session_id đã được xác nhận; không tự tạo phiên thay thế.")?;
+    if session.trim().is_empty() || session.chars().count() > 128 {
+        return Err("confirmed_session_id cần 1–128 ký tự và không được chỉ chứa khoảng trắng.".into());
+    }
+    if simulator {
+        if source != SIMULATOR_SOURCE_KEY || !session.starts_with("simulator-") {
+            return Err("Endpoint loopback dành cho Simulator: SourceKey phải là golf-report-simulator và Session phải bắt đầu simulator-.".into());
+        }
+    } else if source == SIMULATOR_SOURCE_KEY
+        || source.starts_with("golf-report-simulator-")
+        || source.starts_with("simulator-")
+        || session.starts_with("simulator-")
+    {
+        return Err("PLC thật không được sử dụng SourceKey hoặc Session thuộc namespace Simulator.".into());
+    }
+    let expected_journal = Path::new(if simulator { SIMULATOR_JOURNAL } else { JOURNAL });
+    let journal = normalized_journal_path(config.journal_path.as_deref().ok_or("Thiếu journal_path; cần giữ đường dẫn bằng chứng/lock đã xác nhận.")?)?;
+    // Absolute paths get their root checked against the selected TOML directory
+    // by read_config/check_plc_directory. Here enforce the environment's slot.
+    if (journal.is_absolute() && !journal.ends_with(expected_journal))
+        || (!journal.is_absolute() && journal != expected_journal)
+    {
+        return Err(format!("Journal của môi trường này phải là {} trong thư mục cấu hình PLC đã chọn (tương đối hoặc tuyệt đối tương ứng). Không dùng journal Simulator cho PLC thật hoặc tự chuyển bằng chứng cũ.", expected_journal.display()));
     }
     if config.pc_heartbeat_enabled || config.allow_plc_heartbeat_write {
         return Err("Published Record không cho phép ghi PC Heartbeat.".into());
@@ -97,6 +112,45 @@ pub(super) fn validate_config(config: &SimulatorConfig) -> Result<(), String> {
         if let Some(reason) = config.ack_config_block_reason() {
             return Err(format!("ACK bị chặn trong as200_config.toml: {reason}."));
         }
+    }
+    Ok(())
+}
+
+// Lexical normalization also works before runtime files exist. Never resolve
+// '..' or symlinks into another evidence location, or rewrite the stored TOML.
+fn normalized_journal_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return Err("journal_path không được chứa ..; không đổi vị trí bằng chứng để vượt validation.".into()),
+            Component::Prefix(_) | Component::RootDir if !path.is_absolute() => {
+                return Err("journal_path phải tương đối với TOML hoặc là đường dẫn tuyệt đối đầy đủ.".into());
+            }
+            #[cfg(windows)]
+            Component::Prefix(prefix) => {
+                // current_exe may use \\?\C: while TOML uses C:. These name
+                // the same native drive; keep the remaining components intact.
+                match prefix.kind() {
+                    std::path::Prefix::Disk(drive) | std::path::Prefix::VerbatimDisk(drive) => {
+                        normalized.push(format!("{}:", char::from(drive).to_ascii_uppercase()));
+                    }
+                    _ => normalized.push(component.as_os_str()),
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn validate_journal_location(config: &SimulatorConfig, configuration: &Path) -> Result<(), String> {
+    let relative = if config.source_key == SIMULATOR_SOURCE_KEY { SIMULATOR_JOURNAL } else { JOURNAL };
+    let expected = configuration.parent().ok_or("Không xác định được thư mục cấu hình PLC.")?.join(relative);
+    let actual = normalized_journal_path(&config.journal_file(configuration))?;
+    if actual != normalized_journal_path(&expected)? {
+        return Err(format!("Journal không thuộc vị trí bằng chứng đã chọn: {}. Cấu hình hiện trỏ tới {}; cần kỹ thuật đối chiếu, không tự di chuyển hoặc ghi đè.", expected.display(), actual.display()));
     }
     Ok(())
 }
@@ -147,6 +201,7 @@ fn read_config(directory: &Path) -> Result<(PathBuf, String, SimulatorConfig), S
     let text = fs::read_to_string(&path).map_err(|_| "Không đọc được as200_config.toml.")?;
     let config = simulator_config::parse(&text)?;
     validate_config(&config)?;
+    validate_journal_location(&config, &path)?;
     Ok((path, text, config))
 }
 
@@ -285,6 +340,9 @@ pub async fn connect_plc_collection(
         return Ok(());
     }
     config.validate()?;
+    // A syntactically valid new SourceKey must not silently reassign a known
+    // physical endpoint. This is read-only; Worker still owns all receipt/ACK proof.
+    verify_source_endpoint(&database.pool().await?, &config).await?;
     let endpoint = config.address.clone();
     let report = inspect_endpoint(config.clone()).await;
     if !report.as200_valid {
@@ -306,6 +364,26 @@ pub async fn connect_plc_collection(
     let status = state.status.read().await;
     if !status.enabled {
         return Err(status.message.clone());
+    }
+    Ok(())
+}
+
+async fn verify_source_endpoint(pool: &sqlx::PgPool, config: &SimulatorConfig) -> Result<(), String> {
+    // Versioned binding layout is written by worker::legacy::binding:
+    // published-ack-v1|mode|IP:port|UnitID|SourceKey|Session|offset|word-order|...
+    let other: Option<String> = sqlx::query_scalar(
+        "SELECT s.source_key FROM plc_acquisition a JOIN plc_sources s ON s.id=a.source_id \
+         WHERE s.source_key<>$1 AND split_part(a.binding,'|',1)='published-ack-v1' \
+         AND split_part(a.binding,'|',3)=$2 AND split_part(a.binding,'|',4)=$3 LIMIT 1",
+    )
+    .bind(&config.source_key)
+    .bind(&config.address)
+    .bind(config.unit_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Không đối chiếu được binding nguồn PLC trong PostgreSQL; chưa bắt đầu thu: {e}"))?;
+    if let Some(source) = other {
+        return Err(format!("Endpoint {} / Unit ID {} đã có binding PostgreSQL thuộc SourceKey {}. Chưa chấp nhận SourceKey {}; cần kỹ thuật đối chiếu nguồn vật lý, journal và checkpoint. Không tự sửa danh tính hoặc ACK cũ.", config.address, config.unit_id, source, config.source_key));
     }
     Ok(())
 }

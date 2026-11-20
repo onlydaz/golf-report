@@ -148,17 +148,12 @@ pub(crate) fn check_plc_directory(dir: &std::path::Path) -> Result<(), String> {
         OpenOptions::new().write(true).open(&file).map_err(|_| {
             format!("Không có quyền cập nhật {}; chưa bật thu hoặc ACK.", file.display())
         })?;
-        if let Some((config, journal)) = plc::simulator_config::load(Some(dir))? {
+        if let Some((config, _)) = plc::simulator_config::load(Some(dir))? {
             if config.enabled && config.journal_path.is_none() {
                 return Err("Cấu hình PLC đang bật nhưng thiếu đường dẫn Journal trong local-runtime; cần kỹ thuật đối chiếu, chưa bật thu hoặc ACK.".into());
             }
-            if config.journal_path.is_some()
-                && (!journal.starts_with(&runtime)
-                    || journal
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir)))
-            {
-                return Err(format!("Journal phải nằm trong {}. Giữ nguyên lịch sử cũ và yêu cầu kỹ thuật đối chiếu; không tự di chuyển.", runtime.display()));
+            if config.journal_path.is_some() {
+                plc::connection_settings::validate_journal_location(&config, &file)?;
             }
         }
     }
