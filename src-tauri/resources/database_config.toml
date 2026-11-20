@@ -1,0 +1,5 @@
+host = "localhost"
+port = 5432
+database = "golf_report"
+username = "postgres"
+password = "113300"
