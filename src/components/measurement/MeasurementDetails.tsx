@@ -7,7 +7,8 @@ import type {
   MeasurementResult,
 } from "../../services/measurementService";
 
-import { displayPointResult, formatClubNumber, formatDecimal, formatLoadKg, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
+import { displayPointResult, formatClubNumber, formatDecimal, isBusinessPoint, isUnmeasuredPoint } from "../../utils/as200Report";
+import { LoadValue, PositionValue } from "./MeasurementValue";
 
 export function ResultTag({
   result,
@@ -104,7 +105,7 @@ export default function MeasurementDetails({
                     {
                       key: "load",
                       label: "Lực đè (kg)",
-                      children: formatLoadKg(station.load),
+                      children: <LoadValue value={station.load} station={type} />,
                     },
                     {
                       key: "result",
@@ -149,7 +150,8 @@ export default function MeasurementDetails({
                     {
                       title: "Vị trí đo (mm)",
                       dataIndex: "position",
-                      render: (value: string | null, point) => formatDecimal(isUnmeasuredPoint(point) ? null : value),
+                      render: (value: string | null, point) => <PositionValue value={isUnmeasuredPoint(point) ? null : value}
+                        station={type} pointNumber={point.pointNumber} />,
                       align: "right",
                       width: 160,
                     },

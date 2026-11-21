@@ -166,6 +166,8 @@ export interface PointQualityStatistics {
   ng: number;
   retested: number;
   loadAvg: string | null;
+  loadCount?: number;
+  loadZeroCount?: number;
   pushDistAvg: string | null;
   bendCount: number;
   bendMin: string | null;
@@ -189,6 +191,8 @@ export interface PointSummaryStatistics {
   pointNumber: number;
   position: string | null;
   loadAvg: string | null;
+  loadCount?: number;
+  loadZeroCount?: number;
   pushDistAvg: string | null;
   bendMin: string | null;
   bendAvg: string | null;

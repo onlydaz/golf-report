@@ -676,6 +676,8 @@ impl MeasurementRepository {
 
     /// Aggregate only: one decision value per measurement/point, never all attempts
     /// sent to the UI. A single SELECT provides a consistent read-only snapshot.
+    /// Load counts let the presentation layer replace zero samples using its
+    /// shared settings; raw averages, sample membership and results stay intact.
     pub async fn quality_statistics(
         pool: &PgPool,
         request: &MeasurementListRequest,
@@ -710,12 +712,14 @@ impl MeasurementRepository {
                 count(DISTINCT measurement_id) FILTER(WHERE result='NG') AS ng,
                 count(*) FILTER(WHERE attempt_count>1) AS retested,
                 avg(load)::text AS load_avg,avg(push_dist)::text AS push_dist_avg,
+                count(load) AS load_count,count(*) FILTER(WHERE load=0) AS load_zero_count,
                 count(bend) AS bend_count,min(bend) AS bend_min,avg(bend) AS bend_avg,
                 max(bend) AS bend_max,stddev_samp(bend) AS bend_stddev
             FROM samples GROUP BY product_code,station,point_number,position
         ), point_summary AS (
             SELECT station,point_number,position,
                 avg(load)::text AS load_avg,avg(push_dist)::text AS push_dist_avg,
+                count(load) AS load_count,count(*) FILTER(WHERE load=0) AS load_zero_count,
                 min(bend)::text AS bend_min,avg(bend)::text AS bend_avg,
                 max(bend)::text AS bend_max,
                 count(DISTINCT measurement_id) FILTER(WHERE attempt_count>1) AS retested,
@@ -775,6 +779,7 @@ impl MeasurementRepository {
             'pointSummary',coalesce((SELECT jsonb_agg(jsonb_build_object(
                 'station',s.station,'pointNumber',s.point_number,'position',s.position::text,
                 'loadAvg',s.load_avg,'pushDistAvg',s.push_dist_avg,
+                'loadCount',s.load_count,'loadZeroCount',s.load_zero_count,
                 'bendMin',s.bend_min,'bendAvg',s.bend_avg,'bendMax',s.bend_max,
                 'retested',s.retested,'ng',s.ng
                 ) ORDER BY s.station,s.point_number,s.position) FROM point_summary s),'[]'::jsonb),
@@ -782,6 +787,7 @@ impl MeasurementRepository {
                 'productCode',g.product_code,'station',g.station,'pointNumber',g.point_number,
                 'position',g.position::text,'measured',g.measured,'ng',g.ng,'retested',g.retested,
                 'loadAvg',g.load_avg,'pushDistAvg',g.push_dist_avg,'bendCount',g.bend_count,
+                'loadCount',g.load_count,'loadZeroCount',g.load_zero_count,
                 'bendMin',g.bend_min::text,'bendAvg',g.bend_avg::text,
                 'bendMax',g.bend_max::text,'bendStddev',g.bend_stddev::text,
                 'histogram',coalesce((SELECT jsonb_agg(jsonb_build_object(

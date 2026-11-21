@@ -12,7 +12,8 @@ import {
   type MeasurementHistoryItem, type MeasurementHistoryPage, type MeasurementListRequest,
   type MeasurementSkuPage, type MeasurementSkuSummary, type MeasurementStatistics,
 } from "../../services/measurementService";
-import { formatClubNumber, formatDecimal, formatLoadKg, stationPointNumbers } from "../../utils/as200Report";
+import { formatClubNumber, formatDecimal, stationPointNumbers } from "../../utils/as200Report";
+import { LoadValue } from "../../components/measurement/MeasurementValue";
 import { formatReportTime, reportDateBoundary } from "../../utils/reportTime";
 import "./MeasurementHistory.css";
 
@@ -138,7 +139,7 @@ function MeasurementHistory() {
       ...stationPointNumbers(station).map(pointNumber => ({ title: `P${pointNumber} (mm)`, width: 104, align: "center" as const,
         render: (_: unknown, row: MeasurementHistoryItem) => formatDecimal(row.decisionPoints.find(point => point.station === station && point.pointNumber === pointNumber)?.bend),
       })),
-      { title: `Lực đè ${station} (kg)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: formatLoadKg, width: 120, align: "center" },
+      { title: `Lực đè ${station} (kg)`, dataIndex: station === "BUTT" ? "buttLoad" : "tipLoad", render: value => <LoadValue value={value} station={station} />, width: 120, align: "center" },
     ];
     return [
       { title: <span title="Thời điểm phần mềm nhận bản ghi, giờ Việt Nam">Thời gian đo</span>, dataIndex: "measuredAt", width: 180, align: "center", render: formatReportTime },

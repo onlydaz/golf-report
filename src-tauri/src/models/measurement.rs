@@ -257,6 +257,10 @@ pub struct PointSummaryStatistics {
     pub point_number: i32,
     pub position: Option<String>,
     pub load_avg: Option<String>,
+    #[serde(default)]
+    pub load_count: i64,
+    #[serde(default)]
+    pub load_zero_count: i64,
     pub push_dist_avg: Option<String>,
     pub bend_min: Option<String>,
     pub bend_avg: Option<String>,
@@ -276,6 +280,10 @@ pub struct PointQualityStatistics {
     pub ng: i64,
     pub retested: i64,
     pub load_avg: Option<String>,
+    #[serde(default)]
+    pub load_count: i64,
+    #[serde(default)]
+    pub load_zero_count: i64,
     pub push_dist_avg: Option<String>,
     pub bend_count: i64,
     pub bend_min: Option<String>,

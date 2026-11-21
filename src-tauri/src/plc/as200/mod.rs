@@ -48,9 +48,11 @@ pub(crate) async fn connect_tcp(
                     TcpSocket::new_v6()
                 }
                 .map_err(|e| {
+                    super::diagnostics::note_tcp_failure(endpoint, local_bind_ip);
                     As200Error::Transport(format!("Không tạo được socket PLC để bind {ip}: {e}"))
                 })?;
                 socket.bind(SocketAddr::new(ip, 0)).map_err(|e| {
+                    super::diagnostics::note_tcp_failure(endpoint, local_bind_ip);
                     eprintln!("PLC_TCP state=BIND_FAILED endpoint={endpoint} local_bind_ip={ip} error={e}");
                     As200Error::Transport(format!(
                         "Không bind được IP nguồn {ip} trước khi kết nối PLC {endpoint}: {e}. Kiểm tra IP này đã được gán cho laptop."
@@ -61,6 +63,7 @@ pub(crate) async fn connect_tcp(
             None => TcpStream::connect(endpoint).await,
         };
         result.map_err(|e| {
+            super::diagnostics::note_tcp_failure(endpoint, local_bind_ip);
             eprintln!(
                 "PLC_TCP state=FAILED endpoint={endpoint} source_ip={source} routing=system kind={:?} error={e}",
                 e.kind()
@@ -78,6 +81,7 @@ pub(crate) async fn connect_tcp(
     let stream = tokio::time::timeout(duration, connection)
         .await
         .map_err(|_| {
+            super::diagnostics::note_tcp_failure(endpoint, local_bind_ip);
             eprintln!(
                 "PLC_TCP state=TIMEOUT endpoint={endpoint} source_ip={source} routing=system timeout_ms={}",
                 duration.as_millis()
@@ -86,10 +90,19 @@ pub(crate) async fn connect_tcp(
                 "Hết thời gian kết nối TCP PLC {endpoint}, IP nguồn {source}. Kiểm tra cáp, nguồn PLC và cấu hình IP/route của Windows."
             ))
         })??;
-    eprintln!(
-        "PLC_TCP state=CONNECTED endpoint={endpoint} source_ip={source} routing=system actual_local={:?}",
-        stream.local_addr().ok()
-    );
+    // A new socket is routine for each Reader/prepared ACK. Connection recovery
+    // is logged separately by the Worker's observed connection transition.
+    if super::diagnostics::take_tcp_failure(endpoint, local_bind_ip) {
+        eprintln!(
+            "PLC_TCP state=RECONNECTED endpoint={endpoint} source_ip={source} routing=system actual_local={:?} after_failed_open=true",
+            stream.local_addr().ok()
+        );
+    } else if super::diagnostics::debug_enabled() {
+        eprintln!(
+            "PLC_TCP state=CONNECTED level=DEBUG endpoint={endpoint} source_ip={source} routing=system actual_local={:?}",
+            stream.local_addr().ok()
+        );
+    }
     Ok(stream)
 }
 
@@ -125,7 +138,7 @@ impl fmt::Display for As200Error {
             Self::Transport(detail) => write!(f, "Lỗi Modbus TCP AS200: {detail}"),
             Self::Protocol(detail) => write!(f, "Lỗi phản hồi Modbus AS200: {detail}"),
             Self::Timeout => write!(f, "Hết thời gian kết nối/đọc AS200"),
-            Self::Unstable => write!(f, "Buffer AS200 đang thay đổi; bỏ snapshot và thử lại"),
+            Self::Unstable => write!(f, "AS200_SNAPSHOT_UNSTABLE: Control hoặc 240 WORD thay đổi trong khi đọc FC03; bỏ snapshot và đọc lại. Không phát lại ACK chưa rõ kết quả; xem log PLC_CONTROL/PLC_SNAPSHOT để xác định Count, Done hoặc publication thay đổi"),
         }
     }
 }

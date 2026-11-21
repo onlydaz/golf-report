@@ -19,7 +19,9 @@ import {
   type MeasurementQualityStatistics, type PointSummaryStatistics,
 } from "../../services/measurementService";
 import { createCsvBytes, createExcelBytes } from "../../utils/as200Export";
-import { buildReportTables, formatClubNumber, formatDecimal, formatLoadKg, isBusinessPoint } from "../../utils/as200Report";
+import { buildReportTables, formatClubNumber, formatDecimal, isBusinessPoint } from "../../utils/as200Report";
+import { LoadValue, MeasurementValue, PositionValue } from "../../components/measurement/MeasurementValue";
+import { presentLoadAverage, presentPosition } from "../../utils/measurementPresentation";
 import { formatReportTime, reportDateBoundary, REPORT_TIME_ZONE, vietnamNow } from "../../utils/reportTime";
 import { groupedReportWindow } from "../../utils/reportBuckets";
 import { measurementSettings } from "../../config/measurementSettings";
@@ -36,8 +38,10 @@ const binLabel = (bin: { lower: number | null; upper: number | null }) => bin.lo
   : bin.upper == null ? `> ${binNumber(bin.lower)}` : `${binNumber(bin.lower)}–${binNumber(bin.upper)}`;
 
 const pointColumns: ColumnsType<PointSummaryStatistics> = [
-  { title: "Điểm đo", width: 145, render: (_, point) => `${point.station} · P${point.pointNumber} (${formatDecimal(point.position)} mm)` },
-  { title: "Lực đè TB (kg)", dataIndex: "loadAvg", width: 120, render: formatLoadKg, align: "center" },
+  { title: "Điểm đo", width: 145, render: (_, point) => <>{point.station} · P{point.pointNumber} (<PositionValue
+    value={point.position} station={point.station} pointNumber={point.pointNumber} /> mm)</> },
+  { title: "Lực đè TB (kg)", dataIndex: "loadAvg", width: 120, render: (value, point) => <MeasurementValue
+    value={presentLoadAverage(value, point.station, point.loadCount, point.loadZeroCount)} />, align: "center" },
   { title: "K/c đẩy TB (mm)", dataIndex: "pushDistAvg", render: numeric, align: "center" },
   { title: "Độ cong Min (mm)", dataIndex: "bendMin", render: numeric, align: "center" },
   { title: "Độ cong TB (mm)", dataIndex: "bendAvg", render: numeric, align: "center" },
@@ -49,8 +53,8 @@ const columns: ColumnsType<BackendMeasurement> = [
   { title: "Thời gian nhận", dataIndex: "measuredAt", render: formatReportTime, width: 165 },
   { title: "SKU", dataIndex: "productCode", width: 150 },
   { title: "Số gậy", dataIndex: "clubNumber", render: formatClubNumber, width: 80, align: "center" },
-  { title: "Lực đè BUTT (kg)", dataIndex: "buttLoad", render: formatLoadKg, width: 125, align: "center" },
-  { title: "Lực đè TIP (kg)", dataIndex: "tipLoad", render: formatLoadKg, width: 125, align: "center" },
+  { title: "Lực đè BUTT (kg)", dataIndex: "buttLoad", render: value => <LoadValue value={value} station="BUTT" />, width: 125, align: "center" },
+  { title: "Lực đè TIP (kg)", dataIndex: "tipLoad", render: value => <LoadValue value={value} station="TIP" />, width: 125, align: "center" },
   ...([ ["Butt", "buttResult"], ["Tip", "tipResult"], ["Overall", "overallResult"] ] as const).map(([title, dataIndex]) => ({
     title, dataIndex, width: 90, align: "center" as const, render: (value: BackendMeasurement["buttResult"]) => <ResultTag result={value} />,
   })),
@@ -227,7 +231,10 @@ function Reports() {
     ] as const).map(([station, pointNumber, demoPosition]) => {
       const samples = points.filter(point => point.station === station && point.pointNumber === pointNumber);
       const ng = samples.reduce((sum, point) => sum + point.ng, 0);
-      const positions = [...new Set(samples.flatMap(point => point.position == null ? [] : [point.position]))]
+      const positions = [...new Set(samples.flatMap(point => {
+        const display = presentPosition(point.position, station, pointNumber);
+        return display.value == null ? [] : [display.value];
+      }))]
         .sort((a, b) => Number(a) - Number(b));
       const position = positions.length ? positions.map(formatDecimal).join(" · ") : quality.demoLimits ? String(demoPosition) : "—";
       const rate = stats.totalMeasurements ? 100 * ng / stats.totalMeasurements : 0;

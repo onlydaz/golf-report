@@ -9,6 +9,7 @@ import { displayPointResult, formatClubNumber, formatDecimal, formatLoadKg, isBu
 import { formatReportTime } from "../../utils/reportTime";
 import { measurementSettings } from "../../config/measurementSettings";
 import type { MeasurementChartSettings } from "../../config/measurementSettings";
+import { LoadValue, PositionValue } from "../../components/measurement/MeasurementValue";
 import { bendAxisTicks, bendDataDomain, bendExcess } from "../../utils/bendChart";
 
 export function ProductionSummary({ statistics, loading }: {
@@ -167,8 +168,9 @@ export const CurrentPointTable = memo(function CurrentPointTable({ detail, loadi
   ) ?? []), [detail]);
   const columns = useMemo<ColumnsType<(typeof rows)[number]>>(() => [
       { title: "Trạm / Điểm", render: (_, row) => `${row.station} · P${row.pointNumber}` },
-      { title: "Vị trí (mm)", render: (_, row) => formatDecimal(isUnmeasuredPoint(row) ? null : row.position), width: "13%" },
-      { title: "Lực đè (kg)", dataIndex: "load", render: formatLoadKg, width: "13%" },
+      { title: "Vị trí (mm)", render: (_, row) => <PositionValue value={isUnmeasuredPoint(row) ? null : row.position}
+        station={row.station} pointNumber={row.pointNumber} />, width: "13%" },
+      { title: "Lực đè (kg)", dataIndex: "load", render: (value, row) => <LoadValue value={value} station={row.station} />, width: "13%" },
       { title: "Khoảng cách đẩy (mm)", dataIndex: "pushDist", render: formatDecimal, width: "17%" },
       { title: "Độ cong (mm)", dataIndex: "bend", render: formatDecimal, width: "14%" },
       { title: <span className="monitor-attempt-heading">Số<br />lần đo</span>, dataIndex: "attemptCount", align: "center", render: (_, row) => isUnmeasuredPoint(row) ? "—" : row.attemptCount, width: 54 },

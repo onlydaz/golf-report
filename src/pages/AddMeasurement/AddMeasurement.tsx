@@ -1,5 +1,6 @@
 import { formatReportTime } from "../../utils/reportTime";
-import { formatClubNumber, formatLoadKg } from "../../utils/as200Report";
+import { formatClubNumber } from "../../utils/as200Report";
+import { LoadValue } from "../../components/measurement/MeasurementValue";
 import {
   Alert,
   Button,
@@ -485,7 +486,7 @@ function AddMeasurement() {
       <Card className="section-card add-measurement-results">
         <div className="monitor-current-heading">
           <h2>Gậy vừa kiểm tra · {displayed ? formatClubNumber(displayed.clubNumber) : "Chưa có dữ liệu"}</h2>
-          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "BUTT")?.load)} kg / Tip {formatLoadKg(activeDetail?.stations.find(station => station.stationType === "TIP")?.load)} kg</span>
+          <span>{receivedTime ? formatReportTime(receivedTime) : "—"} · Lực đè Butt <LoadValue value={activeDetail?.stations.find(station => station.stationType === "BUTT")?.load} station="BUTT" /> kg / Tip <LoadValue value={activeDetail?.stations.find(station => station.stationType === "TIP")?.load} station="TIP" /> kg</span>
         </div>
         <div className="add-measurement-result-grid">
           {(["BUTT", "TIP", "OVERALL"] as const).map((station) => {

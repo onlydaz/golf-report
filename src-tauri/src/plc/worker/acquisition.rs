@@ -91,6 +91,7 @@ impl Engine {
             return Err("Checkpoint thiếu receipt anchor.".into());
         }
         state.status.write().await.session_id = Some(p.session_id.clone());
+        state.reset_diagnostic_logs();
         let engine = Arc::new(Self {
             config,
             source_id: source.id,
@@ -354,6 +355,47 @@ impl Engine {
         Ok(committed)
     }
 
+    // Log the checkpoint already read by this poll; no extra PLC/SQL reads,
+    // no payload dump, and no interpretation of a marker as a successful write.
+    fn trace_ack_observation(
+        &self,
+        stage: &'static str,
+        p: &Progress,
+        row: &InboxRecord,
+        snapshot: &PublishedRecordSnapshot,
+    ) {
+        let c = &snapshot.control;
+        let mut comparison = c.clone();
+        comparison.heartbeat = 0;
+        // Ignore only the independently ticking heartbeat and log timestamp.
+        // Compare complete raw buffers in memory, so equal high-level fields
+        // never hide a payload change. Nothing here participates in ACK guards.
+        let key = format!(
+            "endpoint={} unit={} source={} heartbeat_required={} progress={:?} receipt={:?} control={comparison:?} read_raw={:?}",
+            self.config.address, self.config.unit_id, self.config.source_key,
+            self.config.require_plc_heartbeat_for_ack,
+            (p.source_id, &p.session_id, &p.binding, p.accepted, p.last_total,
+                p.pending_inbox_id, p.anchor_inbox_id, p.ack_attempted,
+                p.done_started, p.done_observed, &p.blocked_reason),
+            (row.id, row.measurement_id, &row.processing_status, row.publication_count,
+                row.total_count, row.record_seq, &row.word_order, row.buffer_index, &row.raw_registers),
+            snapshot.buffer.as_ref().map(|buffer| (buffer.buffer_index, &buffer.raw_registers))
+        );
+        if !self.state.log_changed(stage, key) {
+            return;
+        }
+        eprintln!(
+            "PLC_ACK_OBSERVATION stage={stage} endpoint={} unit_id={} source={} session={} inbox={} measurement_id={:?} processing_status={} target={:?} accepted={} last_total={} pending={:?} anchor={:?} ack_attempted={} done_started={:?} done_observed={} blocked={:?} total={} ready={} pc_count={} pc_done={} heartbeat={} require_heartbeat={} same_receipt={} observed_at={} control={:?}",
+            self.config.address, self.config.unit_id, self.config.source_key, p.session_id,
+            row.id, row.measurement_id, row.processing_status, row.publication_count,
+            p.accepted, p.last_total, p.pending_inbox_id, p.anchor_inbox_id,
+            p.ack_attempted, p.done_started, p.done_observed, p.blocked_reason,
+            c.total_count, c.data_ready, c.pc_read_count, c.pc_read_done, c.heartbeat,
+            self.config.require_plc_heartbeat_for_ack, Self::same_receipt(row, snapshot),
+            Utc::now().to_rfc3339(), c
+        );
+    }
+
     async fn observe_ack(
         &self,
         pool: &PgPool,
@@ -365,6 +407,7 @@ impl Engine {
         let target = row
             .publication_count
             .ok_or("Receipt thiếu counter công bố.")?;
+        self.trace_ack_observation("DONE_OBSERVATION", p, row, snapshot);
         if !p.ack_attempted || p.done_started == Some(false) {
             return Ok(false);
         }
@@ -373,8 +416,9 @@ impl Engine {
             && c.pc_read_done == 1
             && Self::same_receipt(row, snapshot)
         {
-            sqlx::query("UPDATE plc_acquisition SET done_observed=true WHERE source_id=$1 AND pending_inbox_id=$2 AND ack_attempted")
+            let observed = sqlx::query("UPDATE plc_acquisition SET done_observed=true WHERE source_id=$1 AND pending_inbox_id=$2 AND ack_attempted")
                 .bind(p.source_id).bind(row.id).execute(pool).await.map_err(|e| e.to_string())?;
+            eprintln!("PLC_ACK_CHECKPOINT stage=DONE_HIGH_UPDATE_RETURNED source={} inbox={} target={target} accepted={} rows_affected={} awaiting_done_low=true", self.config.source_key, row.id, p.accepted, observed.rows_affected());
         }
         let complete = row.measurement_id.is_some()
             && p.done_observed
@@ -395,6 +439,7 @@ impl Engine {
             if changed.rows_affected() != 1 {
                 return Err("ACK receipt thay đổi; cần đối chiếu.".into());
             }
+            eprintln!("PLC_ACK_CHECKPOINT stage=ACCEPTED source={} inbox={} previous_accepted={} accepted={target} pending_cleared=true", self.config.source_key, row.id, p.accepted);
             let mut confirmed = p.clone();
             confirmed.accepted = target;
             confirmed.pending_inbox_id = None;
@@ -413,7 +458,20 @@ impl Engine {
             return Ok(true);
         }
         self.state.status.write().await.ack_status = "RECONCILIATION_REQUIRED";
-        Err("Raw đã commit; ACK đã bắt đầu nhưng chưa có bằng chứng Done cao → thấp. Chỉ quan sát PLC/DB, không tự gửi lại Count hoặc Done.".into())
+        let reason = if c.pc_read_count != target {
+            "COUNT_NOT_TARGET"
+        } else if c.pc_read_done != 0 {
+            "WAIT_DONE_LOW"
+        } else if !p.done_observed {
+            "DONE_HIGH_NOT_VERIFIED"
+        } else {
+            "PUBLICATION_COMPLETION_NOT_VERIFIED"
+        };
+        Err(format!(
+            "ACK_RECONCILIATION_REQUIRED/{reason}: target={target}, accepted={}, Count={}, Done={}, TotalCount={}, DataReady={}, done_started={:?}, done_observed_loaded={}. Chưa đủ bằng chứng Done cao → thấp và publication phù hợp; chỉ quan sát, không gửi lại Count/Done.",
+            p.accepted, c.pc_read_count, c.pc_read_done, c.total_count, c.data_ready,
+            p.done_started, p.done_observed
+        ))
     }
 
     async fn checked_write_snapshot(
@@ -421,19 +479,93 @@ impl Engine {
         pool: &PgPool,
         row: &InboxRecord,
         expected_count: i32,
+        phase: &'static str,
     ) -> Result<(), String> {
         if self.state.stopping.load(Ordering::SeqCst) {
             return Err("Đang dừng; chưa ghi PLC.".into());
         }
-        let snapshot = self.read_snapshot().await?;
+        let snapshot = self.read_snapshot().await.map_err(|error| {
+            format!("ACK_FENCE_READ_FAILED: phase={phase}, inbox={}, target={:?}, expected_Count={expected_count}; {error}. Chưa gọi lệnh ghi của giai đoạn này.", row.id, row.publication_count)
+        })?;
+        eprintln!(
+            "PLC_ACK_FENCE stage=READ_BACK phase={phase} source={} inbox={} target={:?} expected_pc_count={expected_count} pc_count={} pc_done={} total={} ready={} same_receipt={} require_heartbeat={} ready_matches={} total_matches={} buffer_present={} count_matches={} done_matches={} observed_at={} control={:?}",
+            self.config.source_key, row.id, row.publication_count,
+            snapshot.control.pc_read_count, snapshot.control.pc_read_done,
+            snapshot.control.total_count, snapshot.control.data_ready,
+            Self::same_receipt(row, &snapshot), self.config.require_plc_heartbeat_for_ack,
+            snapshot.control.data_ready == 1,
+            row.publication_count == Some(snapshot.control.total_count),
+            snapshot.buffer.is_some(), snapshot.control.pc_read_count == expected_count,
+            snapshot.control.pc_read_done == 0, Utc::now().to_rfc3339(), snapshot.control
+        );
         if !Self::same_receipt(row, &snapshot)
             || snapshot.control.pc_read_count != expected_count
             || snapshot.control.pc_read_done != 0
         {
-            self.block(pool, "SNAPSHOT_CHANGED").await?;
-            return Err(
-                "Publication/Count/Done thay đổi trước write; giữ receipt để đối chiếu.".into(),
+            // Diagnostics only: compare the committed WORDs with this read-back.
+            // The verified poll baseline matched the same receipt before entering
+            // the write path. Include reserved WORDs; never dump the full payload.
+            let stored_raw = serde_json::from_value::<Vec<u16>>(row.raw_registers.clone());
+            let stored = stored_raw.as_ref().ok().map(Vec::as_slice);
+            let actual = snapshot
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.raw_registers.as_slice());
+            let mut differences = 0;
+            let mut first_differences = Vec::new();
+            if let (Some(before), Some(after)) = (stored, actual) {
+                for offset in 0..before.len().max(after.len()) {
+                    let old_word = before.get(offset).copied();
+                    let new_word = after.get(offset).copied();
+                    if old_word != new_word {
+                        differences += 1;
+                        if first_differences.len() < 8 {
+                            let d_address = u16::try_from(
+                                usize::from(self.config.control_start)
+                                    + as200::map::CONTROL_SIZE
+                                    + offset,
+                            )
+                            .ok();
+                            let modbus_address = d_address.and_then(|d| {
+                                as200::map::modbus_address(d, self.config.modbus_address_offset)
+                            });
+                            first_differences.push((
+                                offset, d_address, modbus_address, old_word, new_word,
+                            ));
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "PLC_ACK_FENCE stage=SNAPSHOT_MISMATCH phase={phase} source={} session={:?} inbox={} measurement_id={:?} processing_status={} receipt_total={:?} receipt_target={:?} receipt_record_seq={} word_order={} receipt_raw_decode_ok={} receipt_words={:?} readback_words={:?} raw_diff_count={:?} diff_columns=offset,d_address,modbus_address,receipt_word,readback_word first_differences={first_differences:?} control={:?}",
+                self.config.source_key, row.publication_session, row.id, row.measurement_id,
+                row.processing_status, row.total_count, row.publication_count, row.record_seq,
+                row.word_order, stored_raw.is_ok(), stored.map(|words| words.len()),
+                actual.map(|words| words.len()),
+                (stored.is_some() && actual.is_some()).then_some(differences), snapshot.control
             );
+            self.block(pool, "SNAPSHOT_CHANGED").await?;
+            // These labels explain the existing guard; they grant no write or recovery.
+            let reason = if !Self::same_receipt(row, &snapshot) {
+                if snapshot.control.data_ready != 1 {
+                    "PUBLICATION_NOT_READY"
+                } else if row.publication_count != Some(snapshot.control.total_count) {
+                    "PUBLICATION_TARGET_MISMATCH"
+                } else if snapshot.buffer.is_none() {
+                    "PUBLICATION_BUFFER_MISSING"
+                } else {
+                    "PUBLICATION_RAW_CHANGED"
+                }
+            } else if snapshot.control.pc_read_count != expected_count {
+                "COUNT_READBACK_MISMATCH"
+            } else {
+                "DONE_NOT_ZERO"
+            };
+            return Err(format!(
+                "SNAPSHOT_CHANGED/{reason}: phase={phase}, inbox={}, target={:?}, Count cần {expected_count} nhưng đọc {}, Done cần 0 nhưng đọc {}, TotalCount={}, DataReady={}. Chưa gọi lệnh ghi của giai đoạn này; giữ receipt/block để đối chiếu, không phát lại ACK.",
+                row.id, row.publication_count, snapshot.control.pc_read_count,
+                snapshot.control.pc_read_done, snapshot.control.total_count, snapshot.control.data_ready
+            ));
         }
         if self.state.stopping.load(Ordering::SeqCst)
             || !self
@@ -441,6 +573,7 @@ impl Engine {
                 .heartbeat_allows_ack(self.config.require_plc_heartbeat_for_ack)
                 .await
         {
+            eprintln!("PLC_ACK_FENCE stage=WRITE_POLICY_BLOCKED phase={phase} source={} inbox={} require_heartbeat={} stopping={}", self.config.source_key, row.id, self.config.require_plc_heartbeat_for_ack, self.state.stopping.load(Ordering::SeqCst));
             return Err(
                 "Đã giữ raw; đang dừng hoặc heartbeat chưa đáp ứng chính sách ACK, chưa ghi PLC."
                     .into(),
@@ -477,6 +610,7 @@ impl Engine {
                 "Không xác nhận được marker chưa gửi; chỉ đối chiếu, không tự reset.".into(),
             );
         }
+        eprintln!("PLC_ACK_CHECKPOINT stage=UNSENT_MARKER_RELEASED source={} inbox={} done_marker={done} transport_not_called=true", self.config.source_key, row.id);
         Ok(())
     }
 
@@ -505,20 +639,27 @@ impl Engine {
         let target = row.publication_count.ok_or("Thiếu publication counter.")?;
         let writer = self.ack_writer()?;
         let stream = writer.prepare_done().await?;
-        self.checked_write_snapshot(pool, row, target).await?;
+        self.checked_write_snapshot(pool, row, target, "FC06_BEFORE_MARKER")
+            .await?;
         let changed = sqlx::query("UPDATE plc_acquisition SET done_started=true WHERE source_id=$1 AND pending_inbox_id=$2 AND accepted=$3 AND session_id=$4 AND binding=$5 AND blocked_reason IS NULL AND ack_attempted AND done_started=false AND NOT done_observed")
             .bind(p.source_id).bind(row.id).bind(p.accepted).bind(&p.session_id).bind(&p.binding)
             .execute(pool).await.map_err(|e| e.to_string())?;
         if changed.rows_affected() != 1 {
             return Err("Done đã bắt đầu hoặc trạng thái DB đổi; không gửi lặp.".into());
         }
-        if let Err(error) = self.checked_write_snapshot(pool, row, target).await {
+        eprintln!("PLC_ACK_CHECKPOINT stage=DONE_MARKER_COMMITTED source={} inbox={} target={target} accepted={} done_started=true transport_not_called_yet=true", self.config.source_key, row.id, p.accepted);
+        if let Err(error) = self
+            .checked_write_snapshot(pool, row, target, "FC06_AFTER_MARKER_BEFORE_CALL")
+            .await
+        {
             self.release_unsent_marker(pool, p, row, true).await?;
             return Err(error);
         }
         // Any interruption from this call onward leaves done_started=true.
         writer.done_prepared(stream).await?;
-        let snapshot = self.read_snapshot().await?;
+        let snapshot = self.read_snapshot().await.map_err(|error| {
+            format!("ACK_POST_FC06_READ_FAILED: inbox={}, target={target}; FC06 có echo hợp lệ nhưng chưa đọc được bằng chứng hoàn tất: {error}. Giữ intent, không gửi lại Count/Done.", row.id)
+        })?;
         let mut sent = p.clone();
         sent.done_started = Some(true);
         self.observe_ack(pool, &sent, row, &snapshot)
@@ -601,6 +742,10 @@ impl Engine {
             }
         }
         if let Some(reason) = &p.blocked_reason {
+            if let Some(row) = &pending {
+                // A later observation cannot reconstruct the original failing fence.
+                self.trace_ack_observation("DURABLE_BLOCK_OBSERVATION", &p, row, &snapshot);
+            }
             let mut status = self.state.status.write().await;
             status.pause_reason = Some(reason.clone());
             status.ack_status = "RECONCILIATION_REQUIRED";
@@ -655,9 +800,19 @@ impl Engine {
         let target = row.publication_count.ok_or("Thiếu định danh công bố.")?;
         if target <= 0 || p.accepted.checked_add(1) != Some(target) {
             self.state.status.write().await.ack_status = "RECONCILIATION_REQUIRED";
-            return Err(if target == 0 && c.total_count == 0 && !Self::same_receipt(&row, &snapshot) {
-                "Payload counter 0 đã đổi; giữ raw đầu trong DB. Chưa có identity mới để lưu/gửi ACK."
-            } else { "Đã giữ raw; chưa chứng minh publication kế tiếp. Không đổi counter hoặc bỏ dữ liệu để ACK." }.into());
+            self.trace_ack_observation("PUBLICATION_NOT_NEXT", &p, &row, &snapshot);
+            let (reason, detail) = if target == 0 && c.total_count == 0 && !Self::same_receipt(&row, &snapshot) {
+                ("PUBLICATION_ZERO_RAW_CHANGED", "Payload counter 0 đã đổi; giữ raw đầu trong DB. Chưa có identity mới để lưu/gửi ACK.")
+            } else if target == 0 {
+                ("PUBLICATION_COUNTER_ZERO", "Đã lưu observation nhưng target 0 chưa phải publication dương kế tiếp; PROCESSED không có nghĩa được phép ACK. Không lấy RecordSeq thay TotalCount.")
+            } else {
+                ("PUBLICATION_NOT_NEXT", "Chưa chứng minh publication kế tiếp. Không đổi counter hoặc bỏ dữ liệu để ACK.")
+            };
+            return Err(format!(
+                "{reason}: inbox={}, receipt_target={target}, RecordSeq={}, accepted={}, expected_target={:?}, TotalCount={}, Count={}, Done={}, DataReady={}. {detail}",
+                row.id, row.record_seq, p.accepted, p.accepted.checked_add(1),
+                c.total_count, c.pc_read_count, c.pc_read_done, c.data_ready
+            ));
         }
         if p.ack_attempted && p.done_started != Some(false) {
             return self
@@ -677,6 +832,7 @@ impl Engine {
             return Err("MEASUREMENT: waiting for committed Measurement; ACK withheld".into());
         }
         if !Self::measurement_committed(pool, row.id).await? {
+            self.trace_ack_observation("MEASUREMENT_NOT_VERIFIED", &p, &row, &snapshot);
             return Err("MEASUREMENT: committed link/identity not verified; ACK withheld".into());
         }
         if self.config.read_only || !self.config.ack_enabled {
@@ -693,14 +849,28 @@ impl Engine {
                 "Payload khác 240 WORD đã commit"
             };
             return Err(format!(
-                "Raw/target khác receipt đã commit; không ACK. {reason} (DataReady={}, TotalCount={}, receipt={target}).",
+                "PUBLICATION_CONFLICT: Raw/target khác receipt đã commit; không ACK. {reason} (DataReady={}, TotalCount={}, receipt={target}).",
                 c.data_ready, c.total_count
             ));
         }
+        // This poll's control is the baseline; raw equality with the durable
+        // receipt has just been verified. A later fence logs its own read-back.
+        self.trace_ack_observation("POLL_BASELINE_VERIFIED", &p, &row, &snapshot);
         if p.ack_attempted {
             if c.pc_read_count != target || c.pc_read_done != 0 {
-                return Err("Count chưa được đối chiếu đúng target hoặc Done khác 0; tiếp tục quan sát, không phát lại Count.".into());
+                // Repeated observations intentionally retain the uncertain marker.
+                self.trace_ack_observation("COUNT_RECONCILE_WAIT", &p, &row, &snapshot);
+                let reason = if c.pc_read_count != target {
+                    "COUNT_RECONCILE_WAIT"
+                } else {
+                    "DONE_NOT_ZERO"
+                };
+                return Err(format!(
+                    "{reason}: inbox={}, target={target}, accepted={}, Count={}, Done={}, TotalCount={}, DataReady={}; ack_attempted=true, done_started=false. Chưa xác minh Count/Done để gửi Done lần đầu; tiếp tục quan sát, không phát lại Count.",
+                    row.id, p.accepted, c.pc_read_count, c.pc_read_done, c.total_count, c.data_ready
+                ));
             }
+            self.trace_ack_observation("COUNT_MATCH_FIRST_DONE_ELIGIBLE", &p, &row, &snapshot);
             return self.first_done(pool, &p, &row).await;
         }
         if c.pc_read_count != p.accepted || c.pc_read_done != 0 {
@@ -710,8 +880,10 @@ impl Engine {
             return Err("Đang dừng trước Count.".into());
         }
         let writer = self.ack_writer()?;
+        self.trace_ack_observation("FIRST_COUNT_PREPARATION", &p, &row, &snapshot);
         let stream = writer.prepare_count().await?;
-        self.checked_write_snapshot(pool, &row, p.accepted).await?;
+        self.checked_write_snapshot(pool, &row, p.accepted, "FC16_BEFORE_MARKER")
+            .await?;
         let changed = sqlx::query("UPDATE plc_acquisition SET ack_attempted=true WHERE source_id=$1 AND pending_inbox_id=$2 AND accepted=$3 AND session_id=$4 AND binding=$5 AND blocked_reason IS NULL AND NOT ack_attempted AND done_started=false AND NOT done_observed")
             .bind(p.source_id).bind(row.id).bind(p.accepted).bind(&p.session_id).bind(&p.binding)
             .execute(pool).await.map_err(|e| e.to_string())?;
@@ -719,11 +891,16 @@ impl Engine {
             return Err("ACK đã bắt đầu hoặc trạng thái đổi; không gửi lặp.".into());
         }
         p.ack_attempted = true;
-        if let Err(error) = self.checked_write_snapshot(pool, &row, p.accepted).await {
+        eprintln!("PLC_ACK_CHECKPOINT stage=COUNT_MARKER_COMMITTED source={} inbox={} target={target} accepted={} ack_attempted=true done_started={:?} transport_not_called_yet=true", self.config.source_key, row.id, p.accepted, p.done_started);
+        if let Err(error) = self
+            .checked_write_snapshot(pool, &row, p.accepted, "FC16_AFTER_MARKER_BEFORE_CALL")
+            .await
+        {
             self.release_unsent_marker(pool, &p, &row, false).await?;
             return Err(error);
         }
         writer.count_prepared(target, stream).await?;
+        eprintln!("PLC_ACK_CHECKPOINT stage=COUNT_ECHO_OK source={} inbox={} target={target} accepted={} readback_required=true checkpoint_confirmed=false", self.config.source_key, row.id, p.accepted);
         self.first_done(pool, &p, &row).await
     }
 }

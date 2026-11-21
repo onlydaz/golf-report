@@ -212,6 +212,7 @@ pub struct WorkerState {
     pub(super) settings_directory: Arc<Mutex<Option<PathBuf>>>,
     startup_config: Arc<Mutex<Option<SimulatorConfig>>>,
     connection_log: Arc<Mutex<connection_log::ConnectionLog>>,
+    diagnostic_logs: Arc<std::sync::Mutex<super::diagnostics::ChangedLogs>>,
     pub(super) settings_ready: Arc<AtomicBool>,
     pub(super) runtime_error: Arc<Mutex<Option<String>>>,
     heartbeat: Arc<std::sync::Mutex<Option<super::as200::heartbeat::HeartbeatMonitor>>>,
@@ -221,6 +222,28 @@ pub struct WorkerState {
     reconnect_waiters: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
 }
 impl WorkerState {
+    // These caches affect stderr only. Fail open on a poisoned cache so a
+    // diagnostic failure never hides evidence or changes acquisition behavior.
+    fn log_changed(&self, event: &'static str, value: String) -> bool {
+        self.diagnostic_logs
+            .lock()
+            .map(|mut logs| logs.should_emit(event, value))
+            .unwrap_or(true)
+    }
+
+    fn forget_log(&self, event: &'static str) -> bool {
+        self.diagnostic_logs
+            .lock()
+            .map(|mut logs| logs.forget(event))
+            .unwrap_or(false)
+    }
+
+    fn reset_diagnostic_logs(&self) {
+        if let Ok(mut logs) = self.diagnostic_logs.lock() {
+            logs.clear();
+        }
+    }
+
     pub(super) async fn tasks_are_stopped(&self) -> bool {
         self.tasks.lock().await.is_empty()
     }
@@ -362,10 +385,16 @@ impl WorkerState {
             && status.connection == "CONNECTED"
             && matches!(observed_health, Some("OBSERVING" | "STALE"))
             && observed_health == Some(status.plc_health.as_str());
-        if bypass {
-            eprintln!("PLC_WORKER {WARNING} health={}", status.plc_health);
+        let allowed = status.connection == "CONNECTED" && (running || bypass);
+        let policy = format!("required={required} connection={} health={} observed={observed_health:?} running={running} bypass={bypass} allowed={allowed}", status.connection, status.plc_health);
+        if self.log_changed("WORKER_HEARTBEAT_POLICY", policy) {
+            if bypass {
+                eprintln!("PLC_WORKER {WARNING} health={}", status.plc_health);
+            } else {
+                eprintln!("PLC_WORKER stage=ACK_HEARTBEAT_POLICY required={required} health={} connection={} allowed={allowed}", status.plc_health, status.connection);
+            }
         }
-        status.connection == "CONNECTED" && (running || bypass)
+        allowed
     }
 }
 pub(super) struct Engine {
@@ -391,7 +420,12 @@ impl Engine {
 
     async fn error(&self, message: String) {
         let mut status = self.state.status.write().await;
-        if status.last_error.as_deref() != Some(message.as_str()) {
+        let mut comparison = status.control_snapshot.clone();
+        if let Some(control) = comparison.as_mut() {
+            control.heartbeat = 0; // Heartbeat increments alone are not a new ACK error.
+        }
+        let error_key = format!("endpoint={} connection={} health={} pause={:?} ack={} control={comparison:?} reason={message}", self.config.address, status.connection, status.plc_health, status.pause_reason, status.ack_status);
+        if self.state.log_changed("WORKER_ERROR", error_key) {
             eprintln!(
                 "PLC_WORKER state=ERROR endpoint={} pause={:?} ack={} control={:?} reason={message}",
                 self.config.address,
@@ -452,6 +486,7 @@ impl Engine {
                 drop(status);
                 if !self.state.stopping.load(Ordering::SeqCst) {
                     if let Some(kind) = connection_event {
+                        eprintln!("PLC_WORKER connection={kind} endpoint={} unit_id={} control={:?}", self.config.address, self.config.unit_id, snapshot.control);
                         self.state
                             .record_connection(kind, &self.config.address)
                             .await;
@@ -551,6 +586,9 @@ impl Engine {
                     }
                 }
                 self.error(error.clone()).await;
+            } else if self.state.forget_log("WORKER_ERROR") {
+                let status = self.state.status.read().await;
+                eprintln!("PLC_WORKER stage=POLL_RECOVERED endpoint={} pause={:?} ack={} control={:?}", self.config.address, status.pause_reason, status.ack_status, status.control_snapshot);
             }
             let reconnect = if result.is_ok()
                 && self.state.status.read().await.ack_status == "RECONCILIATION_REQUIRED"

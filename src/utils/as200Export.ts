@@ -4,6 +4,8 @@ import * as XLSX from "xlsx";
 
 import type { MeasurementDetail } from "../services/measurementService";
 import { buildReportTables, displayPointResult, isBusinessPoint, isUnmeasuredPoint } from "./as200Report";
+import { exportMeasurementValue, measurementValueDescription, presentLoad, presentPosition } from "./measurementPresentation";
+import type { PresentedMeasurementValue } from "./measurementPresentation";
 
 type ExportValue = string | number;
 type ExportRow = Record<string, ExportValue>;
@@ -74,11 +76,13 @@ export const createCsvBytes = (rows: ExportRow[], details?: MeasurementDetail[])
       const base = byId.get(item.id)!;
       if (!item.stations.length) return [base];
       return item.stations.flatMap(station => {
-        const stationRow = { ...base, StationType: station.stationType, "Station Load (kg)": station.load ?? "", "Station Result": station.result };
+        const stationRow = { ...base, StationType: station.stationType,
+          "Station Load (kg)": exportMeasurementValue(presentLoad(station.load, station.stationType)), "Station Result": station.result };
         const points = station.points.filter(point => isBusinessPoint(station.stationType, point.pointNumber));
         if (!points.length) return [stationRow];
         return points.flatMap(point => {
-          const pointRow = { ...stationRow, PointNumber: point.pointNumber, "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
+          const pointRow = { ...stationRow, PointNumber: point.pointNumber, "Position (mm)": isUnmeasuredPoint(point) ? ""
+            : exportMeasurementValue(presentPosition(point.position, station.stationType, point.pointNumber)),
             Result: displayPointResult(station, point), AttemptCount: point.attemptCount, DecideAttempt: point.decideAttempt ?? "" };
           return point.attempts.length ? point.attempts.map(attempt => ({ ...pointRow,
             AttemptNumber: attempt.attemptNumber, "PushDist (mm)": attempt.pushDist ?? "", "Bend (mm)": attempt.bend ?? "",
@@ -120,6 +124,25 @@ export const createExcelBytes = async (
   details: MeasurementDetail[]
 ): Promise<Uint8Array> => {
   const workbook = new ExcelJS.Workbook();
+  const measurementsById = new Map(details.map(item => [item.id, item]));
+  const pointsByKey = new Map(details.flatMap(item => item.stations.flatMap(station =>
+    station.points.map(point => [`${item.id}:${station.stationType}:${point.pointNumber}`, { station, point }] as const))));
+  const noteValue = (cell: ExcelJS.Cell, value: PresentedMeasurementValue) => {
+    cell.note = measurementValueDescription(value);
+  };
+  // Also normalize summary rows supplied directly by callers. Details remain raw;
+  // cell notes identify defaults without turning numeric cells into text labels.
+  const summaryValues = rows.map(row => {
+    const raw = measurementsById.get(Number(row["Measurement ID"]));
+    return {
+      tip: presentLoad(raw ? raw.tipLoad : row["TIP Load (kg)"], "TIP"),
+      butt: presentLoad(raw ? raw.buttLoad : row["BUTT Load (kg)"], "BUTT"),
+    };
+  });
+  rows = rows.map((row, index) => ({ ...row,
+    "TIP Load (kg)": exportMeasurementValue(summaryValues[index].tip),
+    "BUTT Load (kg)": exportMeasurementValue(summaryValues[index].butt),
+  }));
   const realColumns = new Set([
     "TIP Load (kg)", "BUTT Load (kg)", "Station Load (kg)",
     "Position (mm)", "PushDist (mm)", "Bend (mm)",
@@ -146,9 +169,13 @@ export const createExcelBytes = async (
   }));
 
   // Ghi dữ liệu
-  for (const row of rows) {
-    worksheet.addRow(row);
-  }
+  rows.forEach((row, index) => {
+    const added = worksheet.addRow(row);
+    noteValue(added.getCell("TIP Load (kg)"), summaryValues[index].tip);
+    noteValue(added.getCell("BUTT Load (kg)"), summaryValues[index].butt);
+    const quality = measurementsById.get(Number(row["Measurement ID"]))?.qualityError;
+    if (quality) added.getCell("Measurement ID").note = `Diagnostic dữ liệu PLC: ${quality}`;
+  });
 
   // Apply the same formatting to every sheet, preserving the original cell values.
   const styleSheet = (worksheet: ExcelJS.Worksheet, filterable = true) => {
@@ -354,7 +381,16 @@ export const createExcelBytes = async (
       width: calculateColumnWidth(detailRows, header),
     }));
 
-    detailRows.forEach(record => sheet.addRow(record));
+    detailRows.forEach(record => {
+      const added = sheet.addRow(record);
+      if (name === "Điểm đo") {
+        const original = pointsByKey.get(`${record["Measurement ID"]}:${record.StationType}:${record.PointNumber}`);
+        if (original && !isUnmeasuredPoint(original.point)) {
+          noteValue(added.getCell("Position (mm)"), presentPosition(original.point.position,
+            original.station.stationType, original.point.pointNumber));
+        }
+      }
+    });
     // Merged detail sheets are presentation views. Keep full filtering/sorting on
     // the unmerged summary; the existing CSV export retains flat detailed rows.
     styleSheet(sheet, false);

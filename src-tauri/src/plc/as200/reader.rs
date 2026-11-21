@@ -229,6 +229,17 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         )
         .await
     }
+    // Classify the already observed changes without retrying or weakening the
+    // stable-snapshot comparison. More than one field can change in one read.
+    fn trace_unstable_control(&self, stage: &str, before: &PlcControl, after: &PlcControl) {
+        eprintln!(
+            "PLC_CONTROL state=UNSTABLE stage={stage} endpoint={} count_changed={} done_changed={} publication_changed={} before={before:?} after={after:?}",
+            self.config.address,
+            before.pc_read_count != after.pc_read_count,
+            before.pc_read_done != after.pc_read_done,
+            !before.same_buffer_state(after)
+        );
+    }
     /// Đọc riêng D25020..D25259 khi DataReady=1, không đọc buffer index 1.
     /// PLC quản lý buffer vật lý; PC không ghi WriteIdx/LastIdx hoặc chuyển buffer.
     /// DataReady có thể giữ mức 1 và RecordSeq có thể nhỏ hơn TotalCount.
@@ -244,10 +255,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         if before.data_ready == 0 {
             let after = self.read_control().await?;
             if !same_control(&before, &after) {
-                eprintln!(
-                    "PLC_CONTROL state=UNSTABLE stage=IDLE endpoint={} before={before:?} after={after:?}",
-                    self.config.address
-                );
+                self.trace_unstable_control("IDLE", &before, &after);
                 return Err(As200Error::Unstable);
             }
             return Ok(PublishedRecordSnapshot {
@@ -260,25 +268,39 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         let raw = self.read_published_words().await?;
         let middle = self.read_control().await?;
         if !same_control(&before, &middle) {
-            eprintln!(
-                "PLC_CONTROL state=UNSTABLE stage=AFTER_PAYLOAD endpoint={} before={before:?} after={middle:?}",
-                self.config.address
-            );
+            self.trace_unstable_control("AFTER_PAYLOAD", &before, &middle);
             return Err(As200Error::Unstable);
         }
-        if raw != self.read_published_words().await? {
+        let rechecked_raw = self.read_published_words().await?;
+        if raw != rechecked_raw {
+            let changed_words = raw
+                .iter()
+                .zip(&rechecked_raw)
+                .filter(|(a, b)| a != b)
+                .count();
+            let first_differences: Vec<_> = raw
+                .iter()
+                .zip(&rechecked_raw)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(8)
+                .map(|(offset, (a, b))| {
+                    (
+                        usize::from(self.config.control_start) + map::CONTROL_SIZE + offset,
+                        *a,
+                        *b,
+                    )
+                })
+                .collect();
             eprintln!(
-                "PLC_SNAPSHOT state=UNSTABLE endpoint={} reason=published_payload_changed",
+                "PLC_SNAPSHOT state=UNSTABLE endpoint={} reason=published_payload_changed changed_words={changed_words} diff_columns=d_address,first_word,second_word first_differences={first_differences:?}",
                 self.config.address
             );
             return Err(As200Error::Unstable);
         }
         let after = self.read_control().await?;
         if !same_control(&before, &after) {
-            eprintln!(
-                "PLC_CONTROL state=UNSTABLE stage=AFTER_RECHECK endpoint={} before={before:?} after={after:?}",
-                self.config.address
-            );
+            self.trace_unstable_control("AFTER_RECHECK", &before, &after);
             return Err(As200Error::Unstable);
         }
 

@@ -63,7 +63,7 @@ impl AckWriter {
     pub async fn prepare_count(&self) -> Result<TcpStream, String> {
         super::connect_tcp(&self.cfg.address, self.cfg.local_bind_ip, self.cfg.timeout)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("ACK_FC16_CONNECT: Chưa gọi FC16 Count; {e}"))
     }
     pub async fn count_prepared(&self, count: i32, stream: TcpStream) -> Result<(), String> {
         if count <= 0 {
@@ -85,7 +85,7 @@ impl AckWriter {
     pub async fn prepare_done(&self) -> Result<TcpStream, String> {
         super::connect_tcp(&self.cfg.address, self.cfg.local_bind_ip, self.cfg.timeout)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("ACK_FC06_CONNECT: Chưa gọi FC06 Done; {e}"))
     }
     pub async fn done_prepared(&self, stream: TcpStream) -> Result<(), String> {
         let address = map::modbus_address(
@@ -101,6 +101,15 @@ impl AckWriter {
 /// đúng địa chỉ/giá trị (FC06) hoặc địa chỉ/số lượng (FC16). Exception, sai
 /// header (transaction/unit), sai function code, mất kết nối hay timeout đều là lỗi.
 async fn send(cfg: &As200Config, write: Write, stream: TcpStream) -> Result<(), String> {
+    let function = match write {
+        Write::Single(..) => "FC06",
+        Write::Multiple(..) => "FC16",
+    };
+    // A call/echo is transport evidence, never proof of Ladder/checkpoint completion.
+    eprintln!(
+        "PLC_ACK_TRANSPORT stage=CALL_START endpoint={} unit_id={} function={function} request={write:?} word_order={:?} timeout_ms={} checkpoint_confirmed=false",
+        cfg.address, cfg.unit_id, cfg.word_order, cfg.timeout.as_millis()
+    );
     let operation = async {
         let mut ctx = tcp::attach_slave(stream, Slave(cfg.unit_id));
         let (request, expected) = match write {
@@ -116,18 +125,26 @@ async fn send(cfg: &As200Config, write: Write, stream: TcpStream) -> Result<(), 
         let response = ctx
             .call(request)
             .await
-            .map_err(|e| format!("ACK invalid response: {e}"))?
-            .map_err(|e| format!("ACK refused by PLC exception: {e}"))?;
+            .map_err(|e| {
+                eprintln!("PLC_ACK_TRANSPORT stage=RESPONSE_ERROR endpoint={} unit_id={} function={function} request={write:?} error={e} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+                format!("ACK_{function}_RESPONSE: ACK invalid response: {e}; kết quả ghi chưa được xác minh, giữ intent và không tự gửi lại.")
+            })?
+            .map_err(|e| {
+                eprintln!("PLC_ACK_TRANSPORT stage=PLC_EXCEPTION endpoint={} unit_id={} function={function} request={write:?} exception={e} checkpoint_confirmed=false", cfg.address, cfg.unit_id);
+                format!("ACK_{function}_EXCEPTION: ACK refused by PLC exception: {e}; giữ intent để đối chiếu, không tự gửi lại.")
+            })?;
         if response != expected {
-            return Err(format!("ACK refused/malformed response: {response:?}"));
+            eprintln!("PLC_ACK_TRANSPORT stage=ECHO_MISMATCH endpoint={} unit_id={} function={function} request={write:?} response={response:?} expected={expected:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+            return Err(format!("ACK_{function}_ECHO_MISMATCH: ACK refused/malformed response: {response:?}; chưa xác minh kết quả ghi, không tự gửi lại."));
         }
+        eprintln!("PLC_ACK_TRANSPORT stage=ECHO_OK endpoint={} unit_id={} function={function} request={write:?} response={response:?} readback_required=true checkpoint_confirmed=false", cfg.address, cfg.unit_id);
         Ok(())
     };
     tokio::time::timeout(cfg.timeout, operation)
         .await
         .map_err(|_| {
-            eprintln!("PLC_ACK state=TIMEOUT endpoint={}", cfg.address);
-            "ACK hết thời gian kết nối/ghi; giữ intent để đối chiếu, không tự gửi lại.".to_string()
+            eprintln!("PLC_ACK state=TIMEOUT endpoint={} unit_id={} function={function} request={write:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+            format!("ACK_{function}_TIMEOUT: Hết thời gian chờ kết quả ghi; PLC có thể đã nhận lệnh. Giữ intent để đối chiếu, không tự gửi lại.")
         })?
 }
 

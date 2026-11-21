@@ -1,5 +1,6 @@
 import { formatReportTime } from "./reportTime";
 import type { MeasurementDetail, MeasurementPoint, MeasurementStation } from "../services/measurementService";
+import { exportMeasurementValue, presentLoad, presentPosition } from "./measurementPresentation";
 
 /** Presentation only: keep the stored PLC club number unchanged. */
 export function formatClubNumber(value: number | string | null | undefined): string {
@@ -51,9 +52,9 @@ export function buildReportTables(records: MeasurementDetail[]) {
     TotalCount: item.totalCount ?? "",
     OverallResult: item.overallResult,
     "TIP Result": item.tipResult ?? "",
-    "TIP Load (kg)": item.tipLoad ?? "",
+    "TIP Load (kg)": exportMeasurementValue(presentLoad(item.tipLoad, "TIP")),
     "BUTT Result": item.buttResult ?? "",
-    "BUTT Load (kg)": item.buttLoad ?? "",
+    "BUTT Load (kg)": exportMeasurementValue(presentLoad(item.buttLoad, "BUTT")),
   }));
 
   const points = records.flatMap(item =>
@@ -62,7 +63,8 @@ export function buildReportTables(records: MeasurementDetail[]) {
         "Measurement ID": item.id,
         StationType: station.stationType,
         PointNumber: point.pointNumber,
-        "Position (mm)": isUnmeasuredPoint(point) ? "" : point.position ?? "",
+        "Position (mm)": isUnmeasuredPoint(point) ? ""
+          : exportMeasurementValue(presentPosition(point.position, station.stationType, point.pointNumber)),
         Result: displayPointResult(station, point),
         AttemptCount: point.attemptCount,
         DecideAttempt: point.decideAttempt ?? "",
