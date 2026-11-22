@@ -22,13 +22,14 @@ pub(super) async fn progress(pool: &PgPool, source: i64) -> Result<Option<Progre
         .bind(source)
         .fetch_optional(pool)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| { super::super::diagnostics::sql_failure("CHECKPOINT_LOAD", &e); e.to_string() })
 }
 
 impl Engine {
     pub(super) async fn block(&self, pool: &PgPool, reason: &str) -> Result<(), String> {
         sqlx::query("UPDATE plc_acquisition SET blocked_reason=COALESCE(blocked_reason,$2) WHERE source_id=$1")
-            .bind(self.source_id).bind(reason).execute(pool).await.map_err(|e| e.to_string())?;
+            .bind(self.source_id).bind(reason).execute(pool).await.map_err(|e| { super::super::diagnostics::sql_failure("DURABLE_BLOCK_UPDATE", &e); e.to_string() })?;
+        crate::plc::diagnostics::changed_event!("NEW_DURABLE_BLOCK", "PLC_ACK_CHECKPOINT stage=BLOCK_UPDATE_RETURNED source={} reason={reason} original_failing_evidence=preceding_events current_snapshot_is_not_historical=true", self.config.source_key);
         let mut status = self.state.status.write().await;
         status.pause_reason = Some(reason.into());
         status.ack_status = "RECONCILIATION_REQUIRED";
@@ -53,14 +54,20 @@ impl Engine {
             self.config.reader().word_order,
         )
         .map_err(|e| e.to_string())?;
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        self.trace_checkpoint_context(p, None);
+        super::super::diagnostics::update(|context| {
+            context.phase = "RECEIPT_COMMIT";
+            context.target = Some(total);
+            context.record_seq = Some(seq);
+        });
+        let mut tx = pool.begin().await.map_err(|e| { super::super::diagnostics::sql_failure("RECEIPT_BEGIN", &e); e.to_string() })?;
         SourceRepository::lock(&mut tx, p.source_id).await?;
         let current: Progress =
             sqlx::query_as("SELECT * FROM plc_acquisition WHERE source_id=$1 FOR UPDATE")
                 .bind(p.source_id)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| { super::super::diagnostics::sql_failure("RECEIPT_CHECKPOINT_LOCK", &e); e.to_string() })?;
         if current.accepted != p.accepted
             || current.session_id != p.session_id
             || current.binding != p.binding
@@ -94,7 +101,7 @@ impl Engine {
         }
         let existing: Option<InboxRecord> = sqlx::query_as(
             "SELECT * FROM plc_inbox WHERE source_id=$1 AND publication_session=$2 AND publication_count=$3 FOR UPDATE")
-            .bind(p.source_id).bind(&p.session_id).bind(total).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+            .bind(p.source_id).bind(&p.session_id).bind(total).fetch_optional(&mut *tx).await.map_err(|e| { crate::plc::diagnostics::sql_failure(concat!(file!(), ":", line!()), &e); e.to_string() })?;
         let row = if let Some(row) = existing {
             if row.raw_registers != raw
                 || row.word_order != self.config.word_order.as_str()
@@ -102,8 +109,8 @@ impl Engine {
                 || row.total_count != Some(i64::from(total))
             {
                 sqlx::query("UPDATE plc_acquisition SET blocked_reason='PUBLICATION_CONFLICT' WHERE source_id=$1")
-                    .bind(p.source_id).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-                tx.commit().await.map_err(|e| e.to_string())?;
+                    .bind(p.source_id).execute(&mut *tx).await.map_err(|e| { crate::plc::diagnostics::sql_failure(concat!(file!(), ":", line!()), &e); e.to_string() })?;
+                tx.commit().await.map_err(|e| { crate::plc::diagnostics::sql_failure(concat!(file!(), ":", line!()), &e); e.to_string() })?;
                 return Err("CONFLICT: cùng định danh công bố nhưng raw khác; giữ bản gốc, không ACK hoặc gộp dữ liệu.".into());
             }
             row
@@ -112,17 +119,22 @@ impl Engine {
                 .bind(p.source_id).bind(format!("publication-v1:{}:{}:{total}", p.session_id.len(), p.session_id))
                 .bind(seq).bind(i64::from(total)).bind(raw).bind(self.config.word_order.as_str())
                 .bind(&p.session_id).bind(total).bind(Option::<String>::None)
-                .fetch_one(&mut *tx).await.map_err(|e| e.to_string())?
+                .fetch_one(&mut *tx).await.map_err(|e| { crate::plc::diagnostics::sql_failure(concat!(file!(), ":", line!()), &e); e.to_string() })?
         };
         // Receipt and pending pointer commit atomically. Counter 0 is kept, never renamed to 1.
         let changed = sqlx::query("UPDATE plc_acquisition SET pending_inbox_id=$2,last_total=GREATEST(last_total,$3),done_started=false WHERE source_id=$1 AND pending_inbox_id IS NOT DISTINCT FROM $4 AND NOT ack_attempted")
-            .bind(p.source_id).bind(row.id).bind(total).bind(replace_zero).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+            .bind(p.source_id).bind(row.id).bind(total).bind(replace_zero).execute(&mut *tx).await.map_err(|e| { crate::plc::diagnostics::sql_failure(concat!(file!(), ":", line!()), &e); e.to_string() })?;
         if changed.rows_affected() != 1 {
             return Err("Còn receipt khác chưa đối chiếu; chưa ACK.".into());
         }
         tx.commit().await.map_err(|e| {
+            super::super::diagnostics::sql_failure("RECEIPT_COMMIT", &e);
             format!("Commit raw chưa được xác nhận; đọc lại cùng publication, không ACK: {e}")
         })?;
+        self.trace_checkpoint_context(p, Some(&row));
+        crate::plc::diagnostics::event!("PLC_ACK_CHECKPOINT stage=RECEIPT_COMMITTED inbox={} measurement_id={:?} record_seq={seq} target={total} raw_words={} raw_and_pending_transaction=committed pending_inbox_id={} previous_pending={:?} previous_accepted={} source={} session={} endpoint={}",
+            row.id, row.measurement_id, buffer.raw_registers.len(), row.id, p.pending_inbox_id,
+            p.accepted, self.config.source_key, p.session_id, self.config.address);
         Ok(row)
     }
 

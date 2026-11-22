@@ -277,6 +277,9 @@ impl WorkerState {
 
     async fn error_status(&self, error: String) {
         let mut status = self.status.write().await;
+        if self.log_changed("WORKER_STARTUP_ERROR", format!("{}:{}:{error}", status.source_key, status.address)) {
+            crate::plc::diagnostics::event!("PLC_WORKER stage=STARTUP_ERROR source={} endpoint={} reason={error} worker_not_started=true", status.source_key, status.address);
+        }
         status.enabled = false;
         status.connection = "DISABLED".into();
         status.state = "ERROR".into();
@@ -389,9 +392,9 @@ impl WorkerState {
         let policy = format!("required={required} connection={} health={} observed={observed_health:?} running={running} bypass={bypass} allowed={allowed}", status.connection, status.plc_health);
         if self.log_changed("WORKER_HEARTBEAT_POLICY", policy) {
             if bypass {
-                eprintln!("PLC_WORKER {WARNING} health={}", status.plc_health);
+                crate::plc::diagnostics::event!("PLC_WORKER {WARNING} health={}", status.plc_health);
             } else {
-                eprintln!("PLC_WORKER stage=ACK_HEARTBEAT_POLICY required={required} health={} connection={} allowed={allowed}", status.plc_health, status.connection);
+                crate::plc::diagnostics::event!("PLC_WORKER stage=ACK_HEARTBEAT_POLICY required={required} health={} connection={} allowed={allowed}", status.plc_health, status.connection);
             }
         }
         allowed
@@ -407,6 +410,18 @@ pub(super) struct Engine {
     published_gate: Mutex<()>,
 }
 impl Engine {
+    fn diagnostic_context(&self) -> super::diagnostics::Context {
+        super::diagnostics::Context {
+            source: self.config.source_key.clone(),
+            session: self.config.confirmed_session_id.clone().unwrap_or_default(),
+            endpoint: self.config.address.clone(),
+            phase: "POLL_START",
+            count_call: "NOT_CALLED_THIS_POLL",
+            done_call: "NOT_CALLED_THIS_POLL",
+            ..Default::default()
+        }
+    }
+
     pub(super) fn connection_config(&self) -> SimulatorConfig {
         self.config.clone()
     }
@@ -426,7 +441,7 @@ impl Engine {
         }
         let error_key = format!("endpoint={} connection={} health={} pause={:?} ack={} control={comparison:?} reason={message}", self.config.address, status.connection, status.plc_health, status.pause_reason, status.ack_status);
         if self.state.log_changed("WORKER_ERROR", error_key) {
-            eprintln!(
+            crate::plc::diagnostics::event!(
                 "PLC_WORKER state=ERROR endpoint={} pause={:?} ack={} control={:?} reason={message}",
                 self.config.address,
                 status.pause_reason,
@@ -448,6 +463,33 @@ impl Engine {
         let started = std::time::Instant::now();
         match self.config.plc_reader().poll_published_record().await {
             Ok(snapshot) => {
+                super::diagnostics::forget_changed("UNSTABLE_CONTROL");
+                super::diagnostics::forget_changed("UNSTABLE_RAW");
+                let c = &snapshot.control;
+                let seq = snapshot.buffer.as_ref().and_then(|buffer| {
+                    decode::dint32(&buffer.raw_registers, as200::map::record::SEQUENCE,
+                        self.config.reader().word_order).ok()
+                });
+                super::diagnostics::update(|context| {
+                    context.control = format!("total={} ready={} count={} done={} last_idx={} write_idx={}",
+                        c.total_count, c.data_ready, c.pc_read_count, c.pc_read_done, c.last_idx, c.write_idx);
+                    if context.inbox.is_none() {
+                        context.target = Some(c.total_count);
+                        context.record_seq = seq;
+                    }
+                });
+                let mut comparison = c.clone();
+                comparison.heartbeat = 0;
+                let key = format!("{comparison:?} raw={:?} diagnostics={:?}",
+                    snapshot.buffer.as_ref().map(|buffer| &buffer.raw_registers), snapshot.diagnostics);
+                if self.state.log_changed("FC03_SNAPSHOT", key) {
+                    crate::plc::diagnostics::event!("PLC_FC03 stage=SNAPSHOT_STABLE record_seq={seq:?} control={c:?} buffer_words={} diagnostics={:?} control_d={} control_modbus={:?} control_words={} payload_d={} payload_modbus={:?} stability=verified",
+                        snapshot.buffer.as_ref().map_or(0, |buffer| buffer.raw_registers.len()), snapshot.diagnostics,
+                        self.config.control_start, as200::map::modbus_address(self.config.control_start, self.config.modbus_address_offset),
+                        as200::map::CONTROL_SIZE, usize::from(self.config.control_start) + as200::map::CONTROL_SIZE,
+                        u16::try_from(usize::from(self.config.control_start) + as200::map::CONTROL_SIZE).ok()
+                            .and_then(|address| as200::map::modbus_address(address, self.config.modbus_address_offset)));
+                }
                 let health = self
                     .state
                     .heartbeat
@@ -486,7 +528,7 @@ impl Engine {
                 drop(status);
                 if !self.state.stopping.load(Ordering::SeqCst) {
                     if let Some(kind) = connection_event {
-                        eprintln!("PLC_WORKER connection={kind} endpoint={} unit_id={} control={:?}", self.config.address, self.config.unit_id, snapshot.control);
+                        crate::plc::diagnostics::event!("PLC_WORKER connection={kind} endpoint={} unit_id={} control={:?}", self.config.address, self.config.unit_id, snapshot.control);
                         self.state
                             .record_connection(kind, &self.config.address)
                             .await;
@@ -529,10 +571,15 @@ impl Engine {
     }
 
     async fn collection_loop(self: Arc<Self>, database: DatabaseState) {
+        super::diagnostics::scope(self.diagnostic_context(), self.collection_loop_logged(database)).await;
+    }
+
+    async fn collection_loop_logged(self: Arc<Self>, database: DatabaseState) {
         loop {
             if self.state.stopping.load(Ordering::SeqCst) {
                 break;
             }
+            super::diagnostics::update(|context| *context = self.diagnostic_context());
             let waiters = std::mem::take(&mut *self.state.reconnect_waiters.lock().await);
             if !self.config.auto_reconnect
                 && waiters.is_empty()
@@ -558,10 +605,10 @@ impl Engine {
                             .saturating_mul(12)
                             .saturating_add(8000),
                     ),
-                    async {
+                    super::diagnostics::scope(self.diagnostic_context(), async {
                         let pool = database.pool().await?;
                         self.project_pending(&pool).await
-                    },
+                    }),
                 )
                 .await
                 .unwrap_or_else(|_| Err("Hết thời gian projection; retry cùng Inbox ID.".into()));
@@ -588,7 +635,7 @@ impl Engine {
                 self.error(error.clone()).await;
             } else if self.state.forget_log("WORKER_ERROR") {
                 let status = self.state.status.read().await;
-                eprintln!("PLC_WORKER stage=POLL_RECOVERED endpoint={} pause={:?} ack={} control={:?}", self.config.address, status.pause_reason, status.ack_status, status.control_snapshot);
+                crate::plc::diagnostics::event!("PLC_WORKER stage=POLL_RECOVERED endpoint={} pause={:?} ack={} control={:?}", self.config.address, status.pause_reason, status.ack_status, status.control_snapshot);
             }
             let reconnect = if result.is_ok()
                 && self.state.status.read().await.ack_status == "RECONCILIATION_REQUIRED"
@@ -691,7 +738,7 @@ impl WorkerState {
             return;
         }
         if let Err(error) = config.0.validate() {
-            eprintln!("AS200 configuration rejected before connection: {error}");
+            crate::plc::diagnostics::event!("AS200 configuration rejected before connection: {error}");
             let mut status = self.status.write().await;
             status.state = "ERROR".into();
             status.message = error;
@@ -706,7 +753,7 @@ impl WorkerState {
             );
             return;
         }
-        eprintln!(
+        crate::plc::diagnostics::event!(
             "AS200 mode={} address={} unit={} ack_enabled={} read_only={} pid={} ack_config_reason={}",
             config.0.mode, config.0.address, config.0.unit_id, config.0.ack_enabled,
             config.0.read_only, std::process::id(),
@@ -736,10 +783,19 @@ impl WorkerState {
             status.plc_health = "OBSERVING".into();
             status.message = "Đang khởi động hệ thống tiếp nhận AS200...".into();
         }
-        let opened = async {
+        let trace = super::diagnostics::Context {
+            source: config.0.source_key.clone(),
+            session: config.0.confirmed_session_id.clone().unwrap_or_default(),
+            endpoint: config.0.address.clone(),
+            phase: "ENGINE_OPEN",
+            count_call: "NOT_CALLED_BY_OPEN",
+            done_call: "NOT_CALLED_BY_OPEN",
+            ..Default::default()
+        };
+        let opened = super::diagnostics::scope(trace, async {
             let pool = database.pool().await?;
             Engine::open(config.0, config.1, self.clone(), &pool).await
-        }
+        })
         .await;
         match opened {
             Ok(engine) => {

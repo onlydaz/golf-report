@@ -381,11 +381,17 @@ impl InboxService {
         Ok(measurement_id)
     }
     async fn process_transaction(pool: &PgPool, id: i64) -> Result<i64, String> {
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let mut tx = pool.begin().await.map_err(|e| {
+            crate::plc::diagnostics::sql_failure("MEASUREMENT_BEGIN", &e);
+            e.to_string()
+        })?;
         let measurement_id = Self::process_in_transaction(&mut tx, id).await?;
         tx.commit()
             .await
-            .map_err(|e| format!("Commit chưa được xác nhận, retry cùng inbox id: {e}"))?;
+            .map_err(|e| {
+                crate::plc::diagnostics::sql_failure("MEASUREMENT_COMMIT", &e);
+                format!("Commit chưa được xác nhận, retry cùng inbox id: {e}")
+            })?;
         Ok(measurement_id)
     }
     pub async fn process(pool: &PgPool, id: i64) -> Result<i64, String> {

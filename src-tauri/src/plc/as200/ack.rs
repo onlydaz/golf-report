@@ -105,8 +105,9 @@ async fn send(cfg: &As200Config, write: Write, stream: TcpStream) -> Result<(), 
         Write::Single(..) => "FC06",
         Write::Multiple(..) => "FC16",
     };
+    crate::plc::diagnostics::write_outcome(function, "CALL_START");
     // A call/echo is transport evidence, never proof of Ladder/checkpoint completion.
-    eprintln!(
+    crate::plc::diagnostics::event!(
         "PLC_ACK_TRANSPORT stage=CALL_START endpoint={} unit_id={} function={function} request={write:?} word_order={:?} timeout_ms={} checkpoint_confirmed=false",
         cfg.address, cfg.unit_id, cfg.word_order, cfg.timeout.as_millis()
     );
@@ -126,24 +127,29 @@ async fn send(cfg: &As200Config, write: Write, stream: TcpStream) -> Result<(), 
             .call(request)
             .await
             .map_err(|e| {
-                eprintln!("PLC_ACK_TRANSPORT stage=RESPONSE_ERROR endpoint={} unit_id={} function={function} request={write:?} error={e} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+                crate::plc::diagnostics::write_outcome(function, "RESPONSE_ERROR");
+                crate::plc::diagnostics::event!("PLC_ACK_TRANSPORT stage=RESPONSE_ERROR endpoint={} unit_id={} function={function} request={write:?} error={e} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
                 format!("ACK_{function}_RESPONSE: ACK invalid response: {e}; kết quả ghi chưa được xác minh, giữ intent và không tự gửi lại.")
             })?
             .map_err(|e| {
-                eprintln!("PLC_ACK_TRANSPORT stage=PLC_EXCEPTION endpoint={} unit_id={} function={function} request={write:?} exception={e} checkpoint_confirmed=false", cfg.address, cfg.unit_id);
+                crate::plc::diagnostics::write_outcome(function, "PLC_EXCEPTION");
+                crate::plc::diagnostics::event!("PLC_ACK_TRANSPORT stage=PLC_EXCEPTION endpoint={} unit_id={} function={function} request={write:?} exception={e} checkpoint_confirmed=false", cfg.address, cfg.unit_id);
                 format!("ACK_{function}_EXCEPTION: ACK refused by PLC exception: {e}; giữ intent để đối chiếu, không tự gửi lại.")
             })?;
         if response != expected {
-            eprintln!("PLC_ACK_TRANSPORT stage=ECHO_MISMATCH endpoint={} unit_id={} function={function} request={write:?} response={response:?} expected={expected:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+            crate::plc::diagnostics::write_outcome(function, "ECHO_MISMATCH");
+            crate::plc::diagnostics::event!("PLC_ACK_TRANSPORT stage=ECHO_MISMATCH endpoint={} unit_id={} function={function} request={write:?} response={response:?} expected={expected:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
             return Err(format!("ACK_{function}_ECHO_MISMATCH: ACK refused/malformed response: {response:?}; chưa xác minh kết quả ghi, không tự gửi lại."));
         }
-        eprintln!("PLC_ACK_TRANSPORT stage=ECHO_OK endpoint={} unit_id={} function={function} request={write:?} response={response:?} readback_required=true checkpoint_confirmed=false", cfg.address, cfg.unit_id);
+        crate::plc::diagnostics::write_outcome(function, "ECHO_OK");
+        crate::plc::diagnostics::event!("PLC_ACK_TRANSPORT stage=ECHO_OK endpoint={} unit_id={} function={function} request={write:?} response={response:?} readback_required=true checkpoint_confirmed=false", cfg.address, cfg.unit_id);
         Ok(())
     };
     tokio::time::timeout(cfg.timeout, operation)
         .await
         .map_err(|_| {
-            eprintln!("PLC_ACK state=TIMEOUT endpoint={} unit_id={} function={function} request={write:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
+            crate::plc::diagnostics::write_outcome(function, "TIMEOUT");
+            crate::plc::diagnostics::event!("PLC_ACK state=TIMEOUT endpoint={} unit_id={} function={function} request={write:?} write_outcome=unconfirmed", cfg.address, cfg.unit_id);
             format!("ACK_{function}_TIMEOUT: Hết thời gian chờ kết quả ghi; PLC có thể đã nhận lệnh. Giữ intent để đối chiếu, không tự gửi lại.")
         })?
 }

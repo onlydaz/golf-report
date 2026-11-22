@@ -176,6 +176,7 @@ pub fn run() {
             let worker = app.state::<plc::worker::WorkerState>().inner().clone();
             let worker_database = database_state.clone();
             let config_dir = plc_configuration_directory(&app_handle).and_then(|dir| {
+                plc::diagnostics::initialize(&dir);
                 eprintln!(
                     "PLC_STORAGE config={} runtime={}",
                     dir.join("as200_config.toml").display(),
@@ -215,8 +216,13 @@ pub fn run() {
             plc::connection_settings::test_plc_connection,
             plc::worker::retry_as200_inbox,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                plc::diagnostics::flush_on_exit();
+            }
+        });
 }
 
 #[cfg(test)]

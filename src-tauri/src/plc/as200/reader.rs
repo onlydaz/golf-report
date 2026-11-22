@@ -87,7 +87,7 @@ impl HoldingRegisterReader for ModbusTcpReader {
             .await
             .unwrap_or(Err(As200Error::Timeout));
         if matches!(&result, Err(As200Error::Timeout)) {
-            eprintln!(
+            crate::plc::diagnostics::event!(
                 "PLC_READ state=TIMEOUT endpoint={} stage={} timeout_ms={}",
                 self.config.address,
                 if self.ctx.is_some() {
@@ -167,7 +167,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
                 .read_holding_registers(request_address, block_size as u16)
                 .await
                 .map_err(|error| {
-                    eprintln!(
+                    crate::plc::diagnostics::event!(
                         "PLC_FC03 state=ERROR endpoint={} unit_id={} d_start={} modbus_start={} offset={} words={} reason={error}",
                         self.config.address, self.config.unit_id,
                         usize::from(d_address) + result.len(), request_address,
@@ -176,7 +176,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
                     error
                 })?;
             if block.len() != block_size {
-                eprintln!(
+                crate::plc::diagnostics::event!(
                     "PLC_FC03 state=SHORT_RESPONSE endpoint={} unit_id={} modbus_start={} expected_words={} received_words={}",
                     self.config.address,
                     self.config.unit_id,
@@ -206,7 +206,7 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
             .read_range(self.config.control_start, map::CONTROL_SIZE)
             .await?;
         decode::control(&raw, self.config.word_order).map_err(|error| {
-            eprintln!(
+            crate::plc::diagnostics::event!(
                 "PLC_CONTROL state=INVALID endpoint={} unit_id={} d_start={} modbus_start={:?} offset={} word_order={:?} words={raw:?} reason={error}",
                 self.config.address, self.config.unit_id, self.config.control_start,
                 map::modbus_address(self.config.control_start, self.config.modbus_address_offset),
@@ -231,14 +231,22 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
     }
     // Classify the already observed changes without retrying or weakening the
     // stable-snapshot comparison. More than one field can change in one read.
-    fn trace_unstable_control(&self, stage: &str, before: &PlcControl, after: &PlcControl) {
-        eprintln!(
-            "PLC_CONTROL state=UNSTABLE stage={stage} endpoint={} count_changed={} done_changed={} publication_changed={} before={before:?} after={after:?}",
+    fn trace_unstable_control(
+        &self, stage: &str, before: &PlcControl, after: &PlcControl,
+        before_at: chrono::DateTime<chrono::Utc>, after_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut before_key = before.clone();
+        let mut after_key = after.clone();
+        before_key.heartbeat = 0;
+        after_key.heartbeat = 0;
+        crate::plc::diagnostics::emit_changed_signature("UNSTABLE_CONTROL",
+            format!("{}:{stage}:{before_key:?}:{after_key:?}", self.config.address), format_args!(
+            "PLC_CONTROL state=UNSTABLE stage={stage} endpoint={} count_changed={} done_changed={} publication_changed={} before={before:?} after={after:?} before_observed_at={} after_observed_at={}",
             self.config.address,
             before.pc_read_count != after.pc_read_count,
             before.pc_read_done != after.pc_read_done,
-            !before.same_buffer_state(after)
-        );
+            !before.same_buffer_state(after), before_at.to_rfc3339(), after_at.to_rfc3339()
+        ));
     }
     /// Đọc riêng D25020..D25259 khi DataReady=1, không đọc buffer index 1.
     /// PLC quản lý buffer vật lý; PC không ghi WriteIdx/LastIdx hoặc chuyển buffer.
@@ -252,10 +260,11 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
                 && a.pc_read_done == b.pc_read_done
         };
         let before = self.read_control().await?;
+        let before_at = chrono::Utc::now();
         if before.data_ready == 0 {
             let after = self.read_control().await?;
             if !same_control(&before, &after) {
-                self.trace_unstable_control("IDLE", &before, &after);
+                self.trace_unstable_control("IDLE", &before, &after, before_at, chrono::Utc::now());
                 return Err(As200Error::Unstable);
             }
             return Ok(PublishedRecordSnapshot {
@@ -266,12 +275,14 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
         }
 
         let raw = self.read_published_words().await?;
+        let raw_at = chrono::Utc::now();
         let middle = self.read_control().await?;
         if !same_control(&before, &middle) {
-            self.trace_unstable_control("AFTER_PAYLOAD", &before, &middle);
+            self.trace_unstable_control("AFTER_PAYLOAD", &before, &middle, before_at, chrono::Utc::now());
             return Err(As200Error::Unstable);
         }
         let rechecked_raw = self.read_published_words().await?;
+        let rechecked_raw_at = chrono::Utc::now();
         if raw != rechecked_raw {
             let changed_words = raw
                 .iter()
@@ -292,15 +303,16 @@ impl<T: HoldingRegisterReader> As200Reader<T> {
                     )
                 })
                 .collect();
-            eprintln!(
-                "PLC_SNAPSHOT state=UNSTABLE endpoint={} reason=published_payload_changed changed_words={changed_words} diff_columns=d_address,first_word,second_word first_differences={first_differences:?}",
-                self.config.address
-            );
+            crate::plc::diagnostics::emit_changed_signature("UNSTABLE_RAW",
+                format!("{}:{raw:?}:{rechecked_raw:?}", self.config.address), format_args!(
+                "PLC_SNAPSHOT state=UNSTABLE endpoint={} reason=published_payload_changed changed_words={changed_words} diff_columns=d_address,first_word,second_word first_differences={first_differences:?} first_raw_observed_at={} second_raw_observed_at={} before={before:?} middle={middle:?}",
+                self.config.address, raw_at.to_rfc3339(), rechecked_raw_at.to_rfc3339()
+            ));
             return Err(As200Error::Unstable);
         }
         let after = self.read_control().await?;
         if !same_control(&before, &after) {
-            self.trace_unstable_control("AFTER_RECHECK", &before, &after);
+            self.trace_unstable_control("AFTER_RECHECK", &before, &after, before_at, chrono::Utc::now());
             return Err(As200Error::Unstable);
         }
 
