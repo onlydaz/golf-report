@@ -1,43 +1,111 @@
-﻿# Golf Report
+# Thu Thập Dữ Liệu Độ Cong Gậy Golf
 
-Ứng dụng Windows Tauri 2 + Rust + React, một laptop kết nối một PLC Delta AS200 qua Modbus TCP. Giữ nguyên các trang Giám sát, Lịch sử, Chi tiết, Báo cáo và Kết nối PLC.
+## 1. Giới thiệu
 
-## Luồng acquisition hiện tại
+**New Ocean Group** — Phần mềm Thu Thập Dữ Liệu Độ Cong Gậy Golf.
+Kết nối PLC Delta AS200, thu thập dữ liệu đo TIP/BUTT và lưu PostgreSQL Local.
+Hỗ trợ theo dõi kết quả, xem lịch sử và xuất báo cáo Excel/CSV.
 
-Một Worker đọc control ổn định. Khi DataReady=1, đọc riêng D25020–D25259, đúng 240 WORD; PLC tự quản lý buffer. Payload toàn 0, Status bit0=0 hoặc dữ liệu đo chưa hợp lệ vẫn được lưu nguyên trạng vào Inbox PostgreSQL. Không có chế độ TEST và không tạo Measurement giả.
+## 2. Tải và cài đặt
 
-Raw receipt và con trỏ bản ghi đang chờ được commit cùng transaction. UNIQUE `(source_id, publication_session, publication_count)` dùng TotalCount thật và phiên counter cấu hình; không hash payload. RecordSeq gốc, word order và SKU lúc nhận được giữ riêng. Payload giống nhau ở hai counter khác nhau tạo hai receipt khác nhau. Cùng định danh nhưng raw khác gây conflict, không ghi đè.
+**Tải source:** dùng Git hoặc chọn Code → Download ZIP tại [GitHub](https://github.com/onlydaz/golf-report).
 
-Chỉ payload giải mã và workflow hợp lệ mới được project thành Measurement để phục vụ UI/báo cáo. Lỗi projection không cấp hoặc thu hồi quyền ACK. Retry projection có chu kỳ riêng, xử lý batch nhỏ; raw không giải mã được có decode_error để tránh retry liên tục. SKU được đóng băng lúc nhận raw, không lấy SKU hiện tại để gán lại lịch sử.
+```powershell
+git clone https://github.com/onlydaz/golf-report.git
+cd golf-report
+```
 
-## ACK và giới hạn phục hồi
+**Tải setup:** nếu đã có [Release](https://github.com/onlydaz/golf-report/releases),
+tải `.exe`/`.msi` cho Windows hoặc `.deb` cho Ubuntu tại mục Assets.
+Windows: chạy bộ cài theo hướng dẫn. Ubuntu: mở `.deb` bằng trình cài gói của hệ thống.
+Bản setup không cần Node.js/Rust; vẫn cần PostgreSQL và các thành phần giao diện hệ thống.
+Repo cũng có [workflow Ubuntu DEB](.github/workflows/build-linux.yml); kết quả nằm trong Artifacts của lần chạy.
 
-PostgreSQL lưu một outstanding receipt, accepted/last_total, dấu Count có thể đã bắt đầu (`ack_attempted`), bằng chứng Done chưa bắt đầu/có thể đã gửi (`done_started`) và quan sát Done cao. `done_started=NULL` giữ nguyên sự chưa rõ của ACK cũ. Không có năm pha ACK trong DB.
+**Nếu chạy source, cài trước:**
 
-Sau raw commit/read-back, Worker chuẩn bị socket Count, kiểm tra PLC, commit ack_attempted rồi gửi FC16 PC_ReadCount=TotalCount. Count được đọc lại trên cùng publication; socket Done được chuẩn bị trước khi commit done_started=true và gửi FC06 PC_ReadDone=1. Snapshot/heartbeat/stop được kiểm tra sát write. Response ghi không phải bằng chứng hoàn tất; vẫn cần Done cao rồi thấp, Count đúng target và Ready/counter tương thích trước khi tăng accepted.
+- [Node.js](https://nodejs.org/en/download) nhánh 22, phiên bản **22.12 trở lên**, kèm npm.
+- [Rust stable qua rustup](https://rustup.rs/) và Git nếu tải bằng lệnh clone.
+- PostgreSQL Local và pgAdmin 4 theo mục 3.
+- Windows: Microsoft C++ Build Tools, chọn **Desktop development with C++** và Windows SDK;
+  cài Microsoft Edge WebView2 Runtime nếu chưa có. Xem [Tauri Windows](https://v2.tauri.app/start/prerequisites/#windows).
+- Ubuntu: cài thêm các thư viện dưới đây, theo workflow hiện tại của repo:
 
-Sau restart, attempted=true nhưng done_started=false cho phép gửi Done lần đầu khi Count read-back đúng, raw/identity không đổi và các guard đủ. Done true/NULL chỉ được quan sát, không resend. Count chưa rõ và chưa đọc lại tới target vẫn cần đối chiếu; bỏ lỡ Done cao cũng có thể cần kỹ thuật. Raw counter 0 được giữ nguyên và chỉ chuyển pending sang publication 1 khi DB chứng minh chưa attempted/không reset, Count=0/Done=0 và publication mới ổn định. Không đổi row 0 thành 1 hoặc tạo epoch mới.
+```bash
+sudo apt-get update
+sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+```
 
-Projection chia suất cho bản ghi mới và FAILED, có cursor quay vòng. Khi mở Worker, status được khôi phục từ receipt gần nhất/pending và Measurement trong DB; rawCapture mang trạng thái ACK của chính row đó, không mất ACKNOWLEDGED khi PLC idle.
+Workflow dùng Ubuntu 22.04. Hướng dẫn Linux được đối chiếu source, chưa kiểm chứng
+cài đặt bản DEB trong lượt cập nhật README này; lưu ý vị trí cấu hình DB bên dưới.
 
-## Cấu hình, kiểm tra và dừng
+## 3. Cài đặt PostgreSQL Local
 
-Dev đọc as200_config.toml ở root project; Release đọc cạnh EXE. Giữ SourceKey, confirmed_session_id và journal_path hiện có. Session chỉ là namespace counter được cấu hình rõ ràng; không đổi nó để vượt lỗi reset. journal_path hiện dùng để tìm bằng chứng cũ và khóa độc quyền tương thích binary cũ; Worker mới không ghi capture.json.
+1. Tải và cài từ [PostgreSQL Downloads](https://www.postgresql.org/download/).
+   Bộ cài Windows EDB có Server và pgAdmin; có thể tải [pgAdmin 4](https://www.pgadmin.org/download/) riêng.
+2. Ghi nhớ mật khẩu tài khoản `postgres` và cổng đã chọn; cấu hình mẫu dùng `5432`.
+3. Mở pgAdmin 4, kết nối server Local bằng tài khoản `postgres`.
+4. Chuột phải **Databases → Create → Database…**, đặt tên **`golf_report`**, chọn Owner rồi **Save**.
 
-Kiểm tra kết nối chỉ mở TCP/FC03, không truy vấn hoặc ghi PostgreSQL, không tạo Worker và không ghi PLC. Kết nối và auto-launch dùng cùng Engine. Ngắt ghi marker dừng và join Worker; raw đã commit và ACK đang chờ nằm trong DB. Đổi SKU cần Worker đã dừng, không outstanding receipt và PLC idle khớp checkpoint.
+**Chuẩn bị cấu hình:** nếu file đích chưa có, sao chép:
 
-Quyền ACK giữ opt-in trong TOML: technical_setup_confirmed, allow_plc_connection, ack_enabled, ack_protocol=as200, read_only=false và scope map phù hợp. Acquisition không ghi PC_Heartbeat. Công cụ thanh ghi kỹ thuật giữ policy riêng, không phải đường ghi ACK thay thế. Không đổi layout/routes/CSS hay công thức báo cáo.
+- `database_config.example.toml` → `src-tauri/resources/database_config.toml` khi chạy source.
+- `as200_config.example.toml` → `as200_config.toml` ở thư mục gốc khi chạy source.
 
-## Chuyển đổi từ Journal v4
+Không ghi đè cấu hình hiện hữu; mở file và chỉnh cho đúng máy đang sử dụng.
+Điền cấu hình PostgreSQL như sau, thay mật khẩu minh họa bằng mật khẩu của máy:
 
-Migration `20261117120000_publication_receipts.sql` tạo cấu trúc publication. Migration tiếp theo `20261117130000_done_write_evidence.sql` bổ sung done_started, giữ NULL cho attempted cũ chưa rõ. Không sửa migration trước hoặc xóa row lịch sử; chưa chạy migration trong lượt sửa này.
+```toml
+host = "localhost"
+port = 5432
+database = "golf_report"
+username = "postgres"
+password = "DIEN_MAT_KHAU_CUA_BAN"
+```
 
-Lần khởi tạo trạng thái mới đọc Journal cũ, không yêu cầu quyền ghi capture.json. Reader nhận sentinel source_id=0 của delivery cũ nhưng vẫn đối chiếu SourceKey/row/binding/session/raw/receipt/prefix. last_total=accepted+1 chỉ được giữ khi có receipt/intent ACK_CONFIRMED cũ hợp lệ và handshake publication kế tiếp tương thích. Không sửa file cũ. Pending ACK thật, lịch sử vượt checkpoint hoặc thiếu trạng thái ACK của backend mới vẫn chặn; không nhập remote Count làm accepted.
+Mật khẩu không được để trống hoặc đưa lên GitHub.
+Trong `as200_config.toml`, chỉnh `address` theo IP/cổng PLC (mẫu `192.168.1.5:502`)
+và `unit_id` theo thiết bị (mẫu `1`); giữ các thông số kỹ thuật do người triển khai cung cấp.
 
-Đã xóa sáu module cũ `worker/{ack,capture,delivery,journal,recovery,retry}.rs` và kiểu ACK năm pha. Không có Worker cũ hoặc fallback. Chỉ `worker/legacy.rs` giữ reader cutover độc lập và `LegacyInboxInput` private để đối chiếu bằng chứng cũ; không chạy lại logic ACK cũ. Không xóa Journal, đổi Session, reset PLC hoặc chạy binary cũ sau khi đã chuyển sang trạng thái DB mới.
+**Vị trí file cấu hình theo source hiện tại:**
 
-## Kiểm chứng
+| Cách chạy | `database_config.toml` | `as200_config.toml` |
+|---|---|---|
+| Source Windows/Ubuntu | `<project>/src-tauri/resources/database_config.toml` | `<project>/as200_config.toml` |
+| Windows bản cài | `<thư mục golf-report.exe>/resources/database_config.toml` | `<thư mục golf-report.exe>/as200_config.toml` |
+| Linux bản cài | `<thư mục executable>/resources/database_config.toml` | `${XDG_CONFIG_HOME:-$HOME/.config}/com.golf.report/as200_config.toml` |
 
-Sau cleanup, `cargo check` và `npm run build` đã thành công. Vite còn cảnh báo chunk lớn hơn 500 kB. Không chạy ứng dụng, test, migration, Simulator hoặc kết nối PLC/PostgreSQL; không sửa tests.rs. Test Worker, service Inbox và các test proof năm pha cũ cần chuyển sang API acquisition hiện tại trong lượt được cho phép riêng; build production thành công không xác nhận test target hoặc nghiệm thu máy thật. Chi tiết file/logic đã xóa và các dependency được giữ nằm trong `docs/PLC_BACKEND_REFACTOR.md`.
+Với DEB, nếu executable ở `/usr/bin/golf-report`, DB config được tìm tại
+`/usr/bin/resources/database_config.toml`. Cần kiểm tra đường dẫn thực tế trong log
+`DATABASE_CONFIG path=...`; không mặc định resource của gói DEB đã nằm đúng chỗ.
 
-DB config vẫn đọc file bên ngoài binary; không log connection string hoặc credential. Dữ liệu raw chỉ được bảo đảm sau PostgreSQL commit; khi DB mất kết nối, PLC phải giữ publication cho đến ACK. Timing Done, retention, LOW/offset và hợp đồng publish slot 0 còn cần nghiệm thu với Ladder thực tế.
+Ứng dụng tự tạo/cập nhật bảng khi kết nối PostgreSQL thành công; tài khoản DB cần quyền tạo bảng.
+Nếu có banner lỗi kết nối, kiểm tra dịch vụ PostgreSQL và cấu hình rồi bấm **Thử kết nối lại**.
+
+## 4. Chạy phần mềm
+
+Mở Terminal/PowerShell tại thư mục gốc dự án, sau khi đã chuẩn bị cấu hình:
+
+```powershell
+npm ci
+npm run tauri dev
+```
+
+Đóng gói bộ cài trên Windows:
+
+```powershell
+npm run tauri build
+```
+
+Kết quả: `src-tauri/target/release/bundle/nsis/` và `src-tauri/target/release/bundle/msi/`.
+Đóng gói trên Ubuntu:
+
+```bash
+npm run tauri build -- --bundles deb
+```
+
+Kết quả: `src-tauri/target/release/bundle/deb/`.
+`npm run build` chỉ build frontend; dùng lệnh Tauri phía trên để đóng gói ứng dụng.
+
+Sau khi cài setup trên Windows, mở bằng shortcut trong Start Menu hoặc trên Desktop.
+Trên Ubuntu, mở từ menu ứng dụng hoặc chạy `golf-report` trong Terminal nếu lệnh đã được cài vào PATH.
